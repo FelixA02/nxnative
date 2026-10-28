@@ -53,9 +53,10 @@ defaults:
 jobs:
   build:
     name: Build the IPA
-    runs-on: macos-26
+    runs-on: xcode-27   # GitHub's Apple-silicon image; default Xcode 27.1 (build 27A9275, Metal 32023.921) = the one dmsh_chain.lock is tested with (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
     timeout-minutes: 360   # GitHub's limit for a job
     env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_INSTALL_CLEANUP: 1
     steps:
