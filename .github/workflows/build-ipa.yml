@@ -122,7 +122,7 @@ jobs:
       - name: Check the runner
         run: |
           dn=$(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:$HOME/.dotnet:$PATH" command -v dotnet || true)   # the dotnet the NSP script runs
-          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; printf "%.1f", x < 0 ? 0 : x }')
+          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; if (x < 0) x = 0; printf "%.1f", x }')   # macOS's awk cannot parse a comparison inside printf's arguments
           {
             echo "### The runner"
             echo
