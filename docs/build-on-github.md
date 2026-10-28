@@ -35,9 +35,11 @@ Before the first game, run it once with **Check the runner only** ticked (no lin
    | Field | |
    |---|---|
    | Download link | the link to your game files; several links are separated by spaces |
+   | Title ID | only for a cartridge dump (`.xci`) whose file name has no `[title ID]`, such as `Game (World) (Rev 1).xci`: the base game's 16 digits, e.g. `010028600EBDA000` (the games table in [dm/games](../dm/games/README.md#games) lists them). Empty otherwise |
    | Game language | `ja`, `fr`, `de`, `es`, `zh-Hans`, … (empty: English); it must be one the game has |
    | App name | the name on the home screen (empty: the game's name) |
    | Version | the version to pack, e.g. `v0` (empty: the newest in the download) |
+   | Skip the disk cleanup | saves about 5 minutes: without the cleanup the runner has about 95 GB free, enough for a game of up to about 25 GB; leave it off for a bigger one |
    | Show the frame rate | the frame counter at the top left on the iPhone |
 
 3. Click **Run workflow**. The run appears in the list; you can close the browser meanwhile, and GitHub emails you when a run fails.
@@ -74,6 +76,7 @@ The run's summary and the last lines of the step that failed say why. Common one
 |---|---|
 | the link gave a web page, not a file | the link is not a direct download link |
 | curl exit 22 | the server refused the link: it expired, or it needs a browser |
+| no NSP with a readable title ID | the game is a cartridge dump (`.xci`) without a `[title ID]` in its name: fill in the **Title ID** field |
 | the archive is password-protected | pack the files without a password |
 | more than one game in the folder | one game per run |
 | No space left on device, or a build that stops while the summary's lowest free disk space is near 0 | the game is too big for the runner |

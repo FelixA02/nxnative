@@ -13,6 +13,10 @@ on:
         description: 'Download link of the game: an NSP, XCI, NSZ or XCZ, or a .zip / .7z / .rar of one game''s files; several links separated by spaces (empty: the GAME_LINK secret)'
         type: string
         required: false
+      title_id:
+        description: 'Title ID of the base game (16 hex digits), for a cartridge dump (.xci) with no [title ID] in its file name; otherwise empty'
+        type: string
+        required: false
       language:
         description: 'Game language: ja, fr, de, es, it, ko, zh-Hans, zh-Hant, en-GB, … (empty: English)'
         type: string
@@ -29,6 +33,10 @@ on:
         description: 'Show the frame rate on the iPhone (top left)'
         type: boolean
         default: true
+      skip_cleanup:
+        description: 'Skip the 5-minute disk cleanup: about 95 GB are free without it, enough for a game of up to about 25 GB (three times its size plus 10 GB)'
+        type: boolean
+        default: false
       check_only:
         description: 'Check the runner only: free disk space and tools, no game'
         type: boolean
@@ -69,8 +77,11 @@ jobs:
       # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, and the simulators of the
       # other platforms (the iPhone's stays: the app's asset catalog is compiled against it). In the background while the tools install; "Wait for the disk cleanup" waits for it.
       - name: Free disk space (in the background)
+        env:
+          SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
         run: |
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+          if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
           sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
           echo "selected Xcode (kept): $sel"
           (
@@ -144,6 +155,7 @@ jobs:
         if: ${{ !inputs.check_only }}
         env:
           GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
+          IN_TITLE_ID: ${{ inputs.title_id }}
         run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
 
       - name: Build the IPA
