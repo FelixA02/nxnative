@@ -41,9 +41,13 @@ on:
         description: 'Check the runner only: free disk space and tools, no game'
         type: boolean
         default: false
+      publish_release:
+        description: 'Publish the encrypted IPA as a GitHub Release asset instead of a run artifact (faster downloads from the release CDN, no 1-day expiry; needs contents: write)'
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write   # publish_release: creating a Release and attaching an asset (upload-artifact needs only read)
 
 defaults:
   run:
@@ -215,7 +219,7 @@ jobs:
 
       - name: Upload the encrypted IPA
         id: upload
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && !inputs.publish_release }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ env.ARCHIVE }}
@@ -223,17 +227,36 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      - name: Publish a GitHub Release
+        if: ${{ inputs.publish_release && !inputs.check_only }}
+        env:
+          ARCHIVE: ${{ env.ARCHIVE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name=$(basename "$ARCHIVE")
+          tag="ipa-${GITHUB_RUN_ID}-$(date +%s)"
+          gh release create "$tag" "$ARCHIVE" \
+            --title "nxnative IPA: $name" \
+            --notes "Encrypted with your IPA_PASSWORD. Open it with 7-Zip: the IPA inside is the one to sideload."
+          echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
+          echo "published $tag ($(du -h "$ARCHIVE" | cut -f1))"
+
       - name: Summary
         if: ${{ !inputs.check_only && !cancelled() }}
         env:
           OUTCOME: ${{ job.status }}
           URL: ${{ steps.upload.outputs.artifact-url }}
+          RELEASE_URL: ${{ env.RELEASE_URL }}
         run: |
           {
-            if [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
+            if [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
               echo "### Your IPA"
               echo
-              echo "[$(basename "$ARCHIVE")]($URL) ($(du -h "$ARCHIVE" | cut -f1)), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+            elif [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
+              echo "### Your IPA"
+              echo
+              echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
             else
               echo "### The build failed"
               echo
