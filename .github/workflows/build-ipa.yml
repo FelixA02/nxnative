@@ -126,7 +126,7 @@ jobs:
       - name: Wait for the disk cleanup
         run: |
           for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
-          cat "$RUNNER_TEMP/cleanup.log"
+          if [ -f "$RUNNER_TEMP/cleanup.log" ]; then cat "$RUNNER_TEMP/cleanup.log"; fi   # not there when the cleanup was skipped
           if [ ! -e "$RUNNER_TEMP/cleanup.done" ]; then echo "::warning::the disk cleanup did not finish within 30 minutes"; fi
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
 
