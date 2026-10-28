@@ -1,0 +1,235 @@
+# Packs one game's IPA on GitHub's Mac, for players without a Mac (docs/build-on-github.md). Run by hand: Actions → Build IPA → Run workflow, with a download link to the game's
+# files (NSP, XCI, NSZ or XCZ, or an archive of them). The IPA comes back as the run's download, a 7z archive encrypted with the IPA_PASSWORD secret and kept for one day: in a public
+# repository anyone signed in to GitHub can download a run's files, and the IPA holds the whole game. The run's log is public too, so the link is masked in it (dm/tools/ci_fetch_game.py),
+# and it can come from the GAME_LINK secret instead. prod.keys comes from the PROD_KEYS secret. The game files and the keys stay on the runner, a virtual Mac deleted after the run.
+# The runner has 3 cores, 7 GB of memory, the disk the image leaves (the "Check the runner only" option reports what is free after the cleanup below), 6 hours at most, and no Metal 4
+# (tests.yml): a game whose build boots it on NVN to capture its shaders (the GLSLC capture: Fire Emblem: Three Houses, Portal, Catherine: Full Body) cannot be built here.
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: 'Download link of the game: an NSP, XCI, NSZ or XCZ, or a .zip / .7z / .rar of one game''s files; several links separated by spaces (empty: the GAME_LINK secret)'
+        type: string
+        required: false
+      language:
+        description: 'Game language: ja, fr, de, es, it, ko, zh-Hans, zh-Hant, en-GB, … (empty: English)'
+        type: string
+        required: false
+      app_name:
+        description: 'App name on the home screen (empty: the game''s name)'
+        type: string
+        required: false
+      version:
+        description: 'Version to pack, e.g. v0 or v327680 (empty: the newest in the download)'
+        type: string
+        required: false
+      show_fps:
+        description: 'Show the frame rate on the iPhone (top left)'
+        type: boolean
+        default: true
+      check_only:
+        description: 'Check the runner only: free disk space and tools, no game'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment), as in tests.yml.
+jobs:
+  build:
+    name: Build the IPA
+    runs-on: macos-26
+    timeout-minutes: 360   # GitHub's limit for a job
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the secrets
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          missing=
+          if [ -z "$PROD_KEYS" ]; then missing="$missing PROD_KEYS"; fi
+          if [ -z "$IPA_PASSWORD" ]; then missing="$missing IPA_PASSWORD"; fi
+          if [ -n "$missing" ]; then echo "::error::missing repository secrets:$missing (Settings → Secrets and variables → Actions; docs/build-on-github.md)"; exit 1; fi
+
+      # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, and the simulators of the
+      # other platforms (the iPhone's stays: the app's asset catalog is compiled against it). In the background while the tools install; "Wait for the disk cleanup" waits for it.
+      - name: Free disk space (in the background)
+        run: |
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+          sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          echo "selected Xcode (kept): $sel"
+          (
+            set +e
+            case "$sel" in
+              *.app)
+                for x in /Applications/Xcode*.app; do
+                  if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                  echo "removing $x"; sudo rm -rf "$x"
+                done ;;
+            esac
+            for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+              if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            xcrun simctl runtime list -j 2> /dev/null |
+              python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+              while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+            touch "$RUNNER_TEMP/cleanup.done"
+          ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      # The NSP script looks for dotnet in /usr/local/share/dotnet before ~/.dotnet (its TOOL_PATHS), so .NET 10 goes there: a preinstalled older SDK there would be found first
+      - name: Make room for .NET 10 where the NSP script looks first
+        run: sudo mkdir -p /usr/local/share/dotnet && sudo chown -R "$(id -un)" /usr/local/share/dotnet
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        env:
+          DOTNET_INSTALL_DIR: /usr/local/share/dotnet
+        with:
+          dotnet-version: '10.0.x'   # nx_extract and the shader translator target net10.0
+      - name: Install the tools
+        run: |
+          brew install xcodegen zstd spirv-cross glslang sevenzip   # sevenzip: 7zz, which unpacks the download and encrypts the IPA
+          python -m pip install lz4 capstone fonttools   # backports.zstd is for Python before 3.14 only
+          python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
+          # Xcode 26 installs the Metal toolchain (the shader compiler and metal-tt) separately
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Wait for the disk cleanup
+        run: |
+          for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
+          cat "$RUNNER_TEMP/cleanup.log"
+          if [ ! -e "$RUNNER_TEMP/cleanup.done" ]; then echo "::warning::the disk cleanup did not finish within 30 minutes"; fi
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+
+      - name: Check the runner
+        run: |
+          dn=$(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:$HOME/.dotnet:$PATH" command -v dotnet || true)   # the dotnet the NSP script runs
+          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; printf "%.1f", x < 0 ? 0 : x }')
+          {
+            echo "### The runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup) |"
+            echo "| Largest game that should fit | about $fit GB of game files (the build needs about three times the game's size plus 10 GB) |"
+            echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
+            echo "| Metal compiler | $(xcrun -sdk iphoneos metal --version 2>&1 | head -1) |"
+            echo "| metal-tt | $(xcrun -sdk iphoneos metal-tt -version 2>&1 | head -1) |"
+            echo "| .NET SDKs | ${dn:-no dotnet}: $([ -n "$dn" ] && "$dn" --list-sdks 2>&1 | cut -d' ' -f1 | tr '\n' ' ') |"
+            echo "| Python | $(python --version 2>&1) |"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
+          if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
+
+      - name: Download the game
+        if: ${{ !inputs.check_only }}
+        env:
+          GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
+        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+
+      - name: Build the IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_LANGUAGE: ${{ inputs.language }}
+          IN_APP_NAME: ${{ inputs.app_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_SHOW_FPS: ${{ inputs.show_fps }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          args=(--no-keep-extracted --progress lines)
+          if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
+          if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
+          if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
+          if [ "$IN_SHOW_FPS" = true ]; then args+=(--show-fps); else args+=(--no-show-fps); fi
+          # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
+          ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
+          rc=0
+          python scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$keys" "${args[@]}" || rc=$?
+          kill "$sampler" || true
+          rm -f "$keys"
+          low=$(awk 'NR == 1 || $1 < m { m = $1 } END { if (NR) printf "%.1f", m / 1048576 }' "$RUNNER_TEMP/free.log")
+          if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
+          exit "$rc"
+
+      - name: Keep the build logs
+        if: ${{ failure() && !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/game/*_build/logs/
+            ${{ runner.temp }}/game/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Encrypt the IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
+          if [ ${#ipas[@]} = 0 ]; then echo "::error::the build made no IPA"; exit 1; fi
+          ipa=${ipas[0]}; for f in "${ipas[@]}"; do if [ "$f" -nt "$ipa" ]; then ipa=$f; fi; done   # the newest
+          name=$(basename "$ipa")
+          mkdir -p "$RUNNER_TEMP/out" && mv "$ipa" "$RUNNER_TEMP/out/"
+          rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
+          # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$RUNNER_TEMP/out/$name.7z" "$RUNNER_TEMP/out/$name"
+          rm -f "$RUNNER_TEMP/out/$name"
+          echo "ARCHIVE=$RUNNER_TEMP/out/$name.7z" >> "$GITHUB_ENV"
+
+      - name: Upload the encrypted IPA
+        id: upload
+        if: ${{ !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.ARCHIVE }}
+          archive: false   # the .7z itself, not a zip around it; the artifact takes its name
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Summary
+        if: ${{ !inputs.check_only && !cancelled() }}
+        env:
+          OUTCOME: ${{ job.status }}
+          URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            if [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
+              echo "### Your IPA"
+              echo
+              echo "[$(basename "$ARCHIVE")]($URL) ($(du -h "$ARCHIVE" | cut -f1)), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+            else
+              echo "### The build failed"
+              echo
+              echo "The last lines of the step that failed say why. For the build itself, the tools' logs are in the build-logs artifact below."
+            fi
+            echo
+            if [ -n "${LOW_FREE:-}" ]; then echo "Lowest free disk space during the build: $LOW_FREE GB."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete the keys
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/keys"
