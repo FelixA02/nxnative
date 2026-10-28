@@ -215,7 +215,11 @@ jobs:
           # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
           7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$RUNNER_TEMP/out/$name.7z" "$RUNNER_TEMP/out/$name"
           rm -f "$RUNNER_TEMP/out/$name"
-          echo "ARCHIVE=$RUNNER_TEMP/out/$name.7z" >> "$GITHUB_ENV"
+          echo "GAME_IPA=$name" >> "$GITHUB_ENV"   # the real game's name, kept inside the archive and used for the summary mapping
+          # the archive's own name is scrambled (public metadata: the release/artifact name must not reveal the game; the password still guards the contents)
+          scramble="nxnative-${GITHUB_RUN_ID}-$(date +%s).7z"
+          mv "$RUNNER_TEMP/out/$name.7z" "$RUNNER_TEMP/out/$scramble"
+          echo "ARCHIVE=$RUNNER_TEMP/out/$scramble" >> "$GITHUB_ENV"
 
       - name: Upload the encrypted IPA
         id: upload
@@ -247,16 +251,21 @@ jobs:
           OUTCOME: ${{ job.status }}
           URL: ${{ steps.upload.outputs.artifact-url }}
           RELEASE_URL: ${{ env.RELEASE_URL }}
+          GAME_IPA: ${{ env.GAME_IPA }}
         run: |
           {
             if [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
               echo "### Your IPA"
               echo
               echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              echo
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (archive name scrambled so the release page doesn't reveal the game; the file inside keeps the game's name)."
             elif [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
               echo "### Your IPA"
               echo
               echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              echo
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (archive name scrambled so the artifact name doesn't reveal the game; the file inside keeps the game's name)."
             else
               echo "### The build failed"
               echo
