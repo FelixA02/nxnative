@@ -239,6 +239,15 @@ def main(argv=None):
         for i, link in enumerate(links, 1):
             f, name = download(link, f'link {i} of {len(links)}' if len(links) > 1 else 'the link', a.work)
             got += take(f, name, a.out, a.work); shutil.rmtree(f.parent, ignore_errors=True)
+        tid = re.sub(r'[^0-9A-Fa-f]', '', os.environ.get('IN_TITLE_ID', ''))[:16]
+        if len(tid) == 16:   # a cartridge dump (.xci) with no [title ID] in its name: tag it, which the NSP script reads title IDs from
+            for p in list(got):
+                if re.search(r'\[[0-9A-Fa-f]{16}\]', p.name): continue
+                stem, ext = os.path.splitext(p.name)
+                q = a.out / f'{stem} [{tid.upper()}]{ext}'; i = 2
+                while q.exists(): q = a.out / f'{stem} [{tid.upper()}] ({i}){ext}'; i += 1
+                p.rename(q)
+                say(f'tagged {p.name} with title ID {tid.upper()}')
         if not got: raise Fail('the download holds no NSP, XCI, NSZ or XCZ file')
     except Fail as e:
         say(f'::error::{command_value(str(e))}'); return 1
