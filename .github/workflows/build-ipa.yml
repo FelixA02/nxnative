@@ -235,9 +235,13 @@ jobs:
             mv "$ipa" "$RUNNER_TEMP/out/"
             rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
           fi
-          # Split lightly into ~N parts (each just under the 2 GiB per-file cap) when asked, else one archive: -v<size> makes <name>.7z.001, .002, …
+          echo "GAME_IPA=$name" >> "$GITHUB_ENV"   # the real game/IPA name, for the summary mapping to the scrambled archive name
+          # archive base is scrambled (a public release/artifact name must not reveal the game; the password still guards the contents)
+          base="nxnative-${GITHUB_RUN_ID}-$(date +%s)"
+          archive="$RUNNER_TEMP/out/$base.7z"
+          # Split into ~N parts (each just under the 2 GiB per-file cap, which applies to Release assets only) when asked, else one archive: -v<size> makes <base>.7z.001, .002, …
           vz=()
-          up="$RUNNER_TEMP/out/$name.7z"
+          up="$archive"
           if [ "$IN_SPLIT" = true ] && [ "${IN_PARTS:-1}" -gt 1 ]; then
             size=$(stat -f%z "$RUNNER_TEMP/out/$name")   # bytes; a stored archive is about the size of the IPA
             per=$(( (size + IN_PARTS - 1) / IN_PARTS ))   # ceil(bytes / parts)
@@ -251,10 +255,10 @@ jobs:
             echo "splitting into ~$IN_PARTS parts (${per} bytes each)"
           fi
           # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
-          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "${vz[@]}" "$RUNNER_TEMP/out/$name.7z" "$RUNNER_TEMP/out/$name"
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "${vz[@]}" "$archive" "$RUNNER_TEMP/out/$name"
           rm -f "$RUNNER_TEMP/out/$name"
-          echo "ARCHIVE=$RUNNER_TEMP/out/$name.7z" >> "$GITHUB_ENV"   # the logical archive for the summary
-          echo "UPLOAD_PATH=$up" >> "$GITHUB_ENV"                     # the .7z on its own, or the folder holding its parts
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"   # the scrambled archive (or its base) for the summary + upload
+          echo "UPLOAD_PATH=$up" >> "$GITHUB_ENV"    # the .7z on its own, or the folder holding its parts
 
       - name: Upload the encrypted IPA
         id: upload
@@ -276,7 +280,7 @@ jobs:
           if [ ${#files[@]} = 0 ]; then echo "::error::no archive to publish"; exit 1; fi
           name=$(basename "${files[0]}")
           tag="ipa-${GITHUB_RUN_ID}-$(date +%s)"
-          gh release create "$tag" --title "nxnative IPA: $(basename "${files[0]}" .7z)" \
+          gh release create "$tag" --title "nxnative IPA: $(basename "$ARCHIVE" .7z)" \
             --notes "Encrypted with your IPA_PASSWORD. Download all parts into one folder and open the first part (.001) with 7-Zip: the IPA inside is the one to sideload."
           gh release upload "$tag" "${files[@]}"
           echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
@@ -288,18 +292,21 @@ jobs:
           OUTCOME: ${{ job.status }}
           URL: ${{ steps.upload.outputs.artifact-url }}
           RELEASE_URL: ${{ env.RELEASE_URL }}
+          GAME_IPA: ${{ env.GAME_IPA }}
         run: |
           {
             if [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
               echo "### Your IPA"
               echo
               echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
-              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The release holds the archive split into parts: download them all into one folder and open the first part (e.g. name.7z.001)."; fi
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the release page doesn't reveal the game; the file inside keeps the game's name)."
+              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The release holds the archive split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
             elif [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
               echo "### Your IPA"
               echo
               echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
-              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The archive was split into parts: download them all into one folder and open the first part (e.g. name.7z.001)."; fi
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the artifact name doesn't reveal the game; the file inside keeps the game's name)."
+              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The archive was split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
             else
               echo "### The build failed"
               echo
