@@ -41,20 +41,20 @@ on:
         description: 'Check the runner only: free disk space and tools, no game'
         type: boolean
         default: false
-      split_archive:
-        description: 'Split the encrypted archive into part files; choose the count with Split parts. Release assets split automatically if needed for GitHub''s 2 GiB per-file cap.'
-        type: boolean
-        default: false
-      split_parts:
-        description: 'How many parts to split into when Split archive is on (2 and up). In Release mode, the count is increased automatically if needed for GitHub''s 2 GiB per-file cap; artifacts have no cap.'
-        type: number
-        default: 4
       publish_release:
-        description: 'Publish the encrypted archive as a GitHub Release asset instead of a run artifact (faster downloads from the release CDN, no 1-day expiry; needs contents: write; 2 GiB per-file cap applies)'
+        description: 'Publish as a GitHub Release asset instead of a run artifact (no 1-day expiry, faster downloads; needs contents: write). Either way an archive over 2 GiB is split into parts automatically'
         type: boolean
         default: false
       test_split:
-        description: '(TEMPORARY) Skip the download and build; just test the archive split + upload with a 3 GiB dummy file. Set Split archive on and pick Split parts.'
+        description: '(TEMPORARY) Skip the download and build; test the archive, the split and the upload with a dummy file (see Test GB)'
+        type: boolean
+        default: false
+      test_gb:
+        description: '(TEMPORARY) Test mode only: size of the dummy file in GiB, a whole number from 1 to 10 (empty: 3; use 3 or more to get a split)'
+        type: string
+        required: false
+      test_fallback:
+        description: '(TEMPORARY) Test mode only: make the first upload fail on purpose, to see the fallback work (Release on: the Release fails, so the run artifact is used; Release off: the zip of parts fails, so one file is uploaded)'
         type: boolean
         default: false
 
@@ -217,16 +217,20 @@ jobs:
         if: ${{ !inputs.check_only }}
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
-          IN_SPLIT: ${{ inputs.split_archive }}
-          IN_PARTS: ${{ inputs.split_parts }}
           IN_RELEASE: ${{ inputs.publish_release }}
           IN_TEST: ${{ inputs.test_split }}
+          IN_TEST_GB: ${{ inputs.test_gb }}
+          IN_TEST_FALLBACK: ${{ inputs.test_fallback }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          if [ "$IN_TEST" = true ]; then   # test_split: no game build, make a 3 GiB dummy to exercise the split + upload/release
+          if [ "$IN_TEST" = true ]; then   # test_split: no game build, make a dummy to exercise the archive, the split and the upload
             name="split-test.ipa"
-            dd if=/dev/zero of="$RUNNER_TEMP/out/$name" bs=1048576 count=3072 status=none
-            echo "test mode: no build; made a 3 GiB dummy $name"
+            gb="${IN_TEST_GB%%.*}"   # a number can arrive as 4.0; this input is text, but be safe
+            case "$gb" in ''|*[!0-9]*) gb=3 ;; esac
+            if [ "$gb" -lt 1 ]; then gb=1; fi
+            if [ "$gb" -gt 10 ]; then gb=10; fi   # the dummy and its archive both sit on the runner's disk
+            dd if=/dev/zero of="$RUNNER_TEMP/out/$name" bs=1048576 count=$(( gb * 1024 )) status=none
+            echo "test mode: no build; made a $gb GiB dummy $name"
           else
             shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
             if [ ${#ipas[@]} = 0 ]; then echo "::error::the build made no IPA"; exit 1; fi
@@ -239,42 +243,36 @@ jobs:
           # archive base is scrambled (a public release/artifact name must not reveal the game; the password still guards the contents)
           base="nxnative-${GITHUB_RUN_ID}-$(date +%s)"
           archive="$RUNNER_TEMP/out/$base.7z"
-          # Split into ~N parts (each just under the 2 GiB per-file cap, which applies to Release assets only) when asked, else one archive: -v<size> makes <base>.7z.001, .002, …
-          vz=()
-          up="$archive"
+          # One file when it fits under GitHub's 2 GiB per-file cap (Release assets are held to it), else the fewest parts that do: -v<size> makes <base>.7z.001, .002, …
+          # No setting for the count: it follows from the size. Both Release and artifact uploads get the same files
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
+          safe=$(( cap - 1024 * 1024 ))   # leave room for 7z headers and upload rounding
           size=$(stat -f%z "$RUNNER_TEMP/out/$name")   # bytes; a stored archive is about the size of the IPA
-          parts="${IN_PARTS:-1}"
-          if [ "$IN_RELEASE" = true ]; then   # the 2 GiB per-file cap applies to Release assets only, not run artifacts
-            cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
-            safe=$(( cap - 1024 * 1024 ))   # leave room for 7z headers and release-upload rounding
-            minimum=$(( (size + safe - 1) / safe ))
-            if [ "$minimum" -gt "$parts" ]; then
-              echo "::warning::the archive needs at least $minimum parts for GitHub's 2 GiB release-asset limit; increasing Split parts from $parts to $minimum"
-              parts=$minimum
-            fi
+          parts=$(( (size + safe - 1) / safe ))
+          zip_path="$RUNNER_TEMP/out"
+          if [ "$IN_TEST" = true ] && [ "$IN_TEST_FALLBACK" = true ]; then   # test_fallback: the first upload fails on purpose
+            if [ "$IN_RELEASE" = true ]; then parts=1; echo "::warning::test_fallback: no split, so the Release upload of a file over 2 GiB is expected to fail"   # GitHub rejects it
+            else zip_path="$RUNNER_TEMP/no-such-folder"; echo "::warning::test_fallback: the upload of the zipped parts is made to fail"; fi
           fi
-          if { [ "$IN_SPLIT" = true ] && [ "$parts" -gt 1 ]; } || [ "$IN_RELEASE" = true ] && [ "$parts" -gt 1 ]; then
+          seal() { 7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$@" "$archive" "$RUNNER_TEMP/out/$name"; }   # stored (the IPA is compressed already), file name encrypted too (-mhe)
+          split=false
+          if [ "$parts" -gt 1 ]; then
             per=$(( (size + parts - 1) / parts ))   # ceil(bytes / parts)
-            vz=("-v$per"); up="$RUNNER_TEMP/out"   # 7-Zip wants the size glued to -v: -v1386873831, not -v 1386873831
-            echo "splitting into ~$parts parts (${per} bytes each)"
+            echo "splitting into $parts parts (${per} bytes each)"
+            # 7-Zip wants the size glued to -v: -v1386873831, not -v 1386873831
+            if seal "-v$per"; then split=true
+            else echo "::warning::the split failed: making one archive instead"; rm -f "$archive".[0-9][0-9][0-9]; fi
           fi
-          # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
-          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "${vz[@]}" "$archive" "$RUNNER_TEMP/out/$name"
+          if [ "$split" = false ]; then seal; zip_path="$archive"; fi
           rm -f "$RUNNER_TEMP/out/$name"
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"   # the scrambled archive (or its base) for the summary + upload
-          echo "UPLOAD_PATH=$up" >> "$GITHUB_ENV"    # the .7z on its own, or the folder holding its parts
-
-      - name: Upload the encrypted IPA
-        id: upload
-        if: ${{ !inputs.check_only && !inputs.publish_release }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          path: ${{ env.UPLOAD_PATH }}   # the .7z on its own, or the folder of its parts when the split is on
-          archive: false   # the .7z (or its parts) as-is, not a zip around them; the artifact takes its name
-          retention-days: 1
-          if-no-files-found: error
+          echo "SPLIT=$split" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"                       # the scrambled archive (or its base) for the summary + upload
+          echo "UPLOAD_PATH=$([ "$split" = true ] && echo "$RUNNER_TEMP/out" || echo "$archive")" >> "$GITHUB_ENV"   # the folder holding the parts, or the .7z on its own
+          echo "ZIP_PATH=$([ "$split" = true ] && echo "$zip_path" || echo "$archive")" >> "$GITHUB_ENV"   # what the zipped upload takes (a wrong folder in test_fallback)
 
       - name: Publish a GitHub Release
+        id: release
+        continue-on-error: true   # when it fails (a network error, a file over the cap), the artifact steps below keep the archive instead of losing it
         if: ${{ inputs.publish_release && !inputs.check_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -282,19 +280,77 @@ jobs:
           # every file in $RUNNER_TEMP/out: the .7z when not split, or all its parts when the split is on
           shopt -s nullglob; files=("$RUNNER_TEMP"/out/*)
           if [ ${#files[@]} = 0 ]; then echo "::error::no archive to publish"; exit 1; fi
-          name=$(basename "${files[0]}")
           tag="ipa-${GITHUB_RUN_ID}-$(date +%s)"
           gh release create "$tag" --title "nxnative IPA: $(basename "$ARCHIVE" .7z)" \
-            --notes "Encrypted with your IPA_PASSWORD. Download all parts into one folder and open the first part (.001) with 7-Zip: the IPA inside is the one to sideload."
+            --notes "Encrypted with your IPA_PASSWORD. Download all parts (if there are several) into one folder and open the first part (.001) with 7-Zip: the IPA inside is the one to sideload."
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"   # so the next step can remove a release that was made but not filled
           gh release upload "$tag" "${files[@]}"
           echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
           echo "published $tag: ${#files[@]} file(s)"
+
+      - name: Remove the release that failed
+        if: ${{ steps.release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::warning::the Release upload failed: the archive is kept as a run artifact instead"
+          if [ -n "${RELEASE_TAG:-}" ]; then gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true; fi   # a release without its files is no use
+
+      # The run artifact: the way out when Release is off, and when the Release failed. The build takes hours and the IPA exists only on this runner, so each step that fails hands over to a simpler one:
+      #   one file ......... the .7z as it is (`archive: false` takes a single file only)
+      #   several parts .... a zip with no compression around them (the archive is encrypted already), and if that upload fails,
+      #   one file again ... the parts joined into one .7z (they are plain pieces of it: cat gives the archive back), uploaded as it is
+      - name: Upload the encrypted IPA
+        id: upload
+        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.UPLOAD_PATH }}   # the .7z
+          archive: false   # as it is, not a zip around it; the artifact takes its name
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the encrypted parts
+        id: parts
+        continue-on-error: true   # if it fails, the parts are joined and uploaded as one file below
+        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-${{ github.run_id }}
+          path: ${{ env.ZIP_PATH }}   # the folder of parts
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Join the parts into one file
+        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        run: |
+          echo "::warning::the upload of the parts failed: joining them into one file"
+          mkdir -p "$RUNNER_TEMP/single"; one="$RUNNER_TEMP/single/$(basename "$ARCHIVE")"; : > "$one"
+          shopt -s nullglob
+          for p in "$ARCHIVE".[0-9][0-9][0-9]; do cat "$p" >> "$one" && rm -f "$p"; done   # one part at a time: the disk holds the growing file and the parts still to come
+          if [ ! -s "$one" ]; then echo "::error::no parts to join"; exit 1; fi
+          echo "SINGLE_PATH=$one" >> "$GITHUB_ENV"
+          ls -l "$one"
+
+      - name: Upload the one file
+        id: single
+        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.SINGLE_PATH }}
+          archive: false
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Summary
         if: ${{ !inputs.check_only && !cancelled() }}
         env:
           OUTCOME: ${{ job.status }}
           URL: ${{ steps.upload.outputs.artifact-url }}
+          PARTS_URL: ${{ steps.parts.outputs.artifact-url }}
+          SINGLE_URL: ${{ steps.single.outputs.artifact-url }}
+          RELEASE_FAILED: ${{ steps.release.outcome == 'failure' }}
           RELEASE_URL: ${{ env.RELEASE_URL }}
           GAME_IPA: ${{ env.GAME_IPA }}
         run: |
@@ -304,13 +360,19 @@ jobs:
               echo
               echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
               echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the release page doesn't reveal the game; the file inside keeps the game's name)."
-              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The release holds the archive split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
-            elif [ "$OUTCOME" = success ] && [ -n "$URL" ]; then
-              echo "### Your IPA"
+              if [ "${SPLIT:-}" = true ]; then echo; echo "The release holds the archive split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
+            elif [ "$OUTCOME" = success ] && { [ -n "$URL" ] || [ -n "$PARTS_URL" ] || [ -n "$SINGLE_URL" ]; }; then
+              if [ "$RELEASE_FAILED" = true ]; then echo "### Your IPA (the Release upload failed, so it is a run artifact)"; else echo "### Your IPA"; fi
               echo
-              echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              if [ -n "$URL" ]; then
+                echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              elif [ -n "$PARTS_URL" ]; then
+                echo "[$(basename "$ARCHIVE" .7z)]($PARTS_URL), under Artifacts below, for one day. It is a zip of the archive's parts (the archive is over 2 GiB): unzip it, then open the first part (.001) with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              else
+                echo "[$(basename "$ARCHIVE")]($SINGLE_URL), under Artifacts below, for one day. The upload of the parts failed, so the parts were joined and this is the whole archive as one file. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              fi
               echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the artifact name doesn't reveal the game; the file inside keeps the game's name)."
-              if [ "${{ inputs.split_archive }}" = true ]; then echo; echo "The archive was split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
+              if [ "$RELEASE_FAILED" = true ]; then echo "The Release step's log says why it failed."; fi
             else
               echo "### The build failed"
               echo
