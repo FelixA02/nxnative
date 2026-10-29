@@ -53,6 +53,10 @@ on:
         description: 'Publish the encrypted archive as a GitHub Release asset instead of a run artifact (faster downloads from the release CDN, no 1-day expiry; needs contents: write; 2 GiB per-file cap applies)'
         type: boolean
         default: false
+      test_split:
+        description: '(TEMPORARY) Skip the download and build; just test the archive split + upload with a 3 GiB dummy file. Set Split archive on and pick Split parts.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
@@ -165,14 +169,14 @@ jobs:
           if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
 
       - name: Download the game
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && !inputs.test_split }}
         env:
           GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
           IN_TITLE_ID: ${{ inputs.title_id }}
         run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
 
       - name: Build the IPA
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && !inputs.test_split }}
         env:
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
           IN_LANGUAGE: ${{ inputs.language }}
@@ -216,13 +220,21 @@ jobs:
           IN_SPLIT: ${{ inputs.split_archive }}
           IN_PARTS: ${{ inputs.split_parts }}
           IN_RELEASE: ${{ inputs.publish_release }}
+          IN_TEST: ${{ inputs.test_split }}
         run: |
-          shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
-          if [ ${#ipas[@]} = 0 ]; then echo "::error::the build made no IPA"; exit 1; fi
-          ipa=${ipas[0]}; for f in "${ipas[@]}"; do if [ "$f" -nt "$ipa" ]; then ipa=$f; fi; done   # the newest
-          name=$(basename "$ipa")
-          mkdir -p "$RUNNER_TEMP/out" && mv "$ipa" "$RUNNER_TEMP/out/"
-          rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ "$IN_TEST" = true ]; then   # test_split: no game build, make a 3 GiB dummy to exercise the split + upload/release
+            name="split-test.ipa"
+            dd if=/dev/zero of="$RUNNER_TEMP/out/$name" bs=1048576 count=3072 status=none
+            echo "test mode: no build; made a 3 GiB dummy $name"
+          else
+            shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
+            if [ ${#ipas[@]} = 0 ]; then echo "::error::the build made no IPA"; exit 1; fi
+            ipa=${ipas[0]}; for f in "${ipas[@]}"; do if [ "$f" -nt "$ipa" ]; then ipa=$f; fi; done   # the newest
+            name=$(basename "$ipa")
+            mv "$ipa" "$RUNNER_TEMP/out/"
+            rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
+          fi
           # Split lightly into ~N parts (each just under the 2 GiB per-file cap) when asked, else one archive: -v<size> makes <name>.7z.001, .002, …
           vz=()
           up="$RUNNER_TEMP/out/$name.7z"
@@ -235,7 +247,7 @@ jobs:
                 echo "::error::$IN_PARTS parts would push a Release part at or past the 2 GiB per-file cap; use at least $(( (size + cap - 1) / cap )) parts, or more"; exit 1
               fi
             fi
-            vz=(-v "$per"); up="$RUNNER_TEMP/out"
+            vz=("-v$per"); up="$RUNNER_TEMP/out"   # 7-Zip wants the size glued to -v: -v1386873831, not -v 1386873831
             echo "splitting into ~$IN_PARTS parts (${per} bytes each)"
           fi
           # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
