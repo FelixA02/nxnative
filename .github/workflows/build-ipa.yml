@@ -42,11 +42,11 @@ on:
         type: boolean
         default: false
       split_archive:
-        description: 'Split the encrypted archive into part files; choose the count with Split parts. (The 2 GiB per-file cap applies to Release assets only, not run artifacts.)'
+        description: 'Split the encrypted archive into part files; choose the count with Split parts. Release assets split automatically if needed for GitHub''s 2 GiB per-file cap.'
         type: boolean
         default: false
       split_parts:
-        description: 'How many parts to split into when Split archive is on (2 and up). In Release mode, too few for the game size can hit the 2 GiB per-file cap; in artifact mode there is no cap.'
+        description: 'How many parts to split into when Split archive is on (2 and up). In Release mode, the count is increased automatically if needed for GitHub''s 2 GiB per-file cap; artifacts have no cap.'
         type: number
         default: 4
       publish_release:
@@ -242,17 +242,21 @@ jobs:
           # Split into ~N parts (each just under the 2 GiB per-file cap, which applies to Release assets only) when asked, else one archive: -v<size> makes <base>.7z.001, .002, …
           vz=()
           up="$archive"
-          if [ "$IN_SPLIT" = true ] && [ "${IN_PARTS:-1}" -gt 1 ]; then
-            size=$(stat -f%z "$RUNNER_TEMP/out/$name")   # bytes; a stored archive is about the size of the IPA
-            per=$(( (size + IN_PARTS - 1) / IN_PARTS ))   # ceil(bytes / parts)
-            if [ "$IN_RELEASE" = true ]; then   # the 2 GiB per-file cap applies to Release assets only, not run artifacts
-              cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
-              if [ "$per" -ge "$cap" ]; then
-                echo "::error::$IN_PARTS parts would push a Release part at or past the 2 GiB per-file cap; use at least $(( (size + cap - 1) / cap )) parts, or more"; exit 1
-              fi
+          size=$(stat -f%z "$RUNNER_TEMP/out/$name")   # bytes; a stored archive is about the size of the IPA
+          parts="${IN_PARTS:-1}"
+          if [ "$IN_RELEASE" = true ]; then   # the 2 GiB per-file cap applies to Release assets only, not run artifacts
+            cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
+            safe=$(( cap - 1024 * 1024 ))   # leave room for 7z headers and release-upload rounding
+            minimum=$(( (size + safe - 1) / safe ))
+            if [ "$minimum" -gt "$parts" ]; then
+              echo "::warning::the archive needs at least $minimum parts for GitHub's 2 GiB release-asset limit; increasing Split parts from $parts to $minimum"
+              parts=$minimum
             fi
+          fi
+          if { [ "$IN_SPLIT" = true ] && [ "$parts" -gt 1 ]; } || [ "$IN_RELEASE" = true ] && [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))   # ceil(bytes / parts)
             vz=("-v$per"); up="$RUNNER_TEMP/out"   # 7-Zip wants the size glued to -v: -v1386873831, not -v 1386873831
-            echo "splitting into ~$IN_PARTS parts (${per} bytes each)"
+            echo "splitting into ~$parts parts (${per} bytes each)"
           fi
           # stored (the IPA is compressed already), with its file name encrypted too (-mhe)
           7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "${vz[@]}" "$archive" "$RUNNER_TEMP/out/$name"
