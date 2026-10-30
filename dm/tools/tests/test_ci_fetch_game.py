@@ -66,6 +66,21 @@ class Names(unittest.TestCase):
         self.assertEqual(ci.command_value('https://h/a%20b?c=1\n'), 'https://h/a%2520b?c=1%0A')
 
 
+class VersionTag(unittest.TestCase):
+    def test_round_brackets_get_the_square_ones(self):   # the real update of run 30
+        n = 'Pokemon Violet (World) (En,Ja,Fr,De,Es,It,Zh-Hant,Zh-Hans,Ko) (v786432) (v4.0.0) (Update) [01008F6008C5E000].nsp'
+        self.assertEqual(ci.version_tagged(n), n[:-4] + ' [v786432].nsp')
+        self.assertEqual(ci.version_tagged('Game (v65536).NSZ'), 'Game (v65536) [v65536].NSZ')
+
+    def test_other_names_stay(self):
+        for n in ('Game [0100000000010800][v65536].nsp',          # already tagged
+                  'Game (v65536) [v65536].nsp',                    # already tagged, both ways
+                  'Game (v4.0.0) (Update).nsp',                    # a display version, not a number
+                  'Game (Rev 4).xci', 'Game (v65536).xci',         # cartridge dumps are not updates
+                  'Game.nsp'):
+            self.assertEqual(ci.version_tagged(n), n, n)
+
+
 class Take(unittest.TestCase):
     def setUp(self):
         self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
@@ -163,6 +178,14 @@ class Main(unittest.TestCase):
         with mock.patch.object(ci.time, 'sleep') as slept:
             rc, text = self.run_main(f'http://127.0.0.1:{port}/g.nsp')
         self.assertEqual(rc, 1); self.assertIn('curl exit 7', text); self.assertNotIn('broke off', text); slept.assert_not_called()
+
+    def test_update_named_with_round_brackets_is_tagged_in_the_folder(self):
+        self.srv.routes['/u'] = (pfs0(['u.nca']), {'Content-Disposition': 'attachment; filename="Game (v786432) (v4.0.0) (Update).nsp"'}, False)   # type: ignore[attr-defined]
+        self.srv.routes['/b'] = (pfs0(['b.nca']), {'Content-Disposition': 'attachment; filename="Game [v0].nsp"'}, False)   # type: ignore[attr-defined]
+        rc, text = self.run_main(f'{self.base}/u', f'{self.base}/b')
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['Game (v786432) (v4.0.0) (Update) [v786432].nsp', 'Game [v0].nsp'])
+        self.assertIn('tagged Game (v786432) (v4.0.0) (Update).nsp with its version', text)
 
     def test_several_links(self):
         path = '/' + BASE.replace(' ', '%20').replace('[', '%5B').replace(']', '%5D') + '.nsp'   # the name only in the URL: taken for its game extension

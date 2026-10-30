@@ -3,7 +3,7 @@
 #   into one folder, the NSP folder of build_ipa_from_nsp.py (which reads only that folder's top level, and only lower-case extensions).
 # The links: the command line's, else the run's "link" input (GITHUB_EVENT_PATH), else the GAME_LINK environment variable (the secret of that name); several are separated by white space
 #   (the base game, its update, its DLC). The log of a public repository is public: each link and its host are masked first (::add-mask::) and never printed.
-# A file keeps its name, which the NSP script reads version tags from ([v327680]): its name in the archive, else the server's (Content-Disposition), else the URL's when that ends in a game or
+# A file keeps its name, which the NSP script reads version tags from ([v327680]; an NSP named (v327680) instead gets the [v327680] added): its name in the archive, else the server's (Content-Disposition), else the URL's when that ends in a game or
 #   archive extension; a game file without a game extension gets the one its header calls for (PFS0: .nsp, or .nsz when it holds .ncz entries; XCI: .xci).
 # Archives (.zip, .7z, .rar, .tar and compressed tars; nested up to DEPTH deep) are unpacked with 7-Zip (7zz, brew install sevenzip), bsdtar (macOS's tar), or for a .zip Python's zipfile,
 #   and each is deleted as soon as it is unpacked: the runner's disk is short. Other files are dropped.
@@ -131,6 +131,18 @@ def place(p, name, out):   # move a game file into the NSP folder (a rename: the
     return dst
 
 
+VERSION_TAG, ROUND_VERSION = re.compile(r'\[v\d+\]'), re.compile(r'\(v(\d+)\)')
+
+
+def version_tagged(name):
+    """An update's version for the NSP script, which reads it only from a [vN] in the file name: dumps often write it (v786432) instead, so the script drops the update ("leaving out update NSPs without
+    a version tag") and a base game that needs it cannot be read (Pokémon Violet). The name with [vN] added for an NSP / NSZ that has (vN) and no [vN]; any other name unchanged"""
+    stem, ext = os.path.splitext(name)
+    m = ROUND_VERSION.search(name)
+    if ext.lower() not in ('.nsp', '.nsz') or VERSION_TAG.search(name) or not m: return name
+    return f'{stem} [v{m.group(1)}]{ext}'
+
+
 def empty(d):
     for c in d.iterdir():
         if c.is_dir() and not c.is_symlink(): shutil.rmtree(c)
@@ -249,6 +261,14 @@ def main(argv=None):
                 p.rename(q)
                 got[idx] = q   # the totals below stat the renamed files
                 say(f'tagged {p.name} with title ID {tid.upper()}')
+        for idx, p in enumerate(got):   # an update named (vN): add the [vN] the NSP script reads
+            new = version_tagged(p.name)
+            if new == p.name: continue
+            stem, ext = os.path.splitext(new); q = a.out / new; k = 2
+            while q.exists(): q = a.out / f'{stem} ({k}){ext}'; k += 1
+            p.rename(q)
+            got[idx] = q
+            say(f'tagged {p.name} with its version: {q.name}')
         if not got: raise Fail('the download holds no NSP, XCI, NSZ or XCZ file')
     except Fail as e:
         say(f'::error::{command_value(str(e))}'); return 1
