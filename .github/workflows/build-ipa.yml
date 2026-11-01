@@ -301,6 +301,8 @@ jobs:
           cd "$RUNNER_TEMP/game"
           7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           size=$(stat -f%z "$cache_archive")
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+          safe=$(( cap - 1024 * 1024 ))
           parts=$(( (size + safe - 1) / safe ))
           echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
           if [ "$parts" -gt 1 ]; then
