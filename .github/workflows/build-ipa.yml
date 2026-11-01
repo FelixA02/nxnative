@@ -85,10 +85,12 @@ jobs:
         env:
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
           missing=
           if [ -z "$PROD_KEYS" ]; then missing="$missing PROD_KEYS"; fi
           if [ -z "$IPA_PASSWORD" ]; then missing="$missing IPA_PASSWORD"; fi
+          if [ -z "$CACHE_PASSWORD" ]; then missing="$missing CACHE_PASSWORD"; fi
           if [ -n "$missing" ]; then echo "::error::missing repository secrets:$missing (Settings → Secrets and variables → Actions; docs/build-on-github.md)"; exit 1; fi
 
       # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, and the simulators of the
@@ -172,6 +174,7 @@ jobs:
         if: ${{ !inputs.check_only && !inputs.test_split }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
           title_id="${{ inputs.title_id }}"
           if [ -z "$title_id" ]; then
@@ -194,7 +197,7 @@ jobs:
             gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
             for f in "$RUNNER_TEMP/game/"*.7z*; do
               if [ -f "$f" ]; then
-                7zz x -y -o"$RUNNER_TEMP/game/" "$f" >/dev/null
+                7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null
                 rm -f "$f"
               fi
             done
@@ -243,6 +246,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
           build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
           if [ -z "$build_folder" ]; then
@@ -266,7 +270,7 @@ jobs:
           cache_archive="$RUNNER_TEMP/cache/cache.7z"
           rm -f "$cache_archive" "$cache_archive".*
           cd "$RUNNER_TEMP/game"
-          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "$cache_archive" "${cache_items[@]}"
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           size=$(stat -f%z "$cache_archive")
           cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
           safe=$(( cap - 1024 * 1024 ))
@@ -275,7 +279,7 @@ jobs:
           if [ "$parts" -gt 1 ]; then
             per=$(( (size + parts - 1) / parts ))
             rm -f "$cache_archive"
-            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "$cache_archive" "${cache_items[@]}"
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           fi
 
       - name: Keep the build logs
