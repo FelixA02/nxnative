@@ -57,6 +57,10 @@ on:
         description: '(TEMPORARY) Test mode only: make the first upload fail on purpose, to see the fallback work (Release on: the Release fails, so the run artifact is used; Release off: the zip of parts fails, so one file is uploaded)'
         type: boolean
         default: false
+      test_cache_upload:
+        description: '(TEMPORARY) Skip the game download and build; create a dummy cache archive and test the cache Release upload, fallback artifact, and old-release prune flow'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
@@ -207,14 +211,14 @@ jobs:
           fi
 
       - name: Download the game
-        if: ${{ !inputs.check_only && !inputs.test_split }}
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
         env:
           GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
           IN_TITLE_ID: ${{ inputs.title_id }}
         run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
 
       - name: Build the IPA
-        if: ${{ !inputs.check_only && !inputs.test_split }}
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
         env:
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
           IN_LANGUAGE: ${{ inputs.language }}
@@ -250,6 +254,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
+          version="${{ inputs.version || 'latest' }}"
+          if [ "${{ inputs.test_cache_upload }}" = true ]; then
+            title_id="${{ inputs.title_id || '010099C022B96000' }}"
+            cache_tag="cache-${title_id}-${version}"
+            echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+            mkdir -p "$RUNNER_TEMP/cache"
+            cache_archive="$RUNNER_TEMP/cache/cache.7z"
+            rm -f "$cache_archive" "$cache_archive".*
+            dummy="$RUNNER_TEMP/cache/dummy-cache"
+            dd if=/dev/zero of="$dummy" bs=1048576 count=$(( 1024 )) status=none   # 1 GiB dummy
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "$dummy"
+            size=$(stat -f%z "$cache_archive")
+            cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+            safe=$(( cap - 1024 * 1024 ))
+            parts=$(( (size + safe - 1) / safe ))
+            echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
+            if [ "$parts" -gt 1 ]; then
+              per=$(( (size + parts - 1) / parts ))
+              rm -f "$cache_archive"
+              7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "$dummy"
+            fi
+            echo "test mode: made a $size byte dummy cache archive"
+            exit 0
+          fi
           build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
           if [ -z "$build_folder" ]; then
             echo "No build folder found"
@@ -257,7 +285,6 @@ jobs:
           fi
           build_base=$(basename "$build_folder")
           title_id="${build_base%_build}"
-          version="${{ inputs.version || 'latest' }}"
           cache_tag="cache-${title_id}-${version}"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
           cache_items=()
@@ -274,8 +301,6 @@ jobs:
           cd "$RUNNER_TEMP/game"
           7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           size=$(stat -f%z "$cache_archive")
-          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
-          safe=$(( cap - 1024 * 1024 ))
           parts=$(( (size + safe - 1) / safe ))
           echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
           if [ "$parts" -gt 1 ]; then
@@ -296,7 +321,7 @@ jobs:
           retention-days: 7
 
       - name: Encrypt the IPA
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload }}
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
           IN_RELEASE: ${{ inputs.publish_release }}
@@ -354,8 +379,8 @@ jobs:
 
       - name: Publish a GitHub Release
         id: release
-        continue-on-error: true   # when it fails (a network error, a file over the cap), the artifact steps below keep the archive instead of losing it
-        if: ${{ inputs.publish_release && !inputs.check_only }}
+        continue-on-error: true
+        if: ${{ inputs.publish_release && !inputs.check_only && !inputs.test_cache_upload }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -439,7 +464,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Remove the release that failed
-        if: ${{ steps.release.outcome == 'failure' }}
+        if: ${{ steps.release.outcome == 'failure' && !inputs.test_cache_upload }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -452,7 +477,7 @@ jobs:
       #   one file again ... the parts joined into one .7z (they are plain pieces of it: cat gives the archive back), uploaded as it is
       - name: Upload the encrypted IPA
         id: upload
-        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ env.UPLOAD_PATH }}   # the .7z
@@ -462,8 +487,8 @@ jobs:
 
       - name: Upload the encrypted parts
         id: parts
-        continue-on-error: true   # if it fails, the parts are joined and uploaded as one file below
-        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
+        continue-on-error: true
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nxnative-${{ github.run_id }}
@@ -473,7 +498,7 @@ jobs:
           if-no-files-found: error
 
       - name: Join the parts into one file
-        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload && steps.parts.outcome == 'failure' }}
         run: |
           echo "::warning::the upload of the parts failed: joining them into one file"
           mkdir -p "$RUNNER_TEMP/single"; one="$RUNNER_TEMP/single/$(basename "$ARCHIVE")"; : > "$one"
@@ -485,7 +510,7 @@ jobs:
 
       - name: Upload the one file
         id: single
-        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload && steps.parts.outcome == 'failure' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ env.SINGLE_PATH }}
@@ -494,7 +519,7 @@ jobs:
           if-no-files-found: error
 
       - name: Summary
-        if: ${{ !inputs.check_only && !cancelled() }}
+        if: ${{ !inputs.check_only && !inputs.test_cache_upload && !cancelled() }}
         env:
           OUTCOME: ${{ job.status }}
           URL: ${{ steps.upload.outputs.artifact-url }}
