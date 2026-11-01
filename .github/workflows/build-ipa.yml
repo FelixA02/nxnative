@@ -221,6 +221,7 @@ jobs:
           IN_APP_NAME: ${{ inputs.app_name }}
           IN_VERSION: ${{ inputs.version }}
           IN_SHOW_FPS: ${{ inputs.show_fps }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
         run: |
           keys="$RUNNER_TEMP/keys/prod.keys"
           mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
@@ -229,6 +230,7 @@ jobs:
           if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
           if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
           if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
+          if [ -n "$IN_TITLE_ID" ]; then args+=(--title-id "$IN_TITLE_ID"); fi
           if [ "$IN_SHOW_FPS" = true ]; then args+=(--show-fps); else args+=(--no-show-fps); fi
           # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
           ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
