@@ -387,6 +387,33 @@ jobs:
           fi
           echo "published cache $tag: ${#files[@]} file(s)"
 
+      - name: Prune old cache releases
+        if: ${{ !inputs.check_only && !inputs.test_split && success() && steps.cache-release.outcome == 'success' && env.CACHE_TAG != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title_id="${{ inputs.title_id }}"
+          if [ -z "$title_id" ]; then
+            for f in "$RUNNER_TEMP/game/"*; do
+              if [[ "$f" =~ \[([0-9A-Fa-f]{16})\] ]]; then
+                title_id="${BASH_REMATCH[1]}"
+                break
+              fi
+            done
+          fi
+          if [ -z "$title_id" ]; then
+            echo "No title ID determined, skipping prune"
+            exit 0
+          fi
+          current="$CACHE_TAG"
+          mapfile -t old_releases < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq '.[] | select(.tagName | startswith("cache-" + env.title_id + "-")) | .tagName' 2>/dev/null || true)
+          for tag in "${old_releases[@]}"; do
+            if [ "$tag" != "$current" ]; then
+              echo "Deleting old cache release: $tag"
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            fi
+          done
+
       - name: Remove failed cache release
         if: ${{ steps.cache-release.outcome == 'failure' }}
         env:
