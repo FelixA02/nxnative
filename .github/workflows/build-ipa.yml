@@ -378,7 +378,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="$CACHE_TAG"
-          gh release create "$tag" --clobber -R "$GITHUB_REPOSITORY" \
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
             --title "Build cache: $tag" \
             --notes "Cache for $tag. Download all parts into the build folder and extract, or let the workflow restore it automatically."
           shopt -s nullglob
