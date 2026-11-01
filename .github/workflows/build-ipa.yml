@@ -168,6 +168,41 @@ jobs:
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
           if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
 
+      - name: Restore build cache
+        if: ${{ !inputs.check_only && !inputs.test_split }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title_id="${{ inputs.title_id }}"
+          if [ -z "$title_id" ]; then
+            for f in "$RUNNER_TEMP/game/"*; do
+              if [[ "$f" =~ \[([0-9A-Fa-f]{16})\] ]]; then
+                title_id="${BASH_REMATCH[1]}"
+                break
+              fi
+            done
+          fi
+          if [ -z "$title_id" ]; then
+            echo "No title ID determined, skipping cache restore"
+            exit 0
+          fi
+          version="${{ inputs.version || 'latest' }}"
+          cache_tag="cache-${title_id}-${version}"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          if gh release view "$cache_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/game"
+            gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
+            for f in "$RUNNER_TEMP/game/"*.7z*; do
+              if [ -f "$f" ]; then
+                7zz x -y -o"$RUNNER_TEMP/game/" "$f" >/dev/null
+                rm -f "$f"
+              fi
+            done
+            echo "Restored cache: $cache_tag"
+          else
+            echo "No cache release $cache_tag found"
+          fi
+
       - name: Download the game
         if: ${{ !inputs.check_only && !inputs.test_split }}
         env:
@@ -201,6 +236,47 @@ jobs:
           low=$(awk 'NR == 1 || $1 < m { m = $1 } END { if (NR) printf "%.1f", m / 1048576 }' "$RUNNER_TEMP/free.log")
           if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
           exit "$rc"
+
+      - name: Save build cache
+        if: ${{ !inputs.check_only && !inputs.test_split && success() }}
+        id: cache-save
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
+          if [ -z "$build_folder" ]; then
+            echo "No build folder found"
+            exit 0
+          fi
+          build_base=$(basename "$build_folder")
+          title_id="${build_base%_build}"
+          version="${{ inputs.version || 'latest' }}"
+          cache_tag="cache-${title_id}-${version}"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          cache_items=()
+          [ -d "$build_folder/shader" ] && cache_items+=("$build_base/shader")
+          [ -d "$build_folder/pso_archive" ] && cache_items+=("$build_base/pso_archive")
+          [ -d "$build_folder/profile" ] && cache_items+=("$build_base/profile")
+          if [ ${#cache_items[@]} -eq 0 ]; then
+            echo "No cache to save"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/cache"
+          cache_archive="$RUNNER_TEMP/cache/cache.7z"
+          rm -f "$cache_archive" "$cache_archive".*
+          cd "$RUNNER_TEMP/game"
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "$cache_archive" "${cache_items[@]}"
+          size=$(stat -f%z "$cache_archive")
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+          safe=$(( cap - 1024 * 1024 ))
+          parts=$(( (size + safe - 1) / safe ))
+          echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
+          if [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))
+            rm -f "$cache_archive"
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "$cache_archive" "${cache_items[@]}"
+          fi
 
       - name: Keep the build logs
         if: ${{ failure() && !inputs.check_only }}
@@ -287,6 +363,44 @@ jobs:
           gh release upload "$tag" "${files[@]}"
           echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
           echo "published $tag: ${#files[@]} file(s)"
+
+      - name: Publish cache release
+        id: cache-release
+        continue-on-error: true
+        if: ${{ !inputs.check_only && !inputs.test_split && success() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$CACHE_TAG"
+          gh release create "$tag" --clobber -R "$GITHUB_REPOSITORY" \
+            --title "Build cache: $tag" \
+            --notes "Cache for $tag. Download all parts into the build folder and extract, or let the workflow restore it automatically."
+          shopt -s nullglob
+          files=("$RUNNER_TEMP/cache"/*)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload "$tag" "${files[@]}" -R "$GITHUB_REPOSITORY"
+            echo "RELEASE_URL=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_ENV"
+          fi
+          echo "published cache $tag: ${#files[@]} file(s)"
+
+      - name: Remove failed cache release
+        if: ${{ steps.cache-release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${CACHE_TAG:-}" ]; then
+            gh release delete "$CACHE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          fi
+
+      - name: Upload cache as artifact
+        if: ${{ !inputs.check_only && !inputs.test_split && steps.cache-release.outcome == 'failure' && env.CACHE_TAG != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-cache-${{ env.CACHE_TAG }}
+          path: ${{ env.CACHE_PARTS == '1' && '$RUNNER_TEMP/cache/cache.7z' || '$RUNNER_TEMP/cache' }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Remove the release that failed
         if: ${{ steps.release.outcome == 'failure' }}
