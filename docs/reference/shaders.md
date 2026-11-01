@@ -468,10 +468,18 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 ### Metal compiler of a newer Xcode
 
 - **Symptom:** after an Xcode update the build stops with `[RED] this Mac's Metal compiler is not the one the shaders were tested with (dm/gfx/tools/dmsh_chain.lock): metal_macosx Apple metal version 32023.922 …`; `xcodebuild -downloadComponent MetalToolchain`, as the message said, downloads the same untested compiler again.
-- **Cause:** since Xcode 26 the Metal toolchain is a system asset that each Xcode downloads in its own build and `xcrun` takes for the selected Xcode (`xcodebuild -showComponent MetalToolchain` names it), whatever the macOS version: macOS 27.2 with Xcode 27.1 selected gives the tested 32023.921, with Xcode 27.2 selected 32023.922. The message named the Xcode to install but not that it must be the selected one, and README linked the App Store, which offers only the newest Xcode.
+- **Cause:** since Xcode 26 the Metal toolchain is a system asset that each Xcode downloads in its own build and `xcrun` takes for the selected Xcode (`xcodebuild -showComponent MetalToolchain` names it), whatever the macOS version. When #717 was reported, macOS 27.2 with Xcode 27.1 selected gave the then-pinned 32023.921, with Xcode 27.2 selected 32023.922. The message named the Xcode to install but not that it must be the selected one, and README linked the App Store, which offers only the newest Xcode.
 - **Fix:** the stop message names the selected Xcode and its folder, and says to install the tested Xcode from Apple's download page (beside a newer one as `Xcode-<version>.app`), select it (`xcode-select -s` or `DEVELOPER_DIR`), then download its Metal toolchain; README says the same. The lock stays at the one tested compiler: another one needs a regression run before it is recorded, and the lock is part of the chain version. Whether two installed toolchain assets each follow their own Xcode is inferred from `-showComponent`, not yet tried with both installed (**open**).
 - **Found on:** no game: [GitHub issue #717](https://github.com/seedds/nxnative/issues/717), on macOS 27.2 with Xcode 27.2 (Metal Toolchain 27B47).
 - **Check:** `test_own_compilers.py` (the selection step before the download), `test_ci_toolchain.py` (the message's and README's Xcode are CI's).
+
+### Idle MSBuild workers block regression measurements
+
+- **Symptom:** `regress.py` waits for other jobs to end while the only reported jobs are sleeping `MSBuild.dll /nodemode:1 /nodeReuse:true` workers using 0% CPU.
+- **Cause:** the busy-machine check treated every `dotnet` process as an active build. Reusable MSBuild workers can remain asleep after their build exits, and later builds can recreate them after a build-server shutdown.
+- **Fix:** exclude only sleeping, zero-CPU MSBuild reuse workers whose parent has exited. Active workers, I/O-blocked workers, workers still attached to a parent, and build commands remain busy jobs.
+- **Check:** `test_regress.py` supplies the process census that blocked the measurement, with active, I/O-blocked and parented controls.
+- **Found on:** no game: Xcode 27.2 toolchain validation on an M4 Pro.
 
 ### SPIRV-Cross parse failures
 
@@ -1025,6 +1033,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md#rendering-and-shaders), update 1.1.0: a 308.4 ms frame, 283.5 ms of it pipeline acquisition and 5.9 ms GPU work; with the tables the offline prebuild built all 7,495 bases. [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#pipelines-on-a-cold-start): frames of 100–546 ms before, none of its bases compiled on the first start after.
 - **Check:** `test_nsp_mac_app`: `App.test_pipeline_pair_tables`, `App.test_split_pso_pairs` and `App.test_layout` fail without the tables in the packer; `Script.test_pack_command` checks the split's copy is passed only when the profile has no `pso_pairs.tsv`.
 
+### Offline pipeline archive missing for the device GPU
+
+- **Symptom:** `pipeline archive bundled with the app: none for this GPU (...)`: the device builds the bases itself although the app carries an offline archive.
+- **Cause:** each archive targets one GPU architecture. The iOS packers defaulted to `g18p` for profiles with `pso_mtl4 on`; another GPU family needed an explicit build override.
+- **Fix:** both packers also read the optional profile key `pso_gpu` behind the existing `pso_mtl4 on` gate. It names the families to build for; explicit build overrides still win. Without the new key, opted-in profiles retain `g18p`; profiles with Metal 4 off retain no archive. See [archive target selection](../development.md#the-pipeline-archive-made-offline).
+- **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md#offline-pipeline-archive-probe). Its note records the contributor's Mac build probe and the outstanding device checks.
+- **Check:** `dm/tools/tests/test_game_profile.py` validates the key; `dm/tools/tests/test_pso_offline.py` exercises both packers' selection and override precedence with synthetic profiles.
+
 ### Offline pipeline archive reuse and fallback
 
 - **Symptom:** a truncated `.mtl4a` reaches `MTL4ArchiveImpl::loadFromURL`; the bundle reports coverage with `0 of 0 probed bases found`; rebuilt shader libraries reuse an archive of their old binaries; or packing fails with `pso_offline: no base to build` when every eligible pair has function constants, or when the profile's `shader_pairs.tsv` holds only its header (`--platform mac-app`, [GitHub issue #338](https://github.com/seedds/nxnative/issues/338)).
@@ -1080,6 +1096,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** `dmsh_build.py`'s shader cache was keyed without the pairs.
 - **Fix:** the per-shader key covers the pairs, and a paired vertex shader's key also covers its pixel shaders' keys (`shader_key`, `pair_keyed`), so a change to a profile's pairs rebuilds what it affects ([Pixel shader inputs the vertex shader does not write](#pixel-shader-inputs-the-vertex-shader-does-not-write)).
 - **Found on:** [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md).
+
+### Partial vertex builds missing paired pixel sources
+
+- **Symptom:** a full build reports successful shaders, but `metal-tt` rejects its pipeline archive with fragment inputs not written by the vertex shader. Fifteen cached vertices lacked default outputs in DRAGON QUEST I & II.
+- **Cause:** a partial build requested only its vertex keys. `vs_pad` skipped absent paired pixel MSL, then cached the incomplete vertex under a key that already included those pixel shaders' input digests. A later full build restored it before pixel-first finishing and never padded that cache hit again.
+- **Fix:** include available paired pixel shaders in partial build keys and output cleanup, then finish pixels before vertices. Do not publish a paired vertex cache entry while any paired pixel MSL is missing. The code fingerprint excludes the old incomplete cache entries; the Metal source cache still reuses unchanged complete libraries.
+- **Found on:** [DRAGON QUEST I & II HD-2D Remake](../../dm/games/0100D7C01F254000/README.md#found-on-this-game), while building its Mac pipeline archive.
+- **Check:** `test_shader_toolchain_cache.py` requests a vertex alone, exercises dependency cleanup and pixel-first finishing, and checks that padding survives publication and a later full-cache restore. A missing pixel source prevents publication.
 
 ### Target selection keeps the shader analysis files in the cache
 
@@ -1173,3 +1197,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `dmsh_geometry.capture` initializes only words absent from the captured outputs. The capture slot map stores each selected word once, including defaults for absent outputs. Position W, point size, generic W, clip distances, layer and viewport retain their existing bit values. Full capture selects all 144 words; lean capture selects its consumed words. Shaders and host must be rebuilt together.
 - **Check:** the synthetic throughput comparison alternates control/candidate order and verifies all 9,437,184 captured words against both the original buffer and literal expected values. Mac runs vary in timing, so their percentage gain does not establish iPhone gameplay FPS. The optional real-translator capture fixture in `t_geometry` also checks all uncaptured defaults. All 1,225 NieR shaders build for Mac and iPhone; standard geometry replay and dependency checks pass.
 - **Found on:** [NieR:Automata US 1.0.3](../../dm/games/010056B015FE8000/README.md#factory-combat-capture-and-9s-texture-follow-up), iPhone City Ruins: 14 geometry groups in the captured frame spend 7.485 ms in vertex capture, 6.512 ms in compute and 1.019 ms in depth raster. The accompanying pass dump affects total frame time; its large uncovered GPU interval must not be treated as a clean gameplay hitch measurement.
+
+### The host's own shaders compiled from source at run time
+
+- **Symptom:** Apple's performance HUD (`DM_METAL_HUD=1`) says `Compiled 2 shaders. Total compilation time is 102.70ms. Consider adopting MTL4Compiler for more fine grained compilations` during play, with a dip in the frame-rate graph at that moment, for example when a new room first issues a scissored clear.
+- **Cause:** the host compiled the shaders it writes itself from MSL source at run time (`newLibraryWithSource:`): built-in kernels, clears, copies, `nvnCommandBufferDrawTexture`, the RGB565 red / blue exchange, index conversions, geometry packing, transform feedback, the present, the GPU deswizzle and the OpenGL layer's clear quad. The thread that asked waits for the compiler. The clear triangles were one library per colour slot and type (`snprintf`), up to 24, each compiled when a clear of that kind was first met: about 50 ms each on an iPhone, on the submitting thread. `MTL4Compiler`'s `newLibraryWithDescriptor:` with a source is no way around it: it calls the device's `newLibraryWithSource:` itself (a check with a swizzled device shows the call), and the HUD counts that too.
+- **Fix:** the sources are `.metal` files in `dm/gfx/msl` (the clears in one library: `clr_fs_<slot>_<float|uint|int>`). `dm/gfx/tools/host_msl.py` compiles them when the host is built: `make -C dm/host` for the Mac, and `gen_build.py` with `MSL_SDK=iphoneos` for the app's deployment target on iOS. It writes `dm/host/gen/msl-<sdk>/host_msl_gen.h`, which holds each library's metallib and source. `host_msl_lib` (`dm/gfx/nvn/host_msl.m`) loads one by name with `newLibraryWithData:`, once per device, so nothing is compiled; the pipelines are made as before. A build without the Metal toolchain carries the sources only: the host then compiles each library once and logs a `[RED]` line (`compiled from its source in … ms`). The first load logs `host shader libraries: 13, compiled for <sdk> by <metal version>`. The diagnostic overrides (`DM_NVN_HILITE`, `DM_NVN_MAGSCAN`, `DM_NVN_TEXDUMP`) still compile theirs from source.
+- **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md#found-on-this-game), iPhone 17 Pro Max: the HUD's compile warning in play, from clear-triangle libraries compiled when a new room first issued a scissored clear.
+- **Check:** `t_host_msl` loads every library, with a swizzled `newLibraryWithSource:` that counts 0 calls, and finds all 24 clear functions. `t_builtin`, `t_geometry` and `t_deswz_gpu` use the built libraries.
+- **Build inputs:** Mac libraries use `MACOS_MIN` from `dm/mac/min_os.mk`, matching the host's deployment target; otherwise a newer SDK emits libraries older supported Macs cannot load and the host falls back to runtime compilation. Every build rechecks the compiler, SDK, deployment target and source contents, reusing the header only when all match. Installing the Metal toolchain after a source-only build therefore regenerates the libraries without a clean build.
+- **Build callers:** the NSP packer and regression harness generate the Mac header before checking their cached host executables, and include it in the host fingerprint. The standalone iOS compile check generates the iPhone header before its dry run, as the app build does. A dry run alone does not generate either header.
