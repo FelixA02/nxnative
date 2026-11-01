@@ -7,6 +7,9 @@
 #   archive extension; a game file without a game extension gets the one its header calls for (PFS0: .nsp, or .nsz when it holds .ncz entries; XCI: .xci).
 # Archives (.zip, .7z, .rar, .tar and compressed tars; nested up to DEPTH deep) are unpacked with 7-Zip (7zz, brew install sevenzip), bsdtar (macOS's tar), or for a .zip Python's zipfile,
 #   and each is deleted as soon as it is unpacked: the runner's disk is short. Other files are dropped.
+# A console dump (a Switch 2 game, Donkey Kong Bananza: folders instead of NSPs) is recognized by its layout, base/exefs/main.npdm with base/romfs (updates/<version>/exefs/main.npdm, dlc/<title ID>/ too),
+#   wherever it sits in an archive (a wrapper folder is fine): its folders are moved into the NSP folder as they are, and the NSP script, which tells a dump folder the same way, packs it with
+#   scripts/pack_dump.py and needs no prod.keys. Several archives (base, update, DLC) merge into one folder.
 # Usage: ci_fetch_game.py --out <NSP folder> --work <scratch folder> [link ...]; exit 0 when the folder holds a game file, 1 otherwise (the reason as a ::error:: line)
 import argparse, email.message, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, threading, time, zipfile
 from pathlib import Path, PurePosixPath
@@ -177,6 +180,82 @@ def unpack(p, kind, d):
     raise Fail(f'could not unpack the {kind} archive ({errs[0][-300:] if errs else "no tool to unpack it"})' + ('' if seven else '; 7-Zip is not installed: brew install sevenzip'))
 
 
+DUMP_NAMES = (re.compile(r'(^|/)base/exefs/main\.npdm$'), re.compile(r'(^|/)updates/\d+/exefs/main\.npdm$'), re.compile(r'(^|/)dlc/[0-9A-Fa-f]{16}/'))
+
+
+def dump_in(names):   # whether an archive's entry names hold a console dump's layout
+    return any(m.search(n.replace('\\', '/')) for n in names for m in DUMP_NAMES)
+
+
+def is_dump_root(r):   # a folder that holds a dump (or a part of one: an update or DLC alone)
+    if (r / 'base/exefs/main.npdm').is_file(): return True
+    if (r / 'updates').is_dir() and any((r / 'updates').glob('[0-9]*/exefs/main.npdm')): return True
+    return (r / 'dlc').is_dir() and any(c.is_dir() and re.fullmatch(r'[0-9A-Fa-f]{16}', c.name) for c in (r / 'dlc').iterdir())
+
+
+def dump_roots(d, depth=4):
+    """The topmost folders under d that hold a dump, looking up to depth folders down (an archive of the game's folder has it one level in)"""
+    found = []
+
+    def walk(r, k):
+        if is_dump_root(r): found.append(r); return
+        if k < depth:
+            for c in sorted(r.iterdir()):
+                if c.is_dir() and not c.is_symlink(): walk(c, k + 1)
+    walk(d, 0)
+    return found
+
+
+def merge_into(src, dst):
+    """Move what is in folder src into folder dst, folder by folder (a rename: the same volume, so a dump of tens of GB costs no copy). A file both have is an error: two archives of one dump must not overlap.
+    Returns the paths of src's entries as they are now in dst"""
+    dst.mkdir(parents=True, exist_ok=True); placed = []
+    for c in sorted(src.iterdir()):
+        t = dst / c.name
+        if c.is_dir() and not c.is_symlink() and t.is_dir(): merge_into(c, t)
+        elif t.exists() or t.is_symlink(): raise Fail(f'{c.name} is in two of the downloads, both holding the dump\'s files')
+        else: shutil.move(c, t)
+        placed.append(t)
+    return placed
+
+
+def size_of(p):   # a file's size, or a folder's total
+    if p.is_file(): return p.stat().st_size
+    return sum(f.stat().st_size for f in files_in(p))
+
+
+def readable(d):
+    """Archives keep their files' unix permissions, and a file or folder dumped without read access (a `Phive` in a game folder, run 38) cannot be opened by the build's user: add the owner's read / write (and
+    search, for a folder) bits to everything under d. A folder is opened up before os.walk goes into it"""
+    def add(q, bits):
+        try:
+            if not os.path.islink(q): os.chmod(q, os.stat(q).st_mode | bits)
+        except OSError: pass
+    for root, dirs, files in os.walk(d):
+        for n in dirs: add(os.path.join(root, n), 0o700)
+        for n in files: add(os.path.join(root, n), 0o600)
+
+
+def listing(p, kind):
+    """The entry names of archive p, from its index alone: a zip through zipfile, else 7-Zip's or bsdtar's listing; None when it cannot be listed (encrypted headers, no tool, a tar: listing it reads
+    the whole stream)"""
+    if kind == 'zip':
+        try:
+            with zipfile.ZipFile(p) as z: return z.namelist()
+        except (zipfile.BadZipFile, NotImplementedError, OSError): pass
+    if kind not in ('zip', '7z', 'rar'): return None
+    seven = shutil.which('7zz') or shutil.which('7z')
+    bsd = shutil.which('bsdtar') or (shutil.which('tar') if sys.platform == 'darwin' else None)
+    for cmd, pick in (([seven, 'l', '-slt', '-ba', '-bd', str(p)], lambda ln: ln[7:] if ln.startswith('Path = ') else None), ([bsd, '-tf', str(p)], lambda ln: ln or None)) if seven or bsd else ():
+        if not cmd[0]: continue
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace')
+        if r.returncode == 0: return [n for n in map(pick, r.stdout.splitlines()) if n]
+    return None
+
+
+SKIPPED = {'n': 0}   # files that were neither game files nor archives: counted, not listed (a game folder has tens of thousands)
+
+
 def files_in(d):   # the regular files under d, sorted (links are neither followed nor taken)
     out = []
     for root, dirs, files in os.walk(d):
@@ -187,15 +266,30 @@ def files_in(d):   # the regular files under d, sorted (links are neither follow
 
 def take(p, name, out, work, depth=0):
     """A downloaded or unpacked file p, called name: a game file goes into out, an archive is unpacked and its files taken in turn, anything else is dropped. Returns the game files placed"""
-    kind, shown = sniff(p), name or 'the download'
+    shown = name or 'the download'
+    try: kind = sniff(p)
+    except OSError: SKIPPED['n'] += 1; return []   # cannot be read: not a game file
     if kind in ('pfs0', 'xci'): return [place(p, game_name(p, name, kind), out)]
     if kind == 'html' and depth == 0: p.unlink(); raise Fail('the link gave a web page, not a file: it must be a direct download link (in a browser, the file downloads at once, with no page or button)')
-    if kind in (None, 'html'): say(f'skipped {shown}: not a game file or an archive'); p.unlink(); return []
+    # a file inside an archive is unpacked only when its name says archive: a game folder is full of files that look like one by their first bytes (.zs is a zstd stream, .pak ...)
+    if kind in (None, 'html') or (depth > 0 and not name.lower().endswith(ARCHIVE)): SKIPPED['n'] += 1; p.unlink(); return []
     if depth >= DEPTH: raise Fail(f'{shown}: archives nested more than {DEPTH} deep')
+    names = listing(p, kind)   # the index only: an extracted game folder is told apart before its tens of GB are unpacked
+    if names and len(names) > 20 and not any(n.lower().endswith(GAME + ARCHIVE) for n in names) and not dump_in(names):
+        eg = ', '.join(os.path.basename(n.rstrip('/')) for n in names[:3])
+        raise Fail(f'the {kind} archive holds {len(names):,} files and none is an NSP, XCI, NSZ or XCZ (or an archive of them), for example {eg}: it looks like an extracted game folder. The build needs the game as NSP or XCI files')
     say(f'unpacking {shown} ({kind}, {gb(p.stat().st_size)})')
     d = Path(tempfile.mkdtemp(prefix='unpack_', dir=work))
     try:
         unpack(p, kind, d); p.unlink()   # the archive's space back before its files are moved
+        readable(d)
+        roots = dump_roots(d)
+        if roots:   # a console dump: its folders go into the NSP folder as they are
+            got = []
+            for r in roots:
+                say(f'a game dump: {", ".join(sorted(c.name for c in r.iterdir() if c.is_dir()))}')
+                got += [q for q in merge_into(r, out) if q not in got]
+            return got
         got = []
         for f in files_in(d): got += take(f, f.name, out, work, depth + 1)
         return got
@@ -254,7 +348,7 @@ def main(argv=None):
         tid = re.sub(r'[^0-9A-Fa-f]', '', os.environ.get('IN_TITLE_ID', ''))[:16]
         if len(tid) == 16:   # a cartridge dump (.xci) with no [title ID] in its name: tag it, which the NSP script reads title IDs from
             for idx, p in enumerate(got):
-                if re.search(r'\[[0-9A-Fa-f]{16}\]', p.name): continue
+                if p.is_dir() or re.search(r'\[[0-9A-Fa-f]{16}\]', p.name): continue   # a dump's folders are not renamed
                 stem, ext = os.path.splitext(p.name)
                 q = a.out / f'{stem} [{tid.upper()}]{ext}'; k = 2
                 while q.exists(): q = a.out / f'{stem} [{tid.upper()}] ({k}){ext}'; k += 1
@@ -269,14 +363,16 @@ def main(argv=None):
             p.rename(q)
             got[idx] = q
             say(f'tagged {p.name} with its version: {q.name}')
+        if SKIPPED['n']: say(f'left out {SKIPPED["n"]:,} files that are neither game files nor archives')
         if not got: raise Fail('the download holds no NSP, XCI, NSZ or XCZ file')
     except Fail as e:
         say(f'::error::{command_value(str(e))}'); return 1
-    total = sum(p.stat().st_size for p in got)
-    say(f'{len(got)} game file{"s" if len(got) > 1 else ""}, {gb(total)}, in {a.out}; {gb(shutil.disk_usage(a.out).free)} free')
+    total = sum(size_of(p) for p in got)
+    what = 'game folder' if all(p.is_dir() for p in got) else 'game file'
+    say(f'{len(got)} {what}{"s" if len(got) > 1 else ""}, {gb(total)}, in {a.out}; {gb(shutil.disk_usage(a.out).free)} free')
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as s:
-            s.write(f'### Game files\n\n{len(got)} file{"s" if len(got) > 1 else ""}, {gb(total)}:\n\n' + ''.join(f'- `{p.name}` ({gb(p.stat().st_size)})\n' for p in got) + '\n')
+            s.write(f'### Game files\n\n{len(got)} {what}{"s" if len(got) > 1 else ""}, {gb(total)}:\n\n' + ''.join(f'- `{p.name}{"/" if p.is_dir() else ""}` ({gb(size_of(p))})\n' for p in got) + '\n')
     return 0
 
 

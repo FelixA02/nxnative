@@ -40,6 +40,14 @@ def zipped(members):   # {name: bytes} → a .zip's bytes
     return b.getvalue()
 
 
+def dump_files(wrap='', others=25, update=True, dlc=True):   # a console dump's layout (Donkey Kong Bananza): paths only matter, the bytes are not an NPDM
+    f = {f'{wrap}base/exefs/main.npdm': b'META', f'{wrap}base/exefs/main': b'MAIN', f'{wrap}base/exefs/sdk': b'SDK', f'{wrap}base/romfs/Phive': b'phive'}
+    f.update({f'{wrap}base/romfs/System/Resource/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 40 for i in range(others)})
+    if update: f.update({f'{wrap}updates/458752/exefs/main.npdm': b'META', f'{wrap}updates/458752/exefs/main': b'MAIN2', f'{wrap}updates/458752/romfs/a.zs': b'\x28\xb5\x2f\xfdz'})
+    if dlc: f[f'{wrap}dlc/040074a01bf13001/0/romfs/Dlc.bin'] = b'dlc'
+    return f
+
+
 class Names(unittest.TestCase):
     def test_served_name(self):
         self.assertEqual(ci.served_name(f'attachment; filename="{BASE}.nsp"', 'https://h/x?id=1'), f'{BASE}.nsp')
@@ -100,6 +108,67 @@ class Take(unittest.TestCase):
     def test_game_file_as_is(self):
         got = self.take(pfs0(['x.nca']), f'{BASE}.nsp')
         self.assertEqual([p.name for p in got], [f'{BASE}.nsp'])
+
+    def test_extracted_game_folder_is_refused_before_unpacking(self):   # run 38: tens of thousands of files, none a game file
+        z = zipped({f'romfs/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 50 for i in range(30)} | {'romfs/Phive': b'x'})
+        with self.assertRaisesRegex(ci.Fail, r'holds 31 files and none is an NSP.*extracted game folder'):
+            self.take(z, 'game.zip')
+        self.assertEqual([p.name for p in self.work.iterdir()], ['download'])   # nothing was unpacked
+
+    def test_a_game_file_among_many_others_is_taken_and_the_others_left_out(self):
+        files = {f'romfs/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 50 for i in range(30)}
+        files[f'{BASE}.nsp'] = pfs0(['x.nca'])
+        p = self.work / 'download'; p.write_bytes(zipped(files)); out = io.StringIO()
+        ci.SKIPPED['n'] = 0
+        with contextlib.redirect_stdout(out): got = ci.take(p, 'game.zip', self.out, self.work)
+        self.assertEqual([g.name for g in got], [f'{BASE}.nsp'])
+        self.assertEqual(ci.SKIPPED['n'], 30)
+        self.assertNotIn('.zs', out.getvalue())   # the .zs files (zstd streams) were not unpacked one by one, nor listed
+
+    def test_a_small_archive_without_game_extensions_is_still_unpacked(self):   # a renamed dump
+        got = self.take(zipped({'dump': pfs0(['x.nca'])}), 'game.zip')
+        self.assertEqual([g.name for g in got], ['dump.nsp'])
+
+    def test_unreadable_files_and_folders_are_opened_up(self):
+        d = self.t / 'tree'; (d / 'sub').mkdir(parents=True)
+        (d / 'sub' / 'Phive').write_bytes(b'x'); (d / 'sub' / 'Phive').chmod(0o000); (d / 'sub').chmod(0o000)
+        ci.readable(d)
+        self.assertEqual((d / 'sub').stat().st_mode & 0o700, 0o700)
+        self.assertEqual((d / 'sub' / 'Phive').stat().st_mode & 0o600, 0o600)
+
+    def tree(self):   # every file under the NSP folder, relative
+        return sorted(str(p.relative_to(self.out)) for p in self.out.rglob('*') if p.is_file())
+
+    def test_dump_in_a_wrapper_folder_goes_into_the_nsp_folder_as_it_is(self):
+        got = self.take(zipped(dump_files('Donkey Kong Bananza/')), 'bananza.zip')
+        self.assertEqual(sorted(p.name for p in got), ['base', 'dlc', 'updates'])
+        self.assertTrue(all(p.is_dir() for p in got))
+        self.assertIn('base/exefs/main.npdm', self.tree()); self.assertIn('updates/458752/exefs/main', self.tree()); self.assertIn('dlc/040074a01bf13001/0/romfs/Dlc.bin', self.tree())
+        self.assertEqual(len(self.tree()), 33)   # base: 3 exefs files + Phive + 25 .zs = 29; the update: 3 files; the DLC: 1
+        self.assertEqual(list(self.work.iterdir()), [])   # the archive and its unpacked folder are gone
+
+    def test_dump_without_a_wrapper_folder(self):
+        got = self.take(zipped(dump_files('', update=False, dlc=False)), 'b.zip')
+        self.assertEqual(sorted(p.name for p in got), ['base'])
+
+    def test_base_and_update_in_separate_archives_merge(self):
+        self.take(zipped(dump_files('G/', update=False, dlc=False)), 'base.zip')
+        got = self.take(zipped({'G/updates/458752/exefs/main.npdm': b'META', 'G/updates/458752/exefs/main': b'M', 'G/updates/458752/romfs/a.bin': b'a'}), 'update.zip')
+        self.assertEqual([p.name for p in got], ['updates'])
+        self.assertTrue(any(f.startswith('base/') for f in self.tree()) and any(f.startswith('updates/458752/romfs/') for f in self.tree()))
+
+    def test_two_archives_with_the_same_file_are_refused(self):
+        self.take(zipped(dump_files('', update=False, dlc=False)), 'one.zip')
+        with self.assertRaisesRegex(ci.Fail, 'in two of the downloads'): self.take(zipped(dump_files('', update=False, dlc=False)), 'two.zip')
+
+    def test_many_files_without_a_dump_layout_are_still_refused(self):
+        with self.assertRaisesRegex(ci.Fail, 'extracted game folder'): self.take(zipped({f'romfs/{i}.bin': b'x' for i in range(30)}), 'junk.zip')
+
+    def test_dump_roots_and_size(self):
+        d = self.t / 'x'; (d / 'a/b/base/exefs').mkdir(parents=True); (d / 'a/b/base/exefs/main.npdm').write_bytes(b'12345'); (d / 'a/b/base/romfs').mkdir()
+        (d / 'other').mkdir(); (d / 'other/file').write_bytes(b'z')
+        self.assertEqual(ci.dump_roots(d), [d / 'a/b']); self.assertEqual(ci.size_of(d / 'a/b'), 5)
+        self.assertEqual(ci.dump_roots(self.t / 'work'), [])
 
     def test_web_page_fails(self):
         with self.assertRaisesRegex(ci.Fail, 'web page'): self.take(b'<!DOCTYPE html><html><body>Download</body></html>', '')
@@ -186,6 +255,13 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['Game (v786432) (v4.0.0) (Update) [v786432].nsp', 'Game [v0].nsp'])
         self.assertIn('tagged Game (v786432) (v4.0.0) (Update).nsp with its version', text)
+
+    def test_dump_download_with_a_title_id_set_keeps_its_folders_unrenamed(self):   # the Title ID field is for cartridge dumps (.xci); it must not touch a dump's folders
+        self.srv.routes['/d.zip'] = (zipped(dump_files('Donkey Kong Bananza/')), {}, False)   # type: ignore[attr-defined]
+        with mock.patch.dict(os.environ, {'IN_TITLE_ID': '040074A01BF12000'}): rc, text = self.run_main(f'{self.base}/d.zip')
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['base', 'dlc', 'updates'])
+        self.assertIn('3 game folders', text); self.assertIn('a game dump: base, dlc, updates', text)
 
     def test_several_links(self):
         path = '/' + BASE.replace(' ', '%20').replace('[', '%5B').replace(']', '%5D') + '.nsp'   # the name only in the URL: taken for its game extension

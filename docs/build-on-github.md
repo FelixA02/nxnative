@@ -2,13 +2,14 @@
 
 Packing an IPA needs a Mac: Xcode builds the app and Apple's Metal compiler builds its shaders. Without one, your own copy (fork) of this repository on GitHub can do it on GitHub's Macs, free of charge: you paste a download link to your game files, and get the IPA back as a password-protected download. Everything runs on GitHub; from Windows or any other computer you only use the browser.
 
-The workflow is `.github/workflows/build-ipa.yml`; it runs the same script as [Pack an IPA](../README.md#pack-an-ipa).
+The workflow is `.github/workflows/build-ipa.yml`; it runs the same script as [Build from the command line](../README.md#build-from-the-command-line).
 
 ## What you need
 
 - A GitHub account with a fork of nxnative (the **Fork** button on the repository's page).
 - Your `prod.keys`.
 - The game's files (the base game, and its update and DLC if you have them) behind a **direct download link**: opened in a browser, the link starts the download at once, with no page or button in between. One link per file, or one `.zip`, `.7z` or `.rar` of the files of one game. NSZ and XCZ files work too.
+- **A Switch 2 game** (Donkey Kong Bananza) comes as a dump: a folder, not NSPs. Put the game's folder in a `.zip`, `.7z` or `.rar` (a wrapper folder inside is fine) holding `base/exefs/` (`main`, `main.npdm`, `sdk`, `rtld`), `base/romfs/`, and optionally `updates/<version>/exefs` + `romfs` and `dlc/<DLC title ID>/<n>/romfs` ([the layout](../README.md#switch-2-games)). The workflow recognizes it by that layout, and the build needs no `prod.keys` for it; base, update and DLC may also come as separate archives, one link each. Nothing is selected in the form. The game's profile must exist in [dm/games](../dm/games/README.md#games). The upstream project tests Switch 2 games on a Mac only: an iPhone app of one is untested.
 - [7-Zip](https://www.7-zip.org) (or another tool that opens password-protected `.7z` files), to open the download.
 - A sideloading tool for the IPA (AltStore, Sideloadly, LiveContainer, …).
 
@@ -51,7 +52,7 @@ GitHub's Mac has 3 cores, so a build takes longer than on a recent Mac, and ever
 1. Open the finished run. Its summary, **Your IPA**, links the download, `<name>.ipa.7z`, which is also under **Artifacts** at the bottom.
 2. Download it (you must be signed in to GitHub). It is deleted after one day; run the build again for a new one.
 3. Open it with 7-Zip, type your `IPA_PASSWORD`, and extract the `.ipa`.
-4. Install the IPA with your sideloading tool, as in step 4 of [Pack an IPA](../README.md#pack-an-ipa) (the Increased Memory Limit capability matters there too).
+4. Install the IPA with your sideloading tool, as described under [Install](../README.md#install) (the Increased Memory Limit capability matters there too).
 
 ## What others can see
 
@@ -64,6 +65,7 @@ Your fork is public, and so are its runs:
 ## Limits
 
 - **Disk space**: about three times the game files' size plus 10 GB; [Check the runner](#check-the-runner) says what is free. The biggest games may not fit.
+- **A dump needs more disk than NSPs do** (the archive, its unpacked folder, a RomFS image of it, then the IPA): leave **Skip the disk cleanup** off, and check the summary's lowest free disk space.
 - **6 hours** per run.
 - **Fire Emblem: Three Houses, Portal and Catherine: Full Body** cannot be built here: their build boots the game to capture its shaders, which needs Metal 4, and GitHub's Macs are virtual Macs without it.
 - One game per run.
@@ -79,6 +81,7 @@ The run's summary and the last lines of the step that failed say why. Common one
 | no NSP with a readable title ID | the game is a cartridge dump (`.xci`) without a `[title ID]` in its name: fill in the **Title ID** field |
 | the archive is password-protected | pack the files without a password |
 | more than one game in the folder | one game per run |
+| the archive holds N files and none is an NSP, XCI, NSZ or XCZ | an extracted game folder that is not a dump in the layout above (no `base/exefs/main.npdm` with `base/romfs`): repack it in that layout |
 | No space left on device, or a build that stops while the summary's lowest free disk space is near 0 | the game is too big for the runner |
 | missing repository secrets | add `PROD_KEYS` and `IPA_PASSWORD` ([Set it up once](#set-it-up-once)) |
 

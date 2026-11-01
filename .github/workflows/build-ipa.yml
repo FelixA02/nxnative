@@ -10,11 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: 'Download link of the game: an NSP, XCI, NSZ or XCZ, or a .zip / .7z / .rar of one game''s files; several links separated by spaces (empty: the GAME_LINK secret)'
+        description: 'Download link of the game: an NSP, XCI, NSZ or XCZ, or a .zip / .7z / .rar of one game''s files, or of a Switch 2 game''s dump folder (base/, updates/, dlc/: found automatically); several links separated by spaces (empty: the GAME_LINK secret)'
         type: string
         required: false
       title_id:
-        description: 'Title ID of the base game (16 hex digits), for a cartridge dump (.xci) with no [title ID] in its file name; otherwise empty'
+        description: 'Title ID of the base game (16 hex digits), for a cartridge dump (.xci) with no [title ID] in its file name; otherwise empty (a Switch 2 dump folder needs none)'
         type: string
         required: false
       language:
@@ -69,10 +69,10 @@ defaults:
 jobs:
   build:
     name: Build the IPA
-    runs-on: xcode-27   # GitHub's Apple-silicon image; default Xcode 27.1 (build 27A9275, Metal 32023.921) = the one dmsh_chain.lock is tested with (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
+    runs-on: xcode-27   # GitHub's Apple-silicon image; Xcode 27.2 provides the Metal compiler in dmsh_chain.lock (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
     timeout-minutes: 360   # GitHub's limit for a job
     env:
-      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_INSTALL_CLEANUP: 1
     steps:
