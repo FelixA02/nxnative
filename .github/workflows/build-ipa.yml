@@ -312,6 +312,7 @@ jobs:
             rm -f "$cache_archive"
             7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           fi
+          rm -rf "$build_folder/extract"
 
       - name: Keep the build logs
         if: ${{ failure() && !inputs.check_only }}
