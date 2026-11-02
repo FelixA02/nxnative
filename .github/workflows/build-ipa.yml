@@ -289,6 +289,10 @@ jobs:
           [ -d "$build_folder/shader" ] && cache_items+=("$build_base/shader")
           [ -d "$build_folder/pso_archive" ] && cache_items+=("$build_base/pso_archive")
           [ -d "$build_folder/profile" ] && cache_items+=("$build_base/profile")
+          # Vulkan/GL run-time shader captures (Super Mario Galaxy, Balatro): the raw SPIR-V/GLSL captured by booting the game; without these the capture re-runs every build
+          for cap_dir in "$build_folder"/extract/*/vk_capture "$build_folder"/extract/*/gl_capture; do
+            [ -d "$cap_dir" ] && cache_items+=("$build_base/${cap_dir#$build_folder/}")
+          done
           if [ ${#cache_items[@]} -eq 0 ]; then
             echo "No cache to save"
             exit 0
