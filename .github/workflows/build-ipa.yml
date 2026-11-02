@@ -61,6 +61,10 @@ on:
         description: '(TEMPORARY) Skip the game download and build; create a dummy cache archive and test the cache Release upload, fallback artifact, and old-release prune flow'
         type: boolean
         default: false
+      test_cache_gb:
+        description: '(TEMPORARY) Test mode only: size of the dummy cache in GiB (empty: 3; use 3 or more to test the split)'
+        type: string
+        required: false
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
@@ -180,15 +184,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
-          title_id="${{ inputs.title_id }}"
-          if [ -z "$title_id" ]; then
-            for f in "$RUNNER_TEMP/game/"*; do
-              if [[ "$f" =~ \[([0-9A-Fa-f]{16})\] ]]; then
-                title_id="${BASH_REMATCH[1]}"
-                break
-              fi
-            done
-          fi
+          title_id="${{ inputs.title_id || '010099C022B96000' }}"
           if [ -z "$title_id" ]; then
             echo "No title ID determined, skipping cache restore"
             exit 0
@@ -263,7 +259,8 @@ jobs:
             cache_archive="$RUNNER_TEMP/cache/cache.7z"
             rm -f "$cache_archive" "$cache_archive".*
             dummy="$RUNNER_TEMP/cache/dummy-cache"
-            dd if=/dev/zero of="$dummy" bs=1048576 count=$(( 1024 )) status=none   # 1 GiB dummy
+            cache_gb="${{ inputs.test_cache_gb || '3' }}"
+            dd if=/dev/zero of="$dummy" bs=1048576 count=$(( cache_gb * 1024 )) status=none
             7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "$dummy"
             size=$(stat -f%z "$cache_archive")
             cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
@@ -275,6 +272,7 @@ jobs:
               rm -f "$cache_archive"
               7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "$dummy"
             fi
+            rm -f "$dummy"
             echo "test mode: made a $size byte dummy cache archive"
             exit 0
           fi
@@ -424,21 +422,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          title_id="${{ inputs.title_id }}"
-          if [ -z "$title_id" ]; then
-            for f in "$RUNNER_TEMP/game/"*; do
-              if [[ "$f" =~ \[([0-9A-Fa-f]{16})\] ]]; then
-                title_id="${BASH_REMATCH[1]}"
-                break
-              fi
-            done
-          fi
+          title_id="${{ inputs.title_id || '010099C022B96000' }}"
           if [ -z "$title_id" ]; then
             echo "No title ID determined, skipping prune"
             exit 0
           fi
           current="$CACHE_TAG"
-          mapfile -t old_releases < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq '.[] | select(.tagName | startswith("cache-" + env.title_id + "-")) | .tagName' 2>/dev/null || true)
+          old_releases=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && old_releases+=("$tag")
+          done < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq '.[] | select(.tagName | startswith("cache-" + env.title_id + "-")) | .tagName' 2>/dev/null || true)
           for tag in "${old_releases[@]}"; do
             if [ "$tag" != "$current" ]; then
               echo "Deleting old cache release: $tag"
