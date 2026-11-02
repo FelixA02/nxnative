@@ -2502,6 +2502,13 @@ def main(args=None):
     for ver in versions:   # each merged version streams directly into its own image
         b, u = picks[ver]
         dirs[ver] = extract_dump(ex, ver, u or b, app) if dump else extract(nx, keys, ex, ver, b, u, None, logs, g, app)
+    # Restore run-time shader captures cached at the build folder root (moved out of extract/ before deletion on the previous build)
+    for cap_name in ('vk_capture', 'gl_capture', 'glslc_capture', 'ue_shaders'):
+        cap_src = work / cap_name
+        if cap_src.is_dir() and pkg_ver in dirs:
+            cap_dst = dirs[pkg_ver] / cap_name
+            if not cap_dst.exists():
+                shutil.move(str(cap_src), str(cap_dst))
     check_versions_aarch64(dirs, logs, g, nacp.name(dirs[versions[0]] / 'control.nacp') or f'{app:016X}')   # before build_mismatch, derive_profile and build_sources read the modules
     bad = [] if derived else [f'{v}: {x}' for v in versions for x in build_mismatch(dirs[v], v, g)]   # every module's build ID must be the one the profile registers for its version
     if bad and provisional: raise BuildError(f'not the builds provisional game profile {g.id} registers: {"; ".join(bad)}')
@@ -2654,6 +2661,13 @@ def main(args=None):
     PROG.end(f'{out_ipa.name}, {amount(out_ipa.stat().st_size, "B")}')
     rmtree(work / 'tmp')
     if not keep:
+        # Preserve run-time shader captures for the cache: the captures live under extract/<version>/ and would otherwise be deleted with the extracted game files
+        for cap_name in ('vk_capture', 'gl_capture', 'glslc_capture', 'ue_shaders'):
+            for cap_src in ex.glob(f'*/{cap_name}'):
+                if cap_src.is_dir():
+                    cap_dst = work / cap_name
+                    if cap_dst.exists(): rmtree(cap_dst)
+                    shutil.move(str(cap_src), str(cap_dst))
         say(f'deleting the extracted game files: {ex}'); rmtree(ex)
     say(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.1f} GB)')
     if separate: say_push_romfs(rfs.source(game), bundle_id)
