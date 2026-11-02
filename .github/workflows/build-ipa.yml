@@ -204,6 +204,15 @@ jobs:
                 rm -f "$f"
               fi
             done
+            # Move run-time captures out of extract/ so the game download doesn't wipe them
+            mkdir -p "$RUNNER_TEMP/capture_staging"
+            for cap_dir in "$RUNNER_TEMP/game/"*_build/extract/*/vk_capture "$RUNNER_TEMP/game/"*_build/extract/*/gl_capture "$RUNNER_TEMP/game/"*_build/extract/*/glslc_capture "$RUNNER_TEMP/game/"*_build/extract/*/ue_shaders; do
+              if [ -d "$cap_dir" ]; then
+                rel="${cap_dir#$RUNNER_TEMP/game/}"
+                mkdir -p "$RUNNER_TEMP/capture_staging/$(dirname "$rel")"
+                mv "$cap_dir" "$RUNNER_TEMP/capture_staging/$rel"
+              fi
+            done
             echo "Restored cache: $cache_tag"
           else
             echo "No cache release $cache_tag found"
@@ -215,6 +224,21 @@ jobs:
           GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
           IN_TITLE_ID: ${{ inputs.title_id }}
         run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+
+      - name: Restore run-time captures
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
+        run: |
+          if [ -d "$RUNNER_TEMP/capture_staging" ]; then
+            for cap_dir in "$RUNNER_TEMP/capture_staging/"*_build/extract/*/vk_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/gl_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/glslc_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/ue_shaders; do
+              if [ -d "$cap_dir" ]; then
+                rel="${cap_dir#$RUNNER_TEMP/capture_staging/}"
+                mkdir -p "$RUNNER_TEMP/game/$(dirname "$rel")"
+                mv "$cap_dir" "$RUNNER_TEMP/game/$rel"
+              fi
+            done
+            rm -rf "$RUNNER_TEMP/capture_staging"
+            echo "Restored run-time captures"
+          fi
 
       - name: Build the IPA
         if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
