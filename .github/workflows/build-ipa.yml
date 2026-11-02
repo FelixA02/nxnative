@@ -289,9 +289,9 @@ jobs:
           [ -d "$build_folder/shader" ] && cache_items+=("$build_base/shader")
           [ -d "$build_folder/pso_archive" ] && cache_items+=("$build_base/pso_archive")
           [ -d "$build_folder/profile" ] && cache_items+=("$build_base/profile")
-          # Run-time shader captures (Vulkan SPIR-V, GL GLSL, NVN GLSLC) and decoded UE shader archives: moved out of extract/ before it was deleted, so they survive for the cache
-          for cap_name in vk_capture gl_capture glslc_capture ue_shaders; do
-            [ -d "$build_folder/$cap_name" ] && cache_items+=("$build_base/$cap_name")
+          # Run-time shader captures (Vulkan SPIR-V, GL GLSL, NVN GLSLC) and decoded UE shader archives: without these the capture/decode re-runs every build
+          for cap_dir in "$build_folder"/extract/*/vk_capture "$build_folder"/extract/*/gl_capture "$build_folder"/extract/*/glslc_capture "$build_folder"/extract/*/ue_shaders; do
+            [ -d "$cap_dir" ] && cache_items+=("$build_base/${cap_dir#$build_folder/}")
           done
           if [ ${#cache_items[@]} -eq 0 ]; then
             echo "No cache to save"
