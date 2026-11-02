@@ -226,7 +226,7 @@ jobs:
           keys="$RUNNER_TEMP/keys/prod.keys"
           mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
           printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
-          args=(--no-keep-extracted --progress lines)
+          args=(--keep-extracted --progress lines)
           if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
           if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
           if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
