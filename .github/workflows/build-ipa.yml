@@ -197,7 +197,10 @@ jobs:
             gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
             for f in "$RUNNER_TEMP/game/"*.7z*; do
               if [ -f "$f" ]; then
-                7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null
+                case "$f" in
+                  *.7z.001) 7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null ;;
+                  *.7z)     7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null ;;
+                esac
                 rm -f "$f"
               fi
             done
