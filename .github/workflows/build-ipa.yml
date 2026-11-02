@@ -242,7 +242,7 @@ jobs:
           if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
           exit "$rc"
 
-      - name: Save build cache
+      - name: Save and encrypt build cache
         if: ${{ !inputs.check_only && !inputs.test_split && success() }}
         id: cache-save
         continue-on-error: true
