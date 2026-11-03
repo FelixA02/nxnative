@@ -257,7 +257,12 @@ jobs:
           if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
           if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
           if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
-          if [ -n "$IN_TITLE_ID" ]; then args+=(--title-id "$IN_TITLE_ID"); fi
+          # A dump folder has the authoritative program ID in base/exefs/main.npdm.
+          # Do not force the optional title_id input onto Switch 2 dumps; it is
+          # intended for cartridge packages that have no title ID in their name.
+          if [ -n "$IN_TITLE_ID" ] && [ ! -f "$RUNNER_TEMP/game/base/exefs/main.npdm" ]; then
+            args+=(--title-id "$IN_TITLE_ID")
+          fi
           if [ "$IN_SHOW_FPS" = true ]; then args+=(--show-fps); else args+=(--no-show-fps); fi
           # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
           ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
