@@ -52,32 +52,63 @@ def pack(src, img, say=print):
     say(f'  {n:,} entries, {img.stat().st_size / 2**30:.2f} GB')
 
 
+def find_dir(parent, name):
+    d = parent / name
+    if d.is_dir(): return d
+    if not parent.is_dir(): return None
+    low = name.lower()
+    for c in parent.iterdir():
+        if c.is_dir() and c.name.lower() == low: return c
+    return None
+
+
+def find_file(parent, name):
+    f = parent / name
+    if f.is_file(): return f
+    if not parent.is_dir(): return None
+    low = name.lower()
+    for c in parent.iterdir():
+        if c.is_file() and c.name.lower() == low: return c
+    return None
+
+
 def is_dump(folder):   # whether a folder has the layout above
-    return (folder / 'base/exefs/main.npdm').is_file() and ((folder / 'base/romfs').is_dir() or any(p.is_dir() for p in folder.glob('updates/*/romfs')))
+    base = find_dir(folder, 'base')
+    exefs = find_dir(base, 'exefs') if base else None
+    if not exefs or not find_file(exefs, 'main.npdm'): return False
+    if find_dir(base, 'romfs'): return True
+    updates = find_dir(folder, 'updates')
+    return bool(updates and any(p.is_dir() and p.name.isdigit() and find_dir(p, 'romfs') for p in updates.iterdir()))
 
 
 def scan(dump):
     """What a dump folder holds: (title ID, {update version: its folder}, {DLC title ID: its RomFS folder})"""
     if not is_dump(dump): raise Error(f'{dump}: no base/exefs/main.npdm, or no RomFS in base/ or updates/<version>/')
-    app = program_id(dump / 'base/exefs/main.npdm')
+    base = find_dir(dump, 'base'); exefs = find_dir(base, 'exefs') if base else None   # present when is_dump is true
+    app = program_id(find_file(exefs, 'main.npdm'))
     if app & 0xFFF: raise Error(f'{dump}: base program ID {app:016X} is not a base title ID')
-    vers = {int(p.name): p for p in (dump / 'updates').iterdir() if p.is_dir() and p.name.isdigit()} if (dump / 'updates').is_dir() else {}
+    updates = find_dir(dump, 'updates')
+    vers = {int(p.name): p for p in updates.iterdir() if p.is_dir() and p.name.isdigit()} if updates else {}
     dlc = {}
-    for d in sorted(p for p in (dump / 'dlc').iterdir() if p.is_dir()) if (dump / 'dlc').is_dir() else []:
+    dlc_root = find_dir(dump, 'dlc')
+    for d in sorted(p for p in dlc_root.iterdir() if p.is_dir()) if dlc_root else []:
         try: tid = int(d.name, 16)
         except ValueError: raise Error(f'{d}: not a DLC title ID') from None
         if not 0 < tid - app - 0x1000 <= 2000: raise Error(f'{d}: {tid:016X} is not a DLC of {app:016X}')
-        roms = sorted(d.glob('*/romfs')) or ([d / 'romfs'] if (d / 'romfs').is_dir() else [])
+        roms = [r for c in sorted(p for p in d.iterdir() if p.is_dir()) if (r := find_dir(c, 'romfs'))]
+        if not roms and (r := find_dir(d, 'romfs')): roms = [r]
         if len(roms) != 1: raise Error(f'{d}: expected one <n>/romfs folder, found {len(roms)}')
         dlc[tid] = roms[0]
     return app, vers, dlc
 
 
 def pack_version(src, app, out, say=print):   # one version's folder (base/ or updates/<version>/) → out/ExeFS and out/RomFS.img
-    if not (src / 'exefs/main').is_file() or not (src / 'exefs/main.npdm').is_file() or not (src / 'romfs').is_dir(): raise Error(f'{src}: no exefs/main, exefs/main.npdm and romfs')
-    if (pid := program_id(src / 'exefs/main.npdm')) != app: raise Error(f'{src}: program ID {pid:016X}, the base is {app:016X}')
-    exefs(src / 'exefs', out / 'ExeFS')
-    pack(src / 'romfs', out / 'RomFS.img', say)
+    ex, rom = find_dir(src, 'exefs'), find_dir(src, 'romfs')
+    main, npdm = (find_file(ex, 'main') if ex else None), (find_file(ex, 'main.npdm') if ex else None)
+    if not main or not npdm or not rom: raise Error(f'{src}: no exefs/main, exefs/main.npdm and romfs')
+    if (pid := program_id(npdm)) != app: raise Error(f'{src}: program ID {pid:016X}, the base is {app:016X}')
+    exefs(ex, out / 'ExeFS')
+    pack(rom, out / 'RomFS.img', say)
 
 
 def pack_dlc(app, dlc, aoc, say=print):   # {DLC title ID: its RomFS folder} → aoc/<index>.img; images of DLC no longer in the folder go
