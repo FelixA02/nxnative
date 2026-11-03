@@ -119,55 +119,64 @@ jobs:
           echo "selected Xcode (kept): $sel"
           (
             set +e
-            case "$sel" in
-              *.app)
-                for x in /Applications/Xcode*.app; do
-                  if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
-                  echo "removing $x"; sudo rm -rf "$x"
-                done ;;
-            esac
-            for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
-              if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            xcrun simctl runtime list -j 2> /dev/null |
-              python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
-              while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
-            # Nothing below is used by a build. ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's
-            # TOOL_PATHS tries first. Python stays in the tool cache: setup-python installs into it.
-            for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
-              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
-              if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
-            done
-            # the other platforms' simulator runtimes: simctl leaves the MobileAsset behind when it cannot unmount the cryptex
-            for r in watchOS tvOS visionOS xrOS; do
-              d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
-              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
-            # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
-            # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
-            # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so
-            # the asset whose build is not the kept one goes too. Nothing is removed when either read fails.
-            kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
-            xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
-              sort -t. -k1,1n -k2,2n | sed '$d' |
-              while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
-            for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
-              [ -d "$a" ] || continue
-              b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
-              if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
-                echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+            # Each removal owns its own subtree, so they run together: this is the only part of the cleanup the tool installs do not
+            # hide, and what "Wait for the disk cleanup" waits on. simctl stays one chain (one runtime database).
+            (
+              case "$sel" in
+                *.app)
+                  for x in /Applications/Xcode*.app; do
+                    if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                    echo "removing $x"; sudo rm -rf "$x"
+                  done ;;
+              esac
+              for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+                if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              # ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's TOOL_PATHS tries first.
+              # Python stays in the tool cache: setup-python installs into it.
+              for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+                if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+              done
+              # the other platforms' simulator MobileAssets, which simctl leaves behind when it cannot unmount the cryptex
+              for r in watchOS tvOS visionOS xrOS; do
+                d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+              if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+                sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
               fi
-            done
-            # a Spotlight index of a disk that is thrown away, and the wallpaper videos
-            if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
-              sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
-            fi
-            if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
-              echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
-            fi
+              if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+                echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+              fi
+            ) &
+            (
+              xcrun simctl runtime list -j 2> /dev/null |
+                python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+                while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+              # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+              # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+              # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so the
+              # asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+              kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+              xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+                sort -t. -k1,1n -k2,2n | sed '$d' |
+                while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+              for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+                [ -d "$a" ] || continue
+                b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+                if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                  echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+                fi
+              done
+            ) &
+            wait
             touch "$RUNNER_TEMP/cleanup.done"
           ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
 
@@ -682,55 +691,64 @@ jobs:
           echo "selected Xcode (kept): $sel"
           (
             set +e
-            case "$sel" in
-              *.app)
-                for x in /Applications/Xcode*.app; do
-                  if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
-                  echo "removing $x"; sudo rm -rf "$x"
-                done ;;
-            esac
-            for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
-              if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            xcrun simctl runtime list -j 2> /dev/null |
-              python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
-              while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
-            # Nothing below is used by a build. ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's
-            # TOOL_PATHS tries first. Python stays in the tool cache: setup-python installs into it.
-            for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
-              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
-              if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
-            done
-            # the other platforms' simulator runtimes: simctl leaves the MobileAsset behind when it cannot unmount the cryptex
-            for r in watchOS tvOS visionOS xrOS; do
-              d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
-              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
-            done
-            # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
-            # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
-            # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
-            # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so
-            # the asset whose build is not the kept one goes too. Nothing is removed when either read fails.
-            kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
-            xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
-              sort -t. -k1,1n -k2,2n | sed '$d' |
-              while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
-            for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
-              [ -d "$a" ] || continue
-              b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
-              if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
-                echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+            # Each removal owns its own subtree, so they run together: this is the only part of the cleanup the tool installs do not
+            # hide, and what "Wait for the disk cleanup" waits on. simctl stays one chain (one runtime database).
+            (
+              case "$sel" in
+                *.app)
+                  for x in /Applications/Xcode*.app; do
+                    if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                    echo "removing $x"; sudo rm -rf "$x"
+                  done ;;
+              esac
+              for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+                if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              # ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's TOOL_PATHS tries first.
+              # Python stays in the tool cache: setup-python installs into it.
+              for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+                if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+              done
+              # the other platforms' simulator MobileAssets, which simctl leaves behind when it cannot unmount the cryptex
+              for r in watchOS tvOS visionOS xrOS; do
+                d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+              if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+                sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
               fi
-            done
-            # a Spotlight index of a disk that is thrown away, and the wallpaper videos
-            if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
-              sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
-            fi
-            if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
-              echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
-            fi
+              if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+                echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+              fi
+            ) &
+            (
+              xcrun simctl runtime list -j 2> /dev/null |
+                python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+                while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+              # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+              # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+              # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so the
+              # asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+              kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+              xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+                sort -t. -k1,1n -k2,2n | sed '$d' |
+                while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+              for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+                [ -d "$a" ] || continue
+                b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+                if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                  echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+                fi
+              done
+            ) &
+            wait
             touch "$RUNNER_TEMP/cleanup.done"
           ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
           for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
