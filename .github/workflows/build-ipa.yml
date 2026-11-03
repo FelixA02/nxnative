@@ -65,6 +65,10 @@ on:
         description: '(TEMPORARY) Test mode only: size of the dummy cache in GiB (empty: 3; use 3 or more to test the split)'
         type: string
         required: false
+      map_disk:
+        description: '(TEMPORARY) Map the disk only: run the disk cleanup, then report what uses the space (no game, no build). The report is the disk-map artifact'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
@@ -77,6 +81,7 @@ defaults:
 jobs:
   build:
     name: Build the IPA
+    if: ${{ !inputs.map_disk }}
     runs-on: xcode-27   # GitHub's Apple-silicon image; Xcode 27.2 provides the Metal compiler in dmsh_chain.lock (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
     timeout-minutes: 360   # GitHub's limit for a job
     env:
@@ -592,3 +597,156 @@ jobs:
       - name: Delete the keys
         if: ${{ always() }}
         run: rm -rf "$RUNNER_TEMP/keys"
+
+  # (TEMPORARY) A diagnostic run: the build's disk cleanup, then a size map of everything left on the runner. Nothing is downloaded or
+  # built; the report comes back as the disk-map artifact. Actions → Build IPA → tick "Map the disk only" → Run workflow.
+  disk-map:
+    name: Map the disk (temporary)
+    if: ${{ inputs.map_disk }}
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      # The build's cleanup, unchanged, waited for here instead of running beside the tool installs.
+      - name: Free disk space
+        env:
+          SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
+        run: |
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+          if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
+          sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          echo "selected Xcode (kept): $sel"
+          (
+            set +e
+            case "$sel" in
+              *.app)
+                for x in /Applications/Xcode*.app; do
+                  if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                  echo "removing $x"; sudo rm -rf "$x"
+                done ;;
+            esac
+            for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+              if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            xcrun simctl runtime list -j 2> /dev/null |
+              python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+              while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+            touch "$RUNNER_TEMP/cleanup.done"
+          ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
+          for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
+          cat "$RUNNER_TEMP/cleanup.log" 2>/dev/null || true
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      # The data volume is walked once into du-data.tsv and every section is read from it; a walk per section would take tens of minutes.
+      # Paths are the data volume's (/System/Volumes/Data/Applications, …), not the system volume's firmlinks, so nothing is counted twice.
+      - name: Map the disk
+        run: |
+          set +e
+          out="$RUNNER_TEMP/disk-map.txt"
+          scan="$RUNNER_TEMP/du-data.tsv"
+          # du -k lines ("<KiB>\t<path>") as "<GB> GB  <path>"; the first argument keeps the top N
+          show() { sort -rn | head -n "${1:-40}" | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'; }
+          under() { show "${3:-30}" < <(awk -F'\t' -v p="$1" 'substr($2, 1, length(p)) == p' "$2"); }
+          section() { printf '\n===== %s =====\n' "$1"; }
+
+          sudo du -xk -d 2 /System/Volumes/Data 2>/dev/null | sort -rn > "$scan"
+          sudo du -xk -d 3 "$HOME" 2>/dev/null | sort -rn > "$RUNNER_TEMP/du-home.tsv"
+          sudo du -xk -d 3 "$(xcode-select -p)/../.." 2>/dev/null | sort -rn > "$RUNNER_TEMP/du-xcode.tsv"
+          sudo du -xk -d 2 /System 2>/dev/null | sort -rn > "$RUNNER_TEMP/du-system.tsv"
+
+          {
+            echo "disk map of GitHub's macOS runner (xcode-27) after the build's disk cleanup"
+            date -u
+            echo "free at start: ${FREE_START:-?} GB, after the cleanup: ${FREE:-?} GB"
+
+            section "df -h"
+            df -h
+
+            section "the data volume, two levels (top 40): everything the runner keeps"
+            show 40 < "$scan"
+
+            section "/Applications, two levels (top 20)"
+            under /System/Volumes/Data/Applications "$scan" 20
+
+            section "/Library, two levels (top 30)"
+            under /System/Volumes/Data/Library "$scan" 30
+
+            section "/Library/Developer, two levels (top 20)"
+            under /System/Volumes/Data/Library/Developer "$scan" 20
+
+            section "/private/var, two levels (top 20)"
+            under /System/Volumes/Data/private/var "$scan" 20
+
+            section "/System/Library/AssetsV2 (simulator runtimes and the other MobileAssets), two levels"
+            for a in /System/Volumes/Data/System/Library/AssetsV2 /System/Library/AssetsV2; do
+              if [ -d "$a" ]; then echo "at $a"; sudo du -xk -d 2 "$a" 2>/dev/null | sort -rn | head -20 | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'; break; fi
+            done
+
+            section "/opt and /usr/local, two levels (Homebrew, .NET)"
+            under /System/Volumes/Data/opt "$scan" 15
+            under /System/Volumes/Data/usr/local "$scan" 15
+
+            section "the runner's home, three levels (top 50)"
+            show 50 < "$RUNNER_TEMP/du-home.tsv"
+
+            section "the kept Xcode, three levels (top 30)"
+            show 30 < "$RUNNER_TEMP/du-xcode.tsv"
+
+            section "the system volume, two levels (top 15)"
+            show 15 < "$RUNNER_TEMP/du-system.tsv"
+
+            section "every file over 200 MB (top 60)"
+            sudo find /System/Volumes/Data -xdev -type f -size +200M -print0 2>/dev/null |
+              xargs -0 stat -f '%z %N' 2>/dev/null | sort -rn | head -60 |
+              awk '{ printf "%9.2f GB  %s\n", $1 / 1073741824, substr($0, index($0, $2)) }'
+
+            section "the candidate cleanups, each measured and NOT removed"
+            for p in \
+              "$HOME/Library/Caches" \
+              "$HOME/Library/Caches/Homebrew" \
+              "$HOME/Library/Caches/pip" \
+              "$HOME/.nuget/packages" \
+              "$HOME/Library/Caches/org.swift.swiftpm" \
+              "$HOME/Library/Caches/CocoaPods" \
+              "$HOME/Library/Developer/Xcode/DerivedData" \
+              "$HOME/Library/Developer/CoreSimulator" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}" \
+              /System/Volumes/Data/Library/Caches \
+              /System/Volumes/Data/Library/Developer/CoreSimulator \
+              /System/Volumes/Data/private/var/folders \
+              /System/Volumes/Data/private/var/vm \
+              /System/Library/AssetsV2 \
+              /System/Library/AssetsV2/com_apple_MobileAsset_watchOSSimulatorRuntime \
+              /System/Library/AssetsV2/com_apple_MobileAsset_tvOSSimulatorRuntime \
+              /System/Library/AssetsV2/com_apple_MobileAsset_visionOSSimulatorRuntime \
+              /System/Library/AssetsV2/com_apple_MobileAsset_xrOSSimulatorRuntime \
+              "$(xcode-select -p)/../.." \
+              "$(xcode-select -p)/../Contents/Developer/Documentation" \
+              "$(xcode-select -p)/../Contents/Developer/Platforms" \
+              /System/Volumes/Data/usr/local/share/dotnet \
+              /System/Volumes/Data/opt/homebrew ; do
+              if [ -e "$p" ]; then sudo du -sk "$p" 2>/dev/null; fi
+            done | sort -rn | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'
+
+            section "simulator runtimes the image still holds"
+            xcrun simctl runtime list 2>/dev/null || true
+
+            section "df -h again, after the map"
+            df -h
+          } > "$out" 2>&1
+          cat "$out"
+          { echo '### Disk map (temporary run)'; echo; echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the disk map
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: disk-map
+          path: |
+            ${{ runner.temp }}/disk-map.txt
+            ${{ runner.temp }}/cleanup.log
+          if-no-files-found: warn
+          retention-days: 7
