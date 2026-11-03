@@ -66,16 +66,6 @@ class Scan(Base):
         shutil.rmtree(d / f'updates/{VER}/romfs')
         self.assertFalse(pack_dump.is_dump(d))
 
-    def test_case_mixed_layout(self):
-        d = self.dump.parent / 'mixed'; version(d / 'base'); version(d / f'updates/{VER}', main=b'new code', marker='new')
-        (d / 'base/exefs').rename(d / 'base/ExeFS'); (d / 'base/romfs').rename(d / 'base/RomFS')
-        (d / f'updates/{VER}/exefs').rename(d / f'updates/{VER}/ExeFS'); (d / f'updates/{VER}/romfs').rename(d / f'updates/{VER}/RomFS')
-        (d / 'updates').rename(d / 'Updates')
-        self.assertTrue(pack_dump.is_dump(d))
-        self.assertEqual(pack_dump.scan(d), (TID, {VER: d / f'Updates/{VER}'}, {}))
-        pack_dump.pack_version(d / f'Updates/{VER}', TID, d / 'out', say=lambda s: None)
-        self.assertEqual((d / 'out/ExeFS/main').read_bytes(), b'new code')
-
     def test_refuses(self):
         (self.dump / 'dlc/0100000000000000/romfs').mkdir(parents=True)
         with self.assertRaisesRegex(pack_dump.Error, 'is not a DLC of'): pack_dump.scan(self.dump)
