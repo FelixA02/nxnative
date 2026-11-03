@@ -115,24 +115,6 @@ jobs:
         run: |
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
           if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
-          # The iOS runtimes to prune: all but the newest, when their versions can be read (nothing is removed when they cannot).
-          cat > "$RUNNER_TEMP/prune_ios.py" <<'PY'
-          import json, re, sys
-          try:
-              runtimes = json.load(sys.stdin)
-          except Exception:
-              sys.exit(0)
-          ios = [(k, str(v.get("version", ""))) for k, v in runtimes.items()
-                 if "ios" in str(v.get("platformIdentifier", "")).lower()]
-          def key(t):
-              m = re.search(r"(\d+)\.(\d+)", t[1])
-              return tuple(map(int, m.groups())) if m else None
-          scored = [(key(t), t[0]) for t in ios]
-          if len(scored) < 2 or any(s[0] is None for s in scored):
-              sys.exit(0)   # nothing to compare: leave them alone
-          for _, k in sorted(scored)[:-1]:
-              print(k)
-          PY
           sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
           echo "selected Xcode (kept): $sel"
           (
@@ -164,8 +146,21 @@ jobs:
               if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
             done
             # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
-            xcrun simctl runtime list -j 2> /dev/null | python3 "$RUNNER_TEMP/prune_ios.py" |
-              while read -r id; do echo "removing older iOS runtime $id"; xcrun simctl runtime delete "$id"; done
+            # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+            # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+            # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so
+            # the asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+            kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+            xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+              sort -t. -k1,1n -k2,2n | sed '$d' |
+              while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+            for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+              [ -d "$a" ] || continue
+              b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+              if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+              fi
+            done
             # a Spotlight index of a disk that is thrown away, and the wallpaper videos
             if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
               sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
@@ -205,6 +200,21 @@ jobs:
             if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
           done
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      # The image's own MetalToolchain fails the version check in "Install the tools", so a second one is downloaded: once the newer
+      # one is mounted the older asset is dead weight. If the compiler stops working after the removal, it is downloaded again.
+      - name: Trim the duplicate MetalToolchain
+        run: |
+          assets=(/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/*.asset)
+          if [ ${#assets[@]} -gt 1 ]; then
+            ls -dt "${assets[@]}" | tail -n +2 | while read -r d; do echo "removing the unused MetalToolchain asset $d"; sudo rm -rf "$d"; done
+          else
+            echo "one MetalToolchain asset: nothing to trim"
+          fi
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            echo "::warning::the Metal compiler stopped after the removal: downloading the toolchain again"
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
 
       - name: Wait for the disk cleanup
         run: |
@@ -668,24 +678,6 @@ jobs:
         run: |
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
           if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
-          # The iOS runtimes to prune: all but the newest, when their versions can be read (nothing is removed when they cannot).
-          cat > "$RUNNER_TEMP/prune_ios.py" <<'PY'
-          import json, re, sys
-          try:
-              runtimes = json.load(sys.stdin)
-          except Exception:
-              sys.exit(0)
-          ios = [(k, str(v.get("version", ""))) for k, v in runtimes.items()
-                 if "ios" in str(v.get("platformIdentifier", "")).lower()]
-          def key(t):
-              m = re.search(r"(\d+)\.(\d+)", t[1])
-              return tuple(map(int, m.groups())) if m else None
-          scored = [(key(t), t[0]) for t in ios]
-          if len(scored) < 2 or any(s[0] is None for s in scored):
-              sys.exit(0)   # nothing to compare: leave them alone
-          for _, k in sorted(scored)[:-1]:
-              print(k)
-          PY
           sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
           echo "selected Xcode (kept): $sel"
           (
@@ -717,8 +709,21 @@ jobs:
               if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
             done
             # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
-            xcrun simctl runtime list -j 2> /dev/null | python3 "$RUNNER_TEMP/prune_ios.py" |
-              while read -r id; do echo "removing older iOS runtime $id"; xcrun simctl runtime delete "$id"; done
+            # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+            # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+            # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so
+            # the asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+            kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+            xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+              sort -t. -k1,1n -k2,2n | sed '$d' |
+              while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+            for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+              [ -d "$a" ] || continue
+              b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+              if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+              fi
+            done
             # a Spotlight index of a disk that is thrown away, and the wallpaper videos
             if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
               sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
@@ -760,6 +765,21 @@ jobs:
             if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
           done
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      # The image's own MetalToolchain fails the version check in "Install the tools", so a second one is downloaded: once the newer
+      # one is mounted the older asset is dead weight. If the compiler stops working after the removal, it is downloaded again.
+      - name: Trim the duplicate MetalToolchain
+        run: |
+          assets=(/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/*.asset)
+          if [ ${#assets[@]} -gt 1 ]; then
+            ls -dt "${assets[@]}" | tail -n +2 | while read -r d; do echo "removing the unused MetalToolchain asset $d"; sudo rm -rf "$d"; done
+          else
+            echo "one MetalToolchain asset: nothing to trim"
+          fi
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            echo "::warning::the Metal compiler stopped after the removal: downloading the toolchain again"
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
 
       - name: Check the runner
         run: |
@@ -816,8 +836,11 @@ jobs:
             section "/Library, two levels (top 30)"
             under /System/Volumes/Data/Library "$scan" 30
 
-            section "/Library/Developer, two levels (top 20)"
-            under /System/Volumes/Data/Library/Developer "$scan" 20
+            section "/Library/Developer, three levels (top 25)"
+            sudo du -xk -d 3 /System/Volumes/Data/Library/Developer 2>/dev/null | sort -rn | head -25 | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'
+
+            section "/Library/Frameworks, two levels (top 15)"
+            sudo du -xk -d 2 /System/Volumes/Data/Library/Frameworks 2>/dev/null | sort -rn | head -15 | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'
 
             section "/private/var, two levels (top 20)"
             under /System/Volumes/Data/private/var "$scan" 20
@@ -830,6 +853,9 @@ jobs:
             section "/opt and /usr/local, two levels (Homebrew, .NET)"
             under /System/Volumes/Data/opt "$scan" 15
             under /System/Volumes/Data/usr/local "$scan" 15
+
+            section "the Python tool cache, which read 0.00 GB"
+            ls -ld "$RUNNER_TOOL_CACHE" 2>/dev/null; df -h "$RUNNER_TOOL_CACHE" 2>/dev/null | tail -1; sudo du -sk "$RUNNER_TOOL_CACHE" 2>&1 | tail -1
 
             section "the runner's home, three levels (top 50)"
             show 50 < "$RUNNER_TEMP/du-home.tsv"
