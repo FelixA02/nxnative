@@ -106,14 +106,33 @@ jobs:
           if [ -z "$CACHE_PASSWORD" ]; then missing="$missing CACHE_PASSWORD"; fi
           if [ -n "$missing" ]; then echo "::error::missing repository secrets:$missing (Settings → Secrets and variables → Actions; docs/build-on-github.md)"; exit 1; fi
 
-      # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, and the simulators of the
-      # other platforms (the iPhone's stays: the app's asset catalog is compiled against it). In the background while the tools install; "Wait for the disk cleanup" waits for it.
+      # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, the simulators of the
+      # other platforms (the iPhone's stays: the app's asset catalog is compiled against it), ~/.dotnet, the tool caches nothing here uses, the browsers, the Spotlight index
+      # and the wallpaper videos. In the background while the tools install; "Wait for the disk cleanup" waits for it.
       - name: Free disk space (in the background)
         env:
           SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
         run: |
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
           if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
+          # The iOS runtimes to prune: all but the newest, when their versions can be read (nothing is removed when they cannot).
+          cat > "$RUNNER_TEMP/prune_ios.py" <<'PY'
+          import json, re, sys
+          try:
+              runtimes = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          ios = [(k, str(v.get("version", ""))) for k, v in runtimes.items()
+                 if "ios" in str(v.get("platformIdentifier", "")).lower()]
+          def key(t):
+              m = re.search(r"(\d+)\.(\d+)", t[1])
+              return tuple(map(int, m.groups())) if m else None
+          scored = [(key(t), t[0]) for t in ios]
+          if len(scored) < 2 or any(s[0] is None for s in scored):
+              sys.exit(0)   # nothing to compare: leave them alone
+          for _, k in sorted(scored)[:-1]:
+              print(k)
+          PY
           sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
           echo "selected Xcode (kept): $sel"
           (
@@ -131,6 +150,29 @@ jobs:
             xcrun simctl runtime list -j 2> /dev/null |
               python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
               while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+            # Nothing below is used by a build. ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's
+            # TOOL_PATHS tries first. Python stays in the tool cache: setup-python installs into it.
+            for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+              if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+            done
+            # the other platforms' simulator runtimes: simctl leaves the MobileAsset behind when it cannot unmount the cryptex
+            for r in watchOS tvOS visionOS xrOS; do
+              d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
+            xcrun simctl runtime list -j 2> /dev/null | python3 "$RUNNER_TEMP/prune_ios.py" |
+              while read -r id; do echo "removing older iOS runtime $id"; xcrun simctl runtime delete "$id"; done
+            # a Spotlight index of a disk that is thrown away, and the wallpaper videos
+            if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+              sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
+            fi
+            if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+              echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+            fi
             touch "$RUNNER_TEMP/cleanup.done"
           ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
 
@@ -155,6 +197,15 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
           fi
 
+      # The formulae are in and nothing later runs brew: its download cache and the taps' git history go. The taps' working trees stay.
+      - name: Free more disk space (Homebrew)
+        run: |
+          brew cleanup --prune=all -s > /dev/null 2>&1 || true
+          for t in /opt/homebrew/Library/Taps/homebrew/*/.git; do
+            if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
+          done
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
       - name: Wait for the disk cleanup
         run: |
           for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
@@ -171,7 +222,7 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup) |"
+            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup, ${FREE_AFTER_TOOLS:-?} GB after the tools) |"
             echo "| Largest game that should fit | about $fit GB of game files (the build needs about three times the game's size plus 10 GB) |"
             echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
             echo "| Metal compiler | $(xcrun -sdk iphoneos metal --version 2>&1 | head -1) |"
@@ -598,8 +649,8 @@ jobs:
         if: ${{ always() }}
         run: rm -rf "$RUNNER_TEMP/keys"
 
-  # (TEMPORARY) A diagnostic run: the build's disk cleanup, then a size map of everything left on the runner. Nothing is downloaded or
-  # built; the report comes back as the disk-map artifact. Actions → Build IPA → tick "Map the disk only" → Run workflow.
+  # (TEMPORARY) A diagnostic run: the build's own prologue (disk cleanup, Python, .NET 10, the tools, the runner checks) and then a size
+  # map of what is left, with nothing downloaded or built. The report is the disk-map artifact. Actions → Build IPA → "Map the disk only".
   disk-map:
     name: Map the disk (temporary)
     if: ${{ inputs.map_disk }}
@@ -611,12 +662,30 @@ jobs:
       HOMEBREW_NO_INSTALL_CLEANUP: 1
     steps:
       # The build's cleanup, unchanged, waited for here instead of running beside the tool installs.
-      - name: Free disk space
+      - name: Free disk space (in the background)
         env:
           SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
         run: |
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
           if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
+          # The iOS runtimes to prune: all but the newest, when their versions can be read (nothing is removed when they cannot).
+          cat > "$RUNNER_TEMP/prune_ios.py" <<'PY'
+          import json, re, sys
+          try:
+              runtimes = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          ios = [(k, str(v.get("version", ""))) for k, v in runtimes.items()
+                 if "ios" in str(v.get("platformIdentifier", "")).lower()]
+          def key(t):
+              m = re.search(r"(\d+)\.(\d+)", t[1])
+              return tuple(map(int, m.groups())) if m else None
+          scored = [(key(t), t[0]) for t in ios]
+          if len(scored) < 2 or any(s[0] is None for s in scored):
+              sys.exit(0)   # nothing to compare: leave them alone
+          for _, k in sorted(scored)[:-1]:
+              print(k)
+          PY
           sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
           echo "selected Xcode (kept): $sel"
           (
@@ -634,20 +703,93 @@ jobs:
             xcrun simctl runtime list -j 2> /dev/null |
               python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
               while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+            # Nothing below is used by a build. ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's
+            # TOOL_PATHS tries first. Python stays in the tool cache: setup-python installs into it.
+            for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+              if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+            done
+            # the other platforms' simulator runtimes: simctl leaves the MobileAsset behind when it cannot unmount the cryptex
+            for r in watchOS tvOS visionOS xrOS; do
+              d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+              if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+            done
+            # two iOS runtimes are installed and the app's asset catalog needs one: keep the newest
+            xcrun simctl runtime list -j 2> /dev/null | python3 "$RUNNER_TEMP/prune_ios.py" |
+              while read -r id; do echo "removing older iOS runtime $id"; xcrun simctl runtime delete "$id"; done
+            # a Spotlight index of a disk that is thrown away, and the wallpaper videos
+            if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+              sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
+            fi
+            if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+              echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+            fi
             touch "$RUNNER_TEMP/cleanup.done"
           ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
           for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
           cat "$RUNNER_TEMP/cleanup.log" 2>/dev/null || true
+          if [ ! -e "$RUNNER_TEMP/cleanup.done" ]; then echo "::warning::the disk cleanup did not finish within 30 minutes"; fi
           df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Make room for .NET 10 where the NSP script looks first
+        run: sudo mkdir -p /usr/local/share/dotnet && sudo chown -R "$(id -un)" /usr/local/share/dotnet
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        env:
+          DOTNET_INSTALL_DIR: /usr/local/share/dotnet
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install the tools
+        run: |
+          brew install xcodegen zstd spirv-cross glslang sevenzip
+          python -m pip install lz4 capstone fonttools
+          python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      # The formulae are in and nothing later runs brew: its download cache and the taps' git history go. The taps' working trees stay.
+      - name: Free more disk space (Homebrew)
+        run: |
+          brew cleanup --prune=all -s > /dev/null 2>&1 || true
+          for t in /opt/homebrew/Library/Taps/homebrew/*/.git; do
+            if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
+          done
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      - name: Check the runner
+        run: |
+          dn=$(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:$HOME/.dotnet:$PATH" command -v dotnet || true)
+          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; if (x < 0) x = 0; printf "%.1f", x }')
+          {
+            echo "### The runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup, ${FREE_AFTER_TOOLS:-?} GB after the tools) |"
+            echo "| Largest game that should fit | about $fit GB of game files (the build needs about three times the game's size plus 10 GB) |"
+            echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
+            echo "| Metal compiler | $(xcrun -sdk iphoneos metal --version 2>&1 | head -1) |"
+            echo "| metal-tt | $(xcrun -sdk iphoneos metal-tt -version 2>&1 | head -1) |"
+            echo "| .NET SDKs | ${dn:-no dotnet}: $([ -n "$dn" ] && "$dn" --list-sdks 2>&1 | cut -d' ' -f1 | tr '\n' ' ') |"
+            echo "| Python | $(python --version 2>&1) |"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
+          if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
 
       # The data volume is walked once into du-data.tsv and every section is read from it; a walk per section would take tens of minutes.
       # Paths are the data volume's (/System/Volumes/Data/Applications, …), not the system volume's firmlinks, so nothing is counted twice.
       - name: Map the disk
+        if: ${{ always() }}
         run: |
           set +e
           out="$RUNNER_TEMP/disk-map.txt"
           scan="$RUNNER_TEMP/du-data.tsv"
-          # du -k lines ("<KiB>\t<path>") as "<GB> GB  <path>"; the first argument keeps the top N
           show() { sort -rn | head -n "${1:-40}" | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'; }
           under() { show "${3:-30}" < <(awk -F'\t' -v p="$1" 'substr($2, 1, length(p)) == p' "$2"); }
           section() { printf '\n===== %s =====\n' "$1"; }
@@ -658,9 +800,9 @@ jobs:
           sudo du -xk -d 2 /System 2>/dev/null | sort -rn > "$RUNNER_TEMP/du-system.tsv"
 
           {
-            echo "disk map of GitHub's macOS runner (xcode-27) after the build's disk cleanup"
+            echo "disk map of GitHub's macOS runner (xcode-27), after the build's prologue: the disk cleanup, Python, .NET 10 and the tools"
             date -u
-            echo "free at start: ${FREE_START:-?} GB, after the cleanup: ${FREE:-?} GB"
+            echo "free at start: ${FREE_START:-?} GB; after the cleanup: ${FREE:-?} GB; after the tools: ${FREE_AFTER_TOOLS:-?} GB"
 
             section "df -h"
             df -h
@@ -705,6 +847,7 @@ jobs:
 
             section "the candidate cleanups, each measured and NOT removed"
             for p in \
+              "$HOME/.dotnet" \
               "$HOME/Library/Caches" \
               "$HOME/Library/Caches/Homebrew" \
               "$HOME/Library/Caches/pip" \
@@ -714,20 +857,26 @@ jobs:
               "$HOME/Library/Developer/Xcode/DerivedData" \
               "$HOME/Library/Developer/CoreSimulator" \
               "${RUNNER_TOOL_CACHE:-/nonexistent}" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}/go" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}/node" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby" \
+              "${RUNNER_TOOL_CACHE:-/nonexistent}/Python" \
               /System/Volumes/Data/Library/Caches \
               /System/Volumes/Data/Library/Developer/CoreSimulator \
               /System/Volumes/Data/private/var/folders \
               /System/Volumes/Data/private/var/vm \
+              /System/Volumes/Data/opt/homebrew \
+              /System/Volumes/Data/opt/homebrew/Library/Taps \
               /System/Library/AssetsV2 \
               /System/Library/AssetsV2/com_apple_MobileAsset_watchOSSimulatorRuntime \
-              /System/Library/AssetsV2/com_apple_MobileAsset_tvOSSimulatorRuntime \
-              /System/Library/AssetsV2/com_apple_MobileAsset_visionOSSimulatorRuntime \
-              /System/Library/AssetsV2/com_apple_MobileAsset_xrOSSimulatorRuntime \
+              /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime \
+              /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain \
               "$(xcode-select -p)/../.." \
               "$(xcode-select -p)/../Contents/Developer/Documentation" \
               "$(xcode-select -p)/../Contents/Developer/Platforms" \
               /System/Volumes/Data/usr/local/share/dotnet \
-              /System/Volumes/Data/opt/homebrew ; do
+              /System/Volumes/Data/.Spotlight-V100 ; do
               if [ -e "$p" ]; then sudo du -sk "$p" 2>/dev/null; fi
             done | sort -rn | awk -F'\t' '{ printf "%9.2f GB  %s\n", $1 / 1048576, $2 }'
 
