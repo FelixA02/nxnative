@@ -240,6 +240,62 @@ jobs:
             echo "Restored run-time captures"
           fi
 
+      - name: Normalize dump layout names
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
+        run: |
+          game="$RUNNER_TEMP/game"
+          normalize_child_dir() {
+            local parent="$1" want="$2" exact="" alt="" d b
+            [ -d "$parent" ] || return 0
+            for d in "$parent"/*; do
+              [ -d "$d" ] || continue
+              b=$(basename "$d")
+              [ "${b,,}" = "$want" ] || continue
+              if [ "$b" = "$want" ]; then
+                exact="$d"
+              elif [ -z "$alt" ]; then
+                alt="$d"
+              else
+                echo "::error::multiple case-variants of '$want' under '$parent'"
+                return 1
+              fi
+            done
+            if [ -n "$exact" ] && [ -n "$alt" ]; then
+              echo "::error::both '$exact' and '$alt' exist; cannot normalize safely"
+              return 1
+            fi
+            if [ -n "$alt" ]; then
+              mv "$alt" "$parent/$want"
+              echo "normalized $(basename "$alt") -> $want in $parent"
+            fi
+          }
+
+          normalize_child_dir "$game" base
+          normalize_child_dir "$game" updates
+          normalize_child_dir "$game" dlc
+
+          if [ -d "$game/base" ]; then
+            normalize_child_dir "$game/base" exefs
+            normalize_child_dir "$game/base" romfs
+          fi
+          if [ -d "$game/updates" ]; then
+            for ver in "$game/updates"/*; do
+              [ -d "$ver" ] || continue
+              normalize_child_dir "$ver" exefs
+              normalize_child_dir "$ver" romfs
+            done
+          fi
+          if [ -d "$game/dlc" ]; then
+            for tid in "$game/dlc"/*; do
+              [ -d "$tid" ] || continue
+              normalize_child_dir "$tid" romfs
+              for slot in "$tid"/*; do
+                [ -d "$slot" ] || continue
+                normalize_child_dir "$slot" romfs
+              done
+            done
+          fi
+
       - name: Build the IPA
         if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
         env:
