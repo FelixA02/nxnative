@@ -36,7 +36,7 @@ Before the first game, run it once with **Check the runner only** ticked (no lin
    | Field | |
    |---|---|
    | Download link | the link to your game files; several links are separated by spaces |
-   | Title ID | only for a cartridge dump (`.xci`) whose file name has no `[title ID]`, such as `Game (World) (Rev 1).xci`: the base game's 16 digits, e.g. `010028600EBDA000` (the games table in [dm/games](../dm/games/README.md#games) lists them). Empty otherwise |
+   | Title ID | only when a run says it could not read the game's title ID (a cartridge dump `.xci` whose file name has none, such as `Game (World) (Rev 1).xci`): the base game's 16 digits, e.g. `010028600EBDA000` (the games table in [dm/games](../dm/games/README.md#games) lists them). Empty otherwise: the run reads the title ID from what it downloaded, and names the build cache after it |
    | Game language | `ja`, `fr`, `de`, `es`, `zh-Hans`, … (empty: English); it must be one the game has |
    | App name | the name on the home screen (empty: the game's name) |
    | Version | the version to pack, e.g. `v0` (empty: the newest in the download) |

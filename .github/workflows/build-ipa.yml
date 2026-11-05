@@ -14,7 +14,7 @@ on:
         type: string
         required: false
       title_id:
-        description: 'Title ID of the base game (16 hex digits), for a cartridge dump (.xci) with no [title ID] in its file name; otherwise empty (a Switch 2 dump folder needs none)'
+        description: 'Title ID of the base game (16 hex digits), only when a run says it could not read the game (a cartridge dump with no [title ID] in its file name); otherwise empty: the title ID read from the download names the build cache'
         type: string
         required: false
       language:
@@ -253,13 +253,43 @@ jobs:
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
           if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
 
+      - name: Download the game
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
+        env:
+          GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+
+      # The cache release is named after the game, so the game comes first: the title ID is read from what was just downloaded, by the same scan the
+      # build makes (dm/tools/game_title_id.py: the NUP's program ID, the dump's NPDM, else the NSPs' tickets). The Title ID field stays empty unless
+      # the scan cannot read the game.
+      - name: Find the game's title ID
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          tid=$(python -I dm/tools/game_title_id.py "$RUNNER_TEMP/game" -k "$keys" || true)
+          rm -f "$keys"
+          if [ -z "$tid" ] && [ -n "$IN_TITLE_ID" ]; then tid="$IN_TITLE_ID"; fi   # a game the scan cannot read (a cartridge dump with no [title ID] in its name): the field, when it was filled in
+          if [ -n "$tid" ]; then
+            echo "GAME_TITLE_ID=$tid" >> "$GITHUB_ENV"
+            echo "The game's title ID: $tid"
+          else
+            echo "::warning::the game's title ID could not be read: this run uses no build cache"
+          fi
+
+      # After the download, so the cache's captures (extract/*/vk_capture, …) need no moving out of the way first.
       - name: Restore build cache
-        if: ${{ !inputs.check_only && !inputs.test_split }}
+        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
-          title_id="${{ inputs.title_id || '010099C022B96000' }}"
+          title_id="$GAME_TITLE_ID"
           if [ -z "$title_id" ]; then
             echo "No title ID determined, skipping cache restore"
             exit 0
@@ -279,40 +309,9 @@ jobs:
                 rm -f "$f"
               fi
             done
-            # Move run-time captures out of extract/ so the game download doesn't wipe them
-            mkdir -p "$RUNNER_TEMP/capture_staging"
-            for cap_dir in "$RUNNER_TEMP/game/"*_build/extract/*/vk_capture "$RUNNER_TEMP/game/"*_build/extract/*/gl_capture "$RUNNER_TEMP/game/"*_build/extract/*/glslc_capture "$RUNNER_TEMP/game/"*_build/extract/*/ue_shaders; do
-              if [ -d "$cap_dir" ]; then
-                rel="${cap_dir#$RUNNER_TEMP/game/}"
-                mkdir -p "$RUNNER_TEMP/capture_staging/$(dirname "$rel")"
-                mv "$cap_dir" "$RUNNER_TEMP/capture_staging/$rel"
-              fi
-            done
             echo "Restored cache: $cache_tag"
           else
             echo "No cache release $cache_tag found"
-          fi
-
-      - name: Download the game
-        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
-        env:
-          GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
-          IN_TITLE_ID: ${{ inputs.title_id }}
-        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
-
-      - name: Restore run-time captures
-        if: ${{ !inputs.check_only && !inputs.test_split && !inputs.test_cache_upload }}
-        run: |
-          if [ -d "$RUNNER_TEMP/capture_staging" ]; then
-            for cap_dir in "$RUNNER_TEMP/capture_staging/"*_build/extract/*/vk_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/gl_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/glslc_capture "$RUNNER_TEMP/capture_staging/"*_build/extract/*/ue_shaders; do
-              if [ -d "$cap_dir" ]; then
-                rel="${cap_dir#$RUNNER_TEMP/capture_staging/}"
-                mkdir -p "$RUNNER_TEMP/game/$(dirname "$rel")"
-                mv "$cap_dir" "$RUNNER_TEMP/game/$rel"
-              fi
-            done
-            rm -rf "$RUNNER_TEMP/capture_staging"
-            echo "Restored run-time captures"
           fi
 
       - name: Build the IPA
@@ -534,7 +533,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          title_id="${{ inputs.title_id || '010099C022B96000' }}"
+          title_id="$GAME_TITLE_ID"
           if [ -z "$title_id" ]; then
             echo "No title ID determined, skipping prune"
             exit 0
@@ -543,7 +542,7 @@ jobs:
           old_releases=()
           while IFS= read -r tag; do
             [ -n "$tag" ] && old_releases+=("$tag")
-          done < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq '.[] | select(.tagName | startswith("cache-" + env.title_id + "-")) | .tagName' 2>/dev/null || true)
+          done < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq --arg tid "$title_id" '.[] | select(.tagName | startswith("cache-" + $tid + "-")) | .tagName' 2>/dev/null || true)
           for tag in "${old_releases[@]}"; do
             if [ "$tag" != "$current" ]; then
               echo "Deleting old cache release: $tag"
