@@ -1040,10 +1040,10 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ### A deferred write under a false guard
 
-- **Symptom:** the scene goes white with a yellow fringe: a few objects hold the largest value their target can, and bloom spreads it over the picture. Clamping a shader's terms one by one finds a value that is a register's stale contents.
+- **Symptom:** the scene goes white with a yellow fringe: a few objects hold the largest value their target can, and bloom spreads it over the picture. Clamping a shader's terms one by one finds a value that is a register's stale contents. Or characters lit from an environment cube turn bright white in certain places only, and the cube's mean is far above its value elsewhere.
 - **Cause:** an instruction with a write barrier [writes through a shadow register](#ampere-shader-code-switch-2), which starts as the register's value and is copied back at the first instruction that waits on the barrier. A guarded one whose guard is false writes nothing on hardware, but the copy still ran, and overwrote whatever had been written meanwhile. Here: `EXP2 R17` under P4, `R17 = R29 * R29` under !P4, then the wait; under !P4, R17 got back a squared distance from long before, and the light's falloff with it.
 - **Fix:** `EmitOpsAmpere` keeps the guard as it was at issue in a shadow register of its own and commits only where it held. A predicated last instruction of a block no longer branches straight to the next block when writes are pending, which skipped their commits. A later guarded write no longer discards an earlier pending one, which may still be the one that lands.
-- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): the first light's falloff, 65,000 in R11G11B10 on leaves and eggs.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): the first light's falloff, 65,000 in R11G11B10 on leaves and eggs. [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) (GitHub issue 1100): DK and Pauline white between Hilltop's rocks. The terrain capture shader `7612419c02d496b9` picks its material with `@P0 IPA R8` then `@!P0 MOV R8` as a block's last instruction, and always got material 0, a placeholder with an emissive scale of 30, so the environment cube's red mean reached 53 against about 1.2 elsewhere. A hand patch of that one selection, on the old chain, brought it to 0.45 at the spot with DK normal. On chain 3dd02e581c0c the shader's MSL has the right selection; the spot itself was not revisited on that chain.
 
 ### Ampere forms with a handle in a register, and SURED's other operations
 
@@ -1054,7 +1054,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ### TXD through a uniform register kept no handle
 
-- **Symptom:** `Failed to find handle source for bindless access` in the build's translator notes, for a shader with TXD through a uniform register (0xf6c). The MSL has no gradient sample, and what it read comes back 0.
+- **Symptom:** `[RED] <key>: the translator deleted N bindless accesses` in the build ([Losses a shader build reports](#losses-a-shader-build-reports); `Failed to find handle source for bindless access` in its reflection's notes), for a shader with TXD through a uniform register (0xf6c). The MSL has no gradient sample, and what it read comes back 0.
 - **Cause:** a bindless read takes its handle as source 0. `ATex` adds it in every other form, but TXD has a branch of its own, which left it out. BindlessElimination then took the first coordinate for the handle, found no source for it and deleted the read.
 - **Fix:** the TXD branch adds the handle first, as the others do.
 - **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): in 14,079 of its 133,154 shaders, none of them among the 1,519 the playtests asked for, so no route has shown it in a picture. Found by [PR 1261](https://github.com/seedds/nxnative/pull/1261).
@@ -1062,11 +1062,21 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ### Layer entry points with the point size passed by reference
 
-- **Symptom:** `no member named 'gl_PointSize' in 'main0l_out'` and `does not compile` in the build, which still exits 0. The shader keeps a library without layer entries, so a slice-writing geometry shader on it logs `has no layer entry points`.
+- **Symptom:** `no member named 'gl_PointSize' in 'main0l_out'` and `does not compile` in the build, which still exits 0, then `[RED] <key>: its library builds only without its layer entry points` ([Losses a shader build reports](#losses-a-shader-build-reports)). A slice-writing geometry shader on it logs `has no layer entry points`.
 - **Cause:** Metal builds no pipeline for a vertex function that writes both the layer and a point size, so the layer's entry points lose the output. `dmsh_build.py` removed it with a regex over `out.gl_PointSize = …;`, but Unreal Engine 5.4's bodies are functions of their own, called as `_88(out.gl_Position, out.gl_PointSize)`, which that left behind.
 - **Fix:** `drop_point_size` removes the writes as before, and gives a vertex function that still passes the output by reference a local float instead (the same for `vs_layer` and `vs_layer_entry`).
 - **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): 38 of the vertex shaders of the 1,519 its playtests asked for lacked layer entries. The first habitat's picture does not change, and it logged no `has no layer entry points` before or after. Found by [PR 1261](https://github.com/seedds/nxnative/pull/1261).
 - **Check:** `python3 dm/gfx/tests/test_dmsh_geometry.py PointSize`.
+
+### Losses a shader build reports
+
+- **Symptom:** in the build's log, `[RED] <key>: the translator deleted N bindless accesses (<type> N): their results read 0` or `[RED] <key>: its library builds only without its layer, integer output, dual source entry points`, and `[RED] lost without failing: …` with the counts per kind (the NSP script repeats that one line). In `regress.py`, `NEW-FAIL: N shaders with more … than in the baseline`.
+- **Cause:** both leave a shader that builds, so the build's status said ok and it exited 0. BindlessElimination deletes an access whose handle it cannot trace and writes 0 to its results (`Failed to find handle source`, kept in the reflection's notes). `finish` in `dmsh_build.py` rebuilds a library that does not compile with its extra entry points without any of them. Nothing compared these between builds, which is how [14,079 of Yoshi's shaders](#txd-through-a-uniform-register-kept-no-handle) and [38 of its vertex shaders](#layer-entry-points-with-the-point-size-passed-by-reference) lost something unnoticed.
+- **Fix:** the reflection holds both (`notes`, `entries_lost`), so a build that restores a shader from its cache reports it too. `dm/gfx/tools/shader_regressions.py` holds what counts as a loss (`losses`) and prints the lines (`report_losses`). `regress.py` compares each shader with the baseline (`loss_diff`): more accesses of a type or a new entry point lost in any shader is `NEW-FAIL`, however the totals move, and a shader new in the candidate starts from none. What the baseline has too is listed as known, and the game's note says what is known about it.
+- **The build still exits 0:** the NSP script runs it for players, and one shader the game may never reach must not stop a pack. `regress.py` is the check for a change, so there is no stricter exit code. On a baseline from before `entries_lost` existed, every lost entry point counts as new.
+- **Not counted yet:** the translator's other messages that lose something: `Shader instruction … is not implemented` and `Failed to find targets for BRX instruction`, which the build summary still counts among its translator lines.
+- **Found on:** the 79 games with a library on the Mac (2026-11-05, those shaders rebuilt on the current chain): 1,984 deleted accesses in 964 shaders of 13 games, the most in [Ghost Trick](../../dm/games/010029B018432000/README.md) (1,030 in 616) and [Super Monkey Ball Banana Rumble](../../dm/games/010031F019294000/README.md) (490 in 245), and [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md) has 26 by its note. No shader built without its extra entry points when rebuilt (65 of Sparks of Hope's, which look as if they did, could not be: its package is not on the Mac): the 25 compiles that failed in the logs were all [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md)'s, before the point size fix. Each game's note lists its own. A listed loss is not proved harmless: none has been traced to a picture.
+- **Check:** `python3 dm/tools/tests/test_shader_regressions.py Losses`, `python3 dm/tools/tests/test_regress.py Regress`.
 
 ### Ampere instructions new in Pokémon Pokopia
 
