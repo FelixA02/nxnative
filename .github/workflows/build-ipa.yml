@@ -1,5 +1,5 @@
 # Packs one game's IPA on GitHub's Mac, for players without a Mac (docs/build-on-github.md). Run by hand: Actions → Build IPA → Run workflow, with a download link to the game's
-# files (NSP, XCI, NSZ or XCZ, or an archive of them). The IPA comes back as the run's download, a 7z archive encrypted with the IPA_PASSWORD secret and kept for one day: in a public
+# files (NSP, XCI, NSZ, XCZ or NUP, or an archive of them). The IPA comes back as the run's download, a 7z archive encrypted with the IPA_PASSWORD secret and kept for one day: in a public
 # repository anyone signed in to GitHub can download a run's files, and the IPA holds the whole game. The run's log is public too, so the link is masked in it (dm/tools/ci_fetch_game.py),
 # and it can come from the GAME_LINK secret instead. prod.keys comes from the PROD_KEYS secret. The game files and the keys stay on the runner, a virtual Mac deleted after the run.
 # The runner has 3 cores, 7 GB of memory, the disk the image leaves (the "Check the runner only" option reports what is free after the cleanup below), 6 hours at most, and no Metal 4
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       link:
-        description: 'Download link of the game: an NSP, XCI, NSZ or XCZ, or a .zip / .7z / .rar of one game''s files, or of a Switch 2 game''s dump folder (base/, updates/, dlc/: found automatically); several links separated by spaces (empty: the GAME_LINK secret)'
+        description: 'Download link of the game: an NSP, XCI, NSZ, XCZ or NUP (a Switch 2 game''s .nup container), or a .zip / .7z / .rar of one game''s files, or of a Switch 2 game''s dump folder (base/, updates/, dlc/: found automatically); several links separated by spaces (empty: the GAME_LINK secret)'
         type: string
         required: false
       title_id:

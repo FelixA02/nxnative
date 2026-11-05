@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-# The game files for a build on GitHub's Mac (.github/workflows/build-ipa.yml, docs/build-on-github.md): downloads the run's links, unpacks archives and puts every NSP / XCI / NSZ / XCZ
+# The game files for a build on GitHub's Mac (.github/workflows/build-ipa.yml, docs/build-on-github.md): downloads the run's links, unpacks archives and puts every NSP / XCI / NSZ / XCZ / NUP
 #   into one folder, the NSP folder of build_ipa_from_nsp.py (which reads only that folder's top level, and only lower-case extensions).
 # The links: the command line's, else the run's "link" input (GITHUB_EVENT_PATH), else the GAME_LINK environment variable (the secret of that name); several are separated by white space
 #   (the base game, its update, its DLC). The log of a public repository is public: each link and its host are masked first (::add-mask::) and never printed.
 # A file keeps its name, which the NSP script reads version tags from ([v327680]; an NSP named (v327680) instead gets the [v327680] added): its name in the archive, else the server's (Content-Disposition), else the URL's when that ends in a game or
-#   archive extension; a game file without a game extension gets the one its header calls for (PFS0: .nsp, or .nsz when it holds .ncz entries; XCI: .xci).
+#   archive extension; a game file without a game extension gets the one its header calls for (PFS0: .nsp, or .nsz when it holds .ncz entries; XCI: .xci; NUP: .nup).
 # Archives (.zip, .7z, .rar, .tar and compressed tars; nested up to DEPTH deep) are unpacked with 7-Zip (7zz, brew install sevenzip), bsdtar (macOS's tar), or for a .zip Python's zipfile,
 #   and each is deleted as soon as it is unpacked: the runner's disk is short. Other files are dropped.
 # A console dump (a Switch 2 game, Donkey Kong Bananza: folders instead of NSPs) is recognized by its layout, base/exefs/main.npdm with base/romfs (updates/<version>/exefs/main.npdm, dlc/<title ID>/ too),
 #   wherever it sits in an archive (a wrapper folder is fine): its folders are moved into the NSP folder as they are, and the NSP script, which tells a dump folder the same way, packs it with
 #   scripts/pack_dump.py and needs no prod.keys. Several archives (base, update, DLC) merge into one folder.
+# A game in one NUP container (a .nup file: https://github.com/a55uka/nup, scripts/pack_nup.py) is a game file like an NSP: it goes into the NSP folder as it is and is never unpacked, since
+#   the NSP script reads the container itself (base game, updates, DLC). It needs no prod.keys and carries its own title ID and update versions, so its name is left alone: no [title ID] and no [vN].
 # Usage: ci_fetch_game.py --out <NSP folder> --work <scratch folder> [link ...]; exit 0 when the folder holds a game file, 1 otherwise (the reason as a ::error:: line)
 import argparse, email.message, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, threading, time, zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-GAME = ('.nsp', '.xci', '.nsz', '.xcz')
+GAME = ('.nsp', '.xci', '.nsz', '.xcz', '.nup')
 ARCHIVE = ('.zip', '.7z', '.rar', '.tar', '.tgz', '.gz', '.bz2', '.xz', '.zst')
 DEPTH = 3     # archives inside archives
 BEAT = 30     # seconds between download progress lines
@@ -93,8 +95,9 @@ def served_name(cd, url):
 
 
 def sniff(p):
-    """What a file's header says it is: 'pfs0' (an NSP or NSZ), 'xci' (an XCI or XCZ), 'zip', '7z', 'rar', 'tar' (also a compressed one), 'html' (a web page), or None"""
+    """What a file's header says it is: 'pfs0' (an NSP or NSZ), 'xci' (an XCI or XCZ), 'nup' (a NUP container), 'zip', '7z', 'rar', 'tar' (also a compressed one), 'html' (a web page), or None"""
     with open(p, 'rb') as f: h = f.read(0x200)
+    if h[:3] == b'NUP': return 'nup'   # the container's magic; pack_nup.py reads its version and rejects one it cannot read
     if h[:4] == b'PFS0': return 'pfs0'
     if h[0x100:0x104] == b'HEAD': return 'xci'
     if h[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08'): return 'zip'
@@ -121,9 +124,9 @@ def pfs0_names(p):   # the names of a PFS0's entries, as build_ipa_from_nsp.py p
 
 def game_name(p, name, kind):   # its own name when the extension fits the header (made lower case), else the name with the extension the header calls for
     name = name or 'game'; stem, ext = os.path.splitext(name)
-    if ext.lower() in (('.nsp', '.nsz') if kind == 'pfs0' else ('.xci', '.xcz')): return stem + ext.lower()
+    if ext.lower() in {'pfs0': ('.nsp', '.nsz'), 'xci': ('.xci', '.xcz'), 'nup': ('.nup',)}.get(kind, ()): return stem + ext.lower()
     if kind == 'pfs0': return name + ('.nsz' if any(n.endswith('.ncz') for n in pfs0_names(p)) else '.nsp')
-    return name + '.xci'
+    return name + ('.nup' if kind == 'nup' else '.xci')   # the NSP script looks for *.nup (build_ipa_from_nsp.py's nup_file)
 
 
 def place(p, name, out):   # move a game file into the NSP folder (a rename: the same volume), with " (2)" … when the name is taken
@@ -269,7 +272,7 @@ def take(p, name, out, work, depth=0):
     shown = name or 'the download'
     try: kind = sniff(p)
     except OSError: SKIPPED['n'] += 1; return []   # cannot be read: not a game file
-    if kind in ('pfs0', 'xci'): return [place(p, game_name(p, name, kind), out)]
+    if kind in ('pfs0', 'xci', 'nup'): return [place(p, game_name(p, name, kind), out)]
     if kind == 'html' and depth == 0: p.unlink(); raise Fail('the link gave a web page, not a file: it must be a direct download link (in a browser, the file downloads at once, with no page or button)')
     # a file inside an archive is unpacked only when its name says archive: a game folder is full of files that look like one by their first bytes (.zs is a zstd stream, .pak ...)
     if kind in (None, 'html') or (depth > 0 and not name.lower().endswith(ARCHIVE)): SKIPPED['n'] += 1; p.unlink(); return []
@@ -277,7 +280,7 @@ def take(p, name, out, work, depth=0):
     names = listing(p, kind)   # the index only: an extracted game folder is told apart before its tens of GB are unpacked
     if names and len(names) > 20 and not any(n.lower().endswith(GAME + ARCHIVE) for n in names) and not dump_in(names):
         eg = ', '.join(os.path.basename(n.rstrip('/')) for n in names[:3])
-        raise Fail(f'the {kind} archive holds {len(names):,} files and none is an NSP, XCI, NSZ or XCZ (or an archive of them), for example {eg}: it looks like an extracted game folder. The build needs the game as NSP or XCI files')
+        raise Fail(f'the {kind} archive holds {len(names):,} files and none is an NSP, XCI, NSZ, XCZ or NUP (or an archive of them), for example {eg}: it looks like an extracted game folder. The build needs the game as NSP, XCI or NUP files')
     say(f'unpacking {shown} ({kind}, {gb(p.stat().st_size)})')
     d = Path(tempfile.mkdtemp(prefix='unpack_', dir=work))
     try:
@@ -348,7 +351,7 @@ def main(argv=None):
         tid = re.sub(r'[^0-9A-Fa-f]', '', os.environ.get('IN_TITLE_ID', ''))[:16]
         if len(tid) == 16:   # a cartridge dump (.xci) with no [title ID] in its name: tag it, which the NSP script reads title IDs from
             for idx, p in enumerate(got):
-                if p.is_dir() or re.search(r'\[[0-9A-Fa-f]{16}\]', p.name): continue   # a dump's folders are not renamed
+                if p.is_dir() or p.suffix.lower() == '.nup' or re.search(r'\[[0-9A-Fa-f]{16}\]', p.name): continue   # a dump's folders are not renamed; a NUP's own program ID is what pack_nup.scan reads
                 stem, ext = os.path.splitext(p.name)
                 q = a.out / f'{stem} [{tid.upper()}]{ext}'; k = 2
                 while q.exists(): q = a.out / f'{stem} [{tid.upper()}] ({k}){ext}'; k += 1
@@ -364,7 +367,7 @@ def main(argv=None):
             got[idx] = q
             say(f'tagged {p.name} with its version: {q.name}')
         if SKIPPED['n']: say(f'left out {SKIPPED["n"]:,} files that are neither game files nor archives')
-        if not got: raise Fail('the download holds no NSP, XCI, NSZ or XCZ file')
+        if not got: raise Fail('the download holds no NSP, XCI, NSZ, XCZ or NUP file')
     except Fail as e:
         say(f'::error::{command_value(str(e))}'); return 1
     total = sum(size_of(p) for p in got)

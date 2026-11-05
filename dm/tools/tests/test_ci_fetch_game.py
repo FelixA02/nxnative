@@ -33,6 +33,10 @@ def xci():
     return b'\0' * 0x100 + b'HEAD' + b'\0' * 4096
 
 
+def nup():   # a NUP container (https://github.com/a55uka/nup, SPEC v1): the fetcher reads its magic; pack_nup.py checks the rest
+    return b'NUP\x01' + b'\0' * 0x2000
+
+
 def zipped(members):   # {name: bytes} → a .zip's bytes
     b = io.BytesIO()
     with zipfile.ZipFile(b, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -69,6 +73,10 @@ class Names(unittest.TestCase):
             self.assertEqual(ci.game_name(nsz, 'g.nsz', 'pfs0'), 'g.nsz')
             self.assertEqual(ci.game_name(x, '', 'xci'), 'game.xci')
             self.assertEqual(ci.game_name(x, 'g.XCZ', 'xci'), 'g.xcz')
+            u = Path(t, 'd'); u.write_bytes(nup())
+            self.assertEqual(ci.sniff(u), 'nup')
+            self.assertEqual(ci.game_name(u, 'Age of Imprisonment.NUP', 'nup'), 'Age of Imprisonment.nup')   # the NSP script scans for *.nup
+            self.assertEqual(ci.game_name(u, 'download', 'nup'), 'download.nup')
 
     def test_command_value(self):   # what the runner unescapes back to the link
         self.assertEqual(ci.command_value('https://h/a%20b?c=1\n'), 'https://h/a%2520b?c=1%0A')
@@ -108,6 +116,24 @@ class Take(unittest.TestCase):
     def test_game_file_as_is(self):
         got = self.take(pfs0(['x.nca']), f'{BASE}.nsp')
         self.assertEqual([p.name for p in got], [f'{BASE}.nsp'])
+
+    def test_a_nup_is_a_game_file_and_is_not_unpacked(self):   # a Switch 2 game in one container: the NSP script reads it itself
+        data = nup()
+        got = self.take(data, 'Hyrule Warriors Age of Imprisonment.nup')
+        self.assertEqual([p.name for p in got], ['Hyrule Warriors Age of Imprisonment.nup'])
+        self.assertEqual(got[0].read_bytes(), data)   # as it came
+        self.assertEqual([p.name for p in self.work.iterdir()], [])   # nothing unpacked: the file was moved, not unpacked beside a copy
+
+    def test_a_nup_without_an_extension_gets_one(self):
+        got = self.take(nup(), 'the-download')
+        self.assertEqual([p.name for p in got], ['the-download.nup'])
+
+    def test_a_nup_in_an_archive(self):
+        ci.SKIPPED['n'] = 0
+        got = self.take(zipped({'Game/Age of Imprisonment.nup': nup(), 'Game/readme.txt': b'x'}), 'game.zip')
+        self.assertEqual([p.name for p in got], ['Age of Imprisonment.nup'])
+        self.assertEqual(ci.SKIPPED['n'], 1)   # the readme
+        self.assertEqual([p.name for p in self.work.iterdir()], [])   # the archive and its unpacked folder are gone
 
     def test_extracted_game_folder_is_refused_before_unpacking(self):   # run 38: tens of thousands of files, none a game file
         z = zipped({f'romfs/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 50 for i in range(30)} | {'romfs/Phive': b'x'})
@@ -262,6 +288,17 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['base', 'dlc', 'updates'])
         self.assertIn('3 game folders', text); self.assertIn('a game dump: base, dlc, updates', text)
+
+    def test_nup_download_is_a_game_file_and_a_title_id_does_not_rename_it(self):   # a NUP carries its own program ID; the Title ID field is for cartridge dumps
+        data = nup(); self.srv.routes['/n'] = (data, {}, False)   # type: ignore[attr-defined]
+        with mock.patch.dict(os.environ, {'IN_TITLE_ID': '04003F40232DE000'}): rc, text = self.run_main(f'{self.base}/n')
+        self.assertEqual(rc, 0, text)
+        got = list((self.t / 'nsp').iterdir())
+        self.assertEqual(len(got), 1)                       # placed, not unpacked
+        self.assertEqual(got[0].suffix, '.nup')             # what build_ipa_from_nsp.py's nup_file scans for
+        self.assertEqual(got[0].read_bytes(), data)
+        self.assertNotIn('04003F40232DE000', got[0].name)
+        self.assertIn('1 game file', text); self.assertNotIn('tagged', text)
 
     def test_several_links(self):
         path = '/' + BASE.replace(' ', '%20').replace('[', '%5B').replace(']', '%5D') + '.nsp'   # the name only in the URL: taken for its game extension

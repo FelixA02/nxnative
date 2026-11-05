@@ -8,8 +8,8 @@ The workflow is `.github/workflows/build-ipa.yml`; it runs the same script as [B
 
 - A GitHub account with a fork of nxnative (the **Fork** button on the repository's page).
 - Your `prod.keys`.
-- The game's files (the base game, and its update and DLC if you have them) behind a **direct download link**: opened in a browser, the link starts the download at once, with no page or button in between. One link per file, or one `.zip`, `.7z` or `.rar` of the files of one game. NSZ and XCZ files work too.
-- **A Switch 2 game** (Donkey Kong Bananza) comes as a dump: a folder, not NSPs. Put the game's folder in a `.zip`, `.7z` or `.rar` (a wrapper folder inside is fine) holding `base/exefs/` (`main`, `main.npdm`, `sdk`, `rtld`), `base/romfs/`, and optionally `updates/<version>/exefs` + `romfs` and `dlc/<DLC title ID>/<n>/romfs` ([the layout](../README.md#switch-2-games)). The workflow recognizes it by that layout, and the build needs no `prod.keys` for it; base, update and DLC may also come as separate archives, one link each. Nothing is selected in the form. The game's profile must exist in [dm/games](../dm/games/README.md#games). The upstream project tests Switch 2 games on a Mac only: an iPhone app of one is untested.
+- The game's files (the base game, and its update and DLC if you have them) behind a **direct download link**: opened in a browser, the link starts the download at once, with no page or button in between. One link per file, or one `.zip`, `.7z` or `.rar` of the files of one game. NSZ and XCZ files work too, and so does a Switch 2 game's `.nup` container: one file holding the base game, its updates and its DLC.
+- **A Switch 2 game** (Donkey Kong Bananza) comes as a dump: a folder, not NSPs. Put the game's folder in a `.zip`, `.7z` or `.rar` (a wrapper folder inside is fine) holding `base/exefs/` (`main`, `main.npdm`, `sdk`, `rtld`), `base/romfs/`, and optionally `updates/<version>/exefs` + `romfs` and `dlc/<DLC title ID>/<n>/romfs` ([the layout](../README.md#switch-2-games)). The workflow recognizes it by that layout, and the build needs no `prod.keys` for it; base, update and DLC may also come as separate archives, one link each. Or it comes as one `.nup` container ([NUP](https://github.com/a55uka/nup)): a single link, the base game, updates and DLC inside, no `prod.keys` needed either. Nothing is selected in the form. The game's profile must exist in [dm/games](../dm/games/README.md#games). The upstream project tests Switch 2 games on a Mac only: an iPhone app of one is untested.
 - [7-Zip](https://www.7-zip.org) (or another tool that opens password-protected `.7z` files), to open the download.
 - A sideloading tool for the IPA (AltStore, Sideloadly, LiveContainer, …).
 
@@ -81,7 +81,7 @@ The run's summary and the last lines of the step that failed say why. Common one
 | no NSP with a readable title ID | the game is a cartridge dump (`.xci`) without a `[title ID]` in its name: fill in the **Title ID** field |
 | the archive is password-protected | pack the files without a password |
 | more than one game in the folder | one game per run |
-| the archive holds N files and none is an NSP, XCI, NSZ or XCZ | an extracted game folder that is not a dump in the layout above (no `base/exefs/main.npdm` with `base/romfs`): repack it in that layout |
+| the archive holds N files and none is an NSP, XCI, NSZ, XCZ or NUP | an extracted game folder that is not a dump in the layout above (no `base/exefs/main.npdm` with `base/romfs`): repack it in that layout |
 | No space left on device, or a build that stops while the summary's lowest free disk space is near 0 | the game is too big for the runner |
 | missing repository secrets | add `PROD_KEYS` and `IPA_PASSWORD` ([Set it up once](#set-it-up-once)) |
 
