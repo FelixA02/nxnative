@@ -160,7 +160,8 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Reader:** `kt_shaders` inflates every LINKDATA entry and loose `*.gz` / `*.spkg` file ([01](../agents/01-extract.md)), takes every GLSLC output that passes the triple check, and scans its SARCs for BNSH; `DATA1.bin` is split into 64 scan jobs by entry range (`linkdata_jobs`).
 - **Symptom:** 24 shaders before the control-length fix, 1,355 after.
 - **Cause:** its GLSLC (output version 0x1d.2) writes the 0x848 / 0x850-byte controls and headerless compute code described in the RDB entry, which `glslc_shaders` used to drop. A few outputs of version 0x1d.0 keep something else at control +0x20 (odd values such as 0x136b), so a control length must be a multiple of 4; the section-header reading now takes 8 of them ([GLSLC outputs read through their section headers](#glslc-outputs-read-through-their-section-headers)).
-- **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) (the older KTGL).
+- **Index names:** the archive and its index are `DATA1.bin` + `DATA0.bin` (Three Houses), `LD_<name>.BIN` + `LI_<name>.IDX` ([KTGL on NVN2](#ktgl-on-nvn2-switch-2-glslc-outputs-and-ld_--li_-linkdata)) or `LINKDATA.BIN` + `LINKDATA.IDX` (DRAGON QUEST BUILDERS 2: 1.1 GB, 59,193 entries). `linkdata_index` names each. With a name it does not know, the archive is scanned as one plain file and nothing inside its compressed entries is found: the split reported 130 shaders against 2,107 with the index, and the host printed `is not in the shader map` once the 3D scenes began.
+- **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) (the older KTGL), [DRAGON QUEST BUILDERS 2](../../dm/games/010042000A986000/README.md).
 
 ### KTGL on NVN2: Switch 2 GLSLC outputs and LD_ / LI_ LINKDATA
 
@@ -454,6 +455,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **How it is stored:** the same inline records as [the paks' `.uexp` files](#unreal-engine-427-shaders-inline-in-cooked-packages-lz4), `bShareMaterialShaderCode` being off, with IoStore on as well: the cooked packages are the container's export bundles (chunk type 2 in Unreal 4.27's numbering, TOC version 3), Oodle-compressed block by block, and the pak beside it keeps everything else, the global shader cache (`Engine/GlobalShaderCache-SF_GLSL_SWITCH.bin`) too. The pak's directory has neither `.ushaderbytecode` nor `.uexp`, so it was taken for one with archives.
 - **Reader:** `uepak.py` `inline_shaders` also takes the global shader cache with no `.ushaderbytecode` as inline, and `shader_split.py` `ue_legacy_jobs` then also reads the export bundles of the containers beside such a pak, the newest copy of each chunk ID (`mount_order`), through the game's own Oodle in the host's tool mode. Bulk data chunks are skipped. `Toc.names` reads the container's directory index, so a shader's label names its package, as for a pak, and `shader_groups` works the same way.
 - **Found on:** [Mario & Luigi: Brothership](../../dm/games/01006D0017F7A000/README.md): 45,824 unique shaders from 8.8 GB of export bundles in 39 s.
+
+### Unreal Engine 5.4 shaders for the Switch 2
+
+- **Symptom:** `shaders: 0` from the split, with no red line, on a game whose pak holds `Engine/GlobalShaderCache-SP_GLSL_SAGE.bin` (`Sage` is the engine's name for the platform).
+- **How it is stored:** inline as in [the 4.27 export bundles](#unreal-engine-427-shaders-inline-in-iostore-export-bundles), `bShareMaterialShaderCode` being off, in the TOC version 6 container's export bundles, which are chunk type 1 in Unreal Engine 5's numbering. Two things differ. The code of each `FShaderMapResourceCode` entry is one Oodle stream, not LZ4. And the record is NVN2's, with no `LSLG`: a 0x3e-byte header, `u32` name length, the name (`Global/<type>/0:/Engine/Private/<file>.usf|<entry>`), `u32` code length, the code area, `u32` control length, the control section (version 0xc9), a 12-byte tail. The frequency byte after each entry names the stage as in Unreal's `EShaderFrequency`.
+- **Reader:** `uepak.shader_map_entries` finds a table by its first entry's stream (`8C 0A` is Mermaid) and takes it only when the count before the first entry, the same count before the 20-byte hashes, and a walk over all its entries agree: those two bytes also turn up inside other data, and decoding such a false start aborts the decoder (85 of 5,341 candidates in the global cache). `uepak.sage_record` splits each decoded stream by its lengths and the control section's own. `Toc.export_bundles` now takes UE5's chunk type as well; a container is read only beside a pak `inline_shaders` accepts, so FINAL FANTASY RESONANCE and Octopath Traveler 0 are unaffected.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): 133,154 unique shaders (45,614 vertex, 60,840 pixel, 21,654 compute, 5,041 mesh, 5 geometry) from 19 GB of container in 76 s.
 
 ### Unreal Engine 4.22 to 4.25 paks (version 8)
 
@@ -937,6 +945,20 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 - **Note:** the layout of NVN's driver segments `c0` and `c2` (the handle tables, the storage and uniform buffer tables, the words the host fills) and the binding kinds of the reflection JSON have one definition, `dm/gfx/nvn/dmsh_abi.h`. The host includes it (`nvn_mtl.m`, `nvn_refl.m`, `nvn_obj.h`); `dmsh_build.py` reads it through `dm/gfx/tools/dmsh_abi.py`, which stops on any line it cannot read. Both files are part of the chain version. `dm/tools/tests/test_dmsh_abi.py` checks that the tables fit together, that the host converts every kind the build may write, that the translator's own copy of the `c2` layout (`Program.cs`) agrees, and that the values do not come back as literals in the host or the build. The entries below cite the offsets.
 
+### Images and buffer textures with their handle in a uniform buffer
+
+- **Symptom:** `reflection conversion failed: B binding cp_i_cb3_0_ has no resolved slot number` at load, then `the dispatched program has no compute shader`; in the build, `SUATOM handle in bank 3` or `SURED handle in bank 3`, and bindings of an unrecognized kind for a typed buffer. Compute passes are skipped.
+- **Cause:** the compiler reads a texture handle from wherever the game put it, and bindless textures in uniform buffers were already [read at bind time](#storage-buffer-addresses-in-the-games-own-uniform-buffer). Images and buffer textures were not, as no game had done it: Unreal Engine 5.4 for the Switch 2 keeps every one in `c[3]`, uniform slot 0 (about 87,000 SURED, 15,000 SULD and 121,000 SUST in one game's shaders, none of them in another bank).
+- **Fix:** binding kinds `img_ubo` and `tbuf_ubo` (`dmsh_abi.h`), `NVN_RB_IMGU` and `NVN_RB_TBUFU` in the host, which read the handle as `NVN_RB_TEXU` does and otherwise bind as an image slot or a typed buffer: usage upgrades for written images (`image_prepare`), the uniform shadow check, and the pass logic that treats any bindless shader cautiously. In the translator SUATOM and SURED pass their bank on. With no descriptor to ask at build time, an atomic takes its format from the instruction's size (`UniformHandleAtomicFormat`).
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md).
+
+### Texture and sampler words in either order
+
+- **Symptom:** a scene lit black with correct geometry. In `DM_NVN_PASSDUMP`, the lighting shader's bindings show `tex … tid=0 dummy` where the G-buffer should be, and a sampler bound where a texture is expected.
+- **Cause:** a handle from two words (`fp_t_cb262147_10020016`: words 0x16 and 8, handle type 1) is the OR of a texture and a sampler word, and the GPU does not care which comes first. The build took the first as the texture and the second as the sampler. Unreal Engine 5.4's lighting shaders read a shared sampler's word first, so each G-buffer texture came out as ID 0.
+- **Fix:** each half of such a binding carries the other word (`soff`, `sreg`), and the host ORs the two as the GPU does (`ubo_bind_handle`). A shader whose order was as assumed gets the same handle.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): its lighting, with this as the last step from a black scene to a lit one.
+
 ### A store only a dispatch's first invocation makes
 
 - **Symptom:** objects from a compute-built list flicker: each is in one of two states, on and off irregularly and independently of the others, while the draws are the same frame to frame and the camera is still. Whole groups may vanish or appear in one frame and stay that way until the list's next rebuild. Shots of consecutive frames show the change per frame jumping between two levels.
@@ -1009,6 +1031,43 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md): 10,177 instructions in 7,590 programs. The fix made no visible difference in its tutorial area.
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_mem.py`.
 
+### A guarded load whose destination is its address
+
+- **Symptom:** none in the log: everything drawn with an engine's scene data lands on the first instance's transform, or at nothing. In the MSL, a bounds-checked read has a constant index (`vp_s2._m0[0]`) just after a comparison of the register it should use.
+- **Cause:** a uniform-form LDG (`0x981`) with a predicate is zero where the predicate is false, so the translator zeroed the destination first and then read the address. With `LDG.P R5, [R5 + UR4]` the address was already gone.
+- **Fix:** `ALdg` reads the address into locals before anything is written.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): Unreal Engine 5.4's GPU scene reads, every one of them; the first step away from a black scene.
+
+### A deferred write under a false guard
+
+- **Symptom:** the scene goes white with a yellow fringe: a few objects hold the largest value their target can, and bloom spreads it over the picture. Clamping a shader's terms one by one finds a value that is a register's stale contents.
+- **Cause:** an instruction with a write barrier [writes through a shadow register](#ampere-shader-code-switch-2), which starts as the register's value and is copied back at the first instruction that waits on the barrier. A guarded one whose guard is false writes nothing on hardware, but the copy still ran, and overwrote whatever had been written meanwhile. Here: `EXP2 R17` under P4, `R17 = R29 * R29` under !P4, then the wait; under !P4, R17 got back a squared distance from long before, and the light's falloff with it.
+- **Fix:** `EmitOpsAmpere` keeps the guard as it was at issue in a shadow register of its own and commits only where it held. A predicated last instruction of a block no longer branches straight to the next block when writes are pending, which skipped their commits. A later guarded write no longer discards an earlier pending one, which may still be the one that lands.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): the first light's falloff, 65,000 in R11G11B10 on leaves and eggs.
+
+### Ampere forms with a handle in a register, and SURED's other operations
+
+- **Symptom:** `Ampere instruction f63` (or `f6c`, `364`, `367`) `is not implemented`, or `SURED form 0310e000`, in the build.
+- **Cause:** 0xf60 and 0x361 were known for TEX. The same pairs exist for the others: 0xf63 and 0xf6c are TLD4 and TXD through a uniform register at 40..46, 0x364 and 0x367 are TLD4 and TLD through a register, the first of the second source block, each otherwise laid out as its bound form. SURED takes SUATOM's operation field (87..91): MAX, OR and MIN on 32 bits turn up.
+- **Fix:** `ATex` maps them to the bound forms, `ASured` takes the operation. Open: SURED.MAX.U64 (33,550 uses, Nanite's visibility buffer) is still refused, as the host has no 64-bit image atomics; the game does not reach those shaders so far.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md). Its shaders' jump tables also ran past their code on two compute shaders (`ArgumentOutOfRangeException`, in `GetCode`): an address past the code is now no code, which ends the table as the decoder expected.
+
+### TXD through a uniform register kept no handle
+
+- **Symptom:** `Failed to find handle source for bindless access` in the build's translator notes, for a shader with TXD through a uniform register (0xf6c). The MSL has no gradient sample, and what it read comes back 0.
+- **Cause:** a bindless read takes its handle as source 0. `ATex` adds it in every other form, but TXD has a branch of its own, which left it out. BindlessElimination then took the first coordinate for the handle, found no source for it and deleted the read.
+- **Fix:** the TXD branch adds the handle first, as the others do.
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): in 14,079 of its 133,154 shaders, none of them among the 1,519 the playtests asked for, so no route has shown it in a picture. Found by [PR 1261](https://github.com/seedds/nxnative/pull/1261).
+- **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_mem.py`.
+
+### Layer entry points with the point size passed by reference
+
+- **Symptom:** `no member named 'gl_PointSize' in 'main0l_out'` and `does not compile` in the build, which still exits 0. The shader keeps a library without layer entries, so a slice-writing geometry shader on it logs `has no layer entry points`.
+- **Cause:** Metal builds no pipeline for a vertex function that writes both the layer and a point size, so the layer's entry points lose the output. `dmsh_build.py` removed it with a regex over `out.gl_PointSize = …;`, but Unreal Engine 5.4's bodies are functions of their own, called as `_88(out.gl_Position, out.gl_PointSize)`, which that left behind.
+- **Fix:** `drop_point_size` removes the writes as before, and gives a vertex function that still passes the output by reference a local float instead (the same for `vs_layer` and `vs_layer_entry`).
+- **Found on:** [Yoshi and the Mysterious Book](../../dm/games/0400245021D2C000/README.md): 38 of the vertex shaders of the 1,519 its playtests asked for lacked layer entries. The first habitat's picture does not change, and it logged no `has no layer entry points` before or after. Found by [PR 1261](https://github.com/seedds/nxnative/pull/1261).
+- **Check:** `python3 dm/gfx/tests/test_dmsh_geometry.py PointSize`.
+
 ### Ampere instructions new in Pokémon Pokopia
 
 - **Symptom:** `Ampere instruction <op> at 0x… is not implemented`, `F2FP.MERGE_C` or `F2I from a float that is not 32-bit` in the shader build; those shaders are left out and their draws and dispatches skipped.
@@ -1019,6 +1078,15 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
   - UP2UR (0x883): `URd = UP0 ? 1 : 0`. The game's one encoding (URZ, mask 1) is accepted; any other stops the shader.
 - **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md).
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_mem.py`.
+
+### Comparisons with .FTZ
+
+- **Symptom:** single bright dots at thin far geometry (railings, track edges), changing frame to frame as the camera moves, already in the lit picture before anti-aliasing. Most of them come from another cause (below).
+- **Cause:** a float comparison has an .FTZ flag (Ampere: FSET and FSETP bit 80, after the comparison at 76..80; Maxwell: FSETP bit 47, FSET bit 55, FCMP bit 47): on NVIDIA a denormal operand compares as zero. The translator decoded it and dropped it, and Apple's GPUs keep fp32 denormals. A guard like `sum != 0` before `1 / sum` then lets a denormal sum through: its reciprocal overflows, the products give NaN, and a `min(x, 1.0)` (`precise::`, see [min, max and clamp with a NaN operand](#min-max-and-clamp-with-a-nan-operand)) turns it into 1.0, a fully lit pixel.
+- **Fix:** a comparison flushes each operand where the flag is set: `|x| < FLT_MIN ? 0 : x` (`FlushDenormal`, `InstEmitAluHelper.cs`, from `AFset` / `AFsetp` and from Maxwell's `EmitFset`, `EmitFsetp` and `EmitFcmp`, which flushes only the source it compares). An immediate or RZ needs no code.
+- **Limit:** only the comparisons. The compilers set .FTZ on nearly every float instruction of every shader, so it is in effect a mode of the whole shader, and Metal has none (`MTLCompileOptions` has math modes, no denormal control). Flushing the arithmetic would be about 3.3 million more sites in Mario Kart World, so its FADD, FMUL and FFMA keep denormals. Four denormal weights can still add up to a normal sum, which NVIDIA sees as zero; it stays finite, so it makes no NaN.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md): its deferred lighting `635061c90d75a8d1` normalises four depth-weighted half-resolution samples by `1 / sum` only where `FSETP.NEU.FTZ` says the sum is not zero. No Switch 1 game has shown the symptom; Maxwell's comparisons follow for the same semantics (the flag is on all of them in the 8 Switch 1 games counted).
+- **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_alu.py` (`CompareFtz`, on the game's encoding) and `test_dmsh_maxwell_ftz.py`.
 
 ### Barrier moves around warp shuffles
 
@@ -1578,9 +1646,19 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** a translated shader's argument buffer names several texture types, and Metal's texture classes are large templates. The compiler's module cache holds the templates but not their instantiations, and each shader is a new `metal` process, so it instantiates them again, along with a `memory_coherence_device` copy of each it uses: 722 of a typical shader's 902 ms of front end by `-ftime-trace`, against about 180 ms for the shader's own text. Declaring the argument buffer alone took 0.37 s of that shader's compile.
 - **Fix:** `dm/gfx/tools/dmsh_pch.py` makes one precompiled header per compile convention at a process's first compile, holding those instantiations, and `dmsh_build.py` and `ios_metal.py` compile with `-include-pch`. The header adds only the two includes the sources start with and declares no name, and a class left out of it costs only time. The output is byte-identical, so the compile records and the Metal compile cache's keys stay as they were. `make` checks this on a test shader and builds without the header if a compiler differs, and a compile that fails with the header runs again without it, so a failure reports what a plain compile reports. `DMSH_PCH=0` turns it off. The Vulkan and OpenGL shader tools (`vk_shaders.py`, `gl_shaders.py`) do not use it.
 - **Measurement:** cold builds of 1,019 Pokopia shaders on an M4 Pro (`J=10`, with other jobs on the Mac): Mac child processes 2,343 to 975 s of CPU, wall 253–263 s to 176–182 s; iOS child processes 981–1,077 to 574–605 s, wall 179–233 s to 130–153 s. At that rate the whole Mac map would take about 6.4 hours instead of about 9 (not run). All 37,611 Mac files of 8,157 Pokopia shaders and all 3,675 iOS files of 1,020 came out byte-identical with and without the header, as did 1,600 compiles of eight games' shaders.
-- **Open:** wall time now falls less than CPU, as the builder's Python takes about 0.12 s a shader under the GIL (about 120 of those 176 s), which alone comes to about 4.3 hours for Pokopia.
+- **Open:** wall time fell less than CPU, as the builder's Python took about 0.12 s a shader under the GIL ([Rewrites that try every character of a large source](#rewrites-that-try-every-character-of-a-large-source) lowered that).
 - **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md#found-on-this-game).
 - **Check:** `test_shader_pch.py`.
+
+### Rewrites that try every character of a large source
+
+- **Symptom:** the shader step of a game with large translated sources has fewer Metal compiles running than `J` asks for, and `dmsh_build.py`'s own process stays busy on one core between them. Pokémon Pokopia's sources average 220 KB, and the builder spent about 0.12 s of Python on each shader, all but its system calls under the GIL, which alone would have come to about 4.2 hours of its full build.
+- **Cause:** patterns with no literal start, which `re` can only try at every character: `_once` in `dmsh_fetch.py` began with a lookbehind and ran 24 times a pixel shader at about 4 ms (38% of the Python, on shaders that mostly make no variant), the attribute pattern ran on every shader though only vertex shaders have attributes, and patterns beginning `\b` or an alternation did the same in `reflect`, `fs_uint` and `check_msl`. `dmsh_side.py` `_close` looped in Python over each character of a function body, and `uses_image_atomics` over each SPIR-V instruction.
+- **Fix:** the same questions, answered from the text: `str.find` and a look at the character before it (`_once`, `has_word`), one pass over a shader's stores instead of one for each output (`fs_uint`), the lines that hold attributes (`attributes`), bracket to bracket (`_close`), and a test for a word every match must hold before the pattern runs (`check_msl`, `uses_image_atomics`). The outputs are byte-identical.
+- **Measurement:** cold builds on an M4 Pro, old and new taking turns, never on a quiet Mac. Pokopia's 8,157 `shader_seen.tsv` shaders, Mac and iOS (`J=14`, load 9 to 19): wall 1,426 to 607 s, the builder's Python 1,121 to 463 s of CPU. 1,001 of them, Mac only: `J=14` at load 5 to 8, wall 141 to 68 s, Python 116 to 52 s; `J=14` at load 26 to 39, wall 194 to 94 s; `J=10` at load 31 to 64, wall 177 and 173 s to 92 and 93 s, Python 150 to 160 s to about 49 s. The child processes' CPU stayed about the same (4,842 to 4,789 s on the 8,157; 2 to 13% more on the 1,001, with more compiles running at once). At those rates the whole Mac map at the NSP script's `J=14` would take about 2.5 hours instead of about 5 (not run). Identical: all 31,836 Mac and 23,678 iOS files of those 8,157, and `regress.py chain` on all of Breath of the Wild's 19,592 shaders (0 changed); old against new, step by step, 0 differences on 27,325 sources of seven games, 8,197 of their fetch variants among them.
+- **Open:** a pool of worker processes for the finish step gained only 6 to 8% more on top of this (1,001 shaders, `J=10` and `J=14`, also with half the compiles modelled), for counters returned from its workers and locks across them, so it was not built; measure again on a machine with many more cores. `posix_spawn` (`close_fds=False`) takes `Popen` from 13 to 3 s, but without `pipe2` on macOS another thread's child can inherit a pipe and hold up its reader, so it would need a lock around every launch. The reflections a full build keeps (about 2.5 GB for Pokopia) raise the cost of each fork; a micro-benchmark gives 0.7 ms at 176 MB and 1.8 ms at 2 GB, and no full map has been timed.
+- **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md#found-on-this-game) (resolved).
+- **Check:** `test_shader_rewrites.py`, which also holds each replacement to the pattern or loop it replaced on random text.
 
 ### A library that depends on its source's file name
 
