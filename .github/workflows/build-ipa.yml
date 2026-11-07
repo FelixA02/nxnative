@@ -194,7 +194,7 @@ jobs:
       - name: Install the tools
         run: |
           brew install xcodegen zstd spirv-cross glslang sevenzip   # sevenzip: 7zz, which unpacks the download and encrypts the IPA
-          python -m pip install lz4 capstone fonttools   # backports.zstd is for Python before 3.14 only
+          python -m pip install lz4 capstone fonttools zbic   # backports.zstd is for Python before 3.14 only
           python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
           # Xcode 26 installs the Metal toolchain (the shader compiler and metal-tt) separately
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
@@ -768,7 +768,7 @@ jobs:
       - name: Install the tools
         run: |
           brew install xcodegen zstd spirv-cross glslang sevenzip
-          python -m pip install lz4 capstone fonttools
+          python -m pip install lz4 capstone fonttools zbic
           python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
