@@ -4880,8 +4880,9 @@ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compress
 static struct { tex_t t; void *tex; unsigned level, slice, n; int att; } g_rtm[8]; static int g_nrtm;   // n: the layers the pass draws from slice on; att: the colour slot
 static int tex_storage_dst(const tex_t *t);
 static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, unsigned layer0, const NVNcopyRegion *r, const char *from, int absorb);
+// slice: the attachment's first slice, or of a 3D texture its depth plane (mirror_readback reads a 3D texture's planes from there on)
 static void rt_mirror_add(const tex_t *t, id<MTLTexture> mt, NSUInteger level, NSUInteger slice, int att) {
-    if (!mt || t->d.target == NVN_TEXTURE_TARGET_3D || !tex_storage_dst(t)) return;
+    if (!mt || !tex_storage_dst(t)) return;
     for (int i = 0; i < g_nrtm; i++) if (g_rtm[i].t.serial == t->serial && g_rtm[i].level == level && g_rtm[i].slice == slice) return;
     if (g_nrtm == (int)(sizeof g_rtm / sizeof g_rtm[0])) { RED_ONCE(131, "more than %d storage-backed render targets in one pass: the rest are not read back into their storage", g_nrtm); return; }
     g_rtm[g_nrtm++] = (typeof(g_rtm[0])){*t, (void *)CFBridgingRetain(mt), (unsigned)level, (unsigned)slice, 1, att};
@@ -4889,7 +4890,7 @@ static void rt_mirror_add(const tex_t *t, id<MTLTexture> mt, NSUInteger level, N
 // Once the pass's layers are known: a layered or slice-merged pass (renderTargetArrayLength) draws into that many layers of each attachment from its attached slice on, all read back
 static void rt_mirror_layers(MTL4RenderPassDescriptor *pd) {
     for (int i = 0; i < g_nrtm; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[g_rtm[i].att];
-        g_rtm[i].slice = (unsigned)c.slice; g_rtm[i].n = pd.renderTargetArrayLength > 1 ? (unsigned)pd.renderTargetArrayLength : 1; }
+        g_rtm[i].slice = (unsigned)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_rtm[i].n = pd.renderTargetArrayLength > 1 ? (unsigned)pd.renderTargetArrayLength : 1; }
 }
 // After the pass has ended. The readbacks open the copy encoder, which is closed again: callers of rp_end may open an encoder of their own next and rely on none being open
 // (with it left open, Tears of the Kingdom stopped presenting on loading its opening at frame 1983)
@@ -4897,8 +4898,9 @@ static void rt_mirror_flush(void) {
     int n = g_nrtm; g_nrtm = 0;
     for (int i = 0; i < n; i++) {
         id<MTLTexture> mt = CFBridgingRelease(g_rtm[i].tex);
-        NVNcopyRegion r = {0, 0, 0, (int)MAX(mt.width >> g_rtm[i].level, 1u), (int)MAX(mt.height >> g_rtm[i].level, 1u), (int)g_rtm[i].n};
-        mirror_readback(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, &r, "render", 1);
+        int d3 = mt.textureType == MTLTextureType3D;   // a 3D attachment's planes are the region's depth, from its plane on; any other's layers, from its slice on
+        NVNcopyRegion r = {0, 0, d3 ? (int)g_rtm[i].slice : 0, (int)MAX(mt.width >> g_rtm[i].level, 1u), (int)MAX(mt.height >> g_rtm[i].level, 1u), (int)g_rtm[i].n};
+        mirror_readback(&g_rtm[i].t, mt, g_rtm[i].level, d3 ? 0 : g_rtm[i].slice, &r, "render", 1);
     }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
 }
@@ -5094,7 +5096,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (g_xv_n) { xv_ent *xe = xv_find(R.rt.color[i]->serial, (uint32_t)pd.colorAttachments[i].level, (uint32_t)pd.colorAttachments[i].slice);
             if (xe && (xe->state == XV_INVALID || xe->state == XV_PROBE)) { if (pd.colorAttachments[i].loadAction == MTLLoadActionLoad) { xv_ent copy = *xe; xv_violation(&copy, "old content loaded as an attachment"); } else xv_good(xe); } }
         pd.colorAttachments[i].storeAction = MTLStoreActionStore;
-        rt_mirror_add(R.rt.color[i], pd.colorAttachments[i].texture, pd.colorAttachments[i].level, pd.colorAttachments[i].slice, i);
+        rt_mirror_add(R.rt.color[i], pd.colorAttachments[i].texture, pd.colorAttachments[i].level,
+                      pd.colorAttachments[i].texture.textureType == MTLTextureType3D ? pd.colorAttachments[i].depthPlane : pd.colorAttachments[i].slice, i);
     }
     if (g_sm_plan.on && !clear_only && pd.colorAttachments[0].texture && !R.rt.depth) {   // slice-merged pass (see g_sm_plan): the attachment holds every layer the draws reach
         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[0];
@@ -7715,14 +7718,17 @@ static id<MTL4Compiler> g_comp4;
 // g_arch4: the files that may hold bases with a vertex layout, g_arch4p: the files that hold none (p<seq>.mtl4a: the prebuild's, and any flush whose bases all read their vertices
 // themselves). A base with a layout is looked up in g_arch4 alone: each file a lookup misses in costs about 0.06 ms, and a cold start's misses were for such bases, in the 13 prebuilt files
 static NSArray<id<MTL4Archive>> *g_arch4, *g_arch4p; static NSString *g_arch_dir; static int g_arch_seq;
-// Compaction: every start writes a file or more (each flush captures only what is new), Breath of the Wild 5-7 per start, and each file a base is not in costs a lookup about 0.06 ms.
-// With more than PSO_ARCH_COMPACT files of bases with a vertex layout, the bases the prewarm takes from them are captured again from the original shader functions, so the flush
-// after the prewarm writes them into one file, or one per ARCH_PERIOD_MAX of them; once every period that may hold them is written, the old files are removed (open archives stay
-// usable for the rest of the run). Bases the prewarm did not take (pso_user.tsv never named them) go with them and are built again when drawn. The prebuild's files (p<seq>) are
-// left as they are
+// Compaction: every start writes a file or more (each flush captures only what is new), Breath of the Wild 5-7 per start, Ocarina of Time 13-273 in a play session, and each file
+// a base is not in costs a lookup about 0.06 ms. Run files are taken by size tier (arch_tier, from the pipeline count in the name), each PSO_ARCH_COMPACT times the one below; a full
+// period's file is in none. When a tier has more than PSO_ARCH_COMPACT files, the bases the prewarm takes from it and every smaller tier are captured again from the original shader
+// functions, so the flush after the prewarm writes them into one file, or one per ARCH_PERIOD_MAX of them; once every period that may hold them is written, those files are removed
+// (open archives stay usable for the rest of the run). With every run file in it, a start after a few files of play captured the whole archive again. Bases the prewarm did not
+// take (pso_user.tsv never named them) go with them and are built again when drawn. The prebuild's files (p<seq>) are left as they are
 enum { PSO_ARCH_COMPACT = 8 };
 static int g_compact_enabled;   // immutable after pso4_init; unlike g_compact_files, never cleared by the archive queue
+static _Atomic int g_compact_bases; static _Atomic uint64_t g_compact_ns;   // render bases captured again and their time (the prepare line)
 static NSArray<NSString *> *g_compact_files; static _Atomic int g_compacted;
+static unsigned char *g_compact_state;   // per run file of g_compact_files (g_arch4's order): 1 when the compaction replaces it; immutable after pso4_init
 // g_compact_periods: periods that may hold recaptured bases, handed over and not written yet; g_compact_closed: the last of them is handed over (the first flush after the prewarm);
 // g_compact_bad: one was not written, or a base the prewarm took from an old file was not captured again: the old files stay (arch_compact_finish)
 static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad;
@@ -7737,6 +7743,16 @@ static int arch_compact_allowed(void) {
     if ([m isEqualToString:arch_compact_stamp()]) { MLOG("[RED] pipeline archive: a compaction did not finish on this system build (issue #342): the files are left as they are"); return 0; }
     unlink(arch_compact_marker().fileSystemRepresentation);   // another system build or capture method: try once more
     return 1;
+}
+// The marker around a compacting period's write (arch_write_file): on 1 writes it, 0 removes it once the write returned. -1: the process is ending (mtl_arch_save), so a write
+// it cuts short is no crash in Metal: this run's marker goes (one a crashed run left stays) and none is written again
+static os_unfair_lock g_mark_lock = OS_UNFAIR_LOCK_INIT; static int g_mark_mine, g_mark_off;
+static void arch_mark(int on) {
+    os_unfair_lock_lock(&g_mark_lock);
+    if (on > 0 && !g_mark_off) { [arch_compact_stamp() writeToFile:arch_compact_marker() atomically:YES encoding:NSUTF8StringEncoding error:nil]; g_mark_mine = 1; }
+    else if (on <= 0 && g_mark_mine) { unlink(arch_compact_marker().fileSystemRepresentation); g_mark_mine = 0; }
+    if (on < 0) g_mark_off = 1;
+    os_unfair_lock_unlock(&g_mark_lock);
 }
 static dispatch_queue_t g_arch_q; static _Atomic int g_arch_new, g_arch_new_vd, g_arch_sched;   // bases captured and not written yet, those of them with a vertex layout
 // A flush period: a compiler of its own and the serializer it captures into. A compile the archive captures joins the current period (ep_enter) and leaves it when it returns; a
@@ -7891,9 +7907,34 @@ static void ep_leave(ArchEpoch *ep) { atomic_fetch_sub(&ep->active, 1); dispatch
 // hands it over (arch_flush_from), compaction or not, and each period gets a fresh environment. g_arch_period_max: the tests lower it
 enum { ARCH_PERIOD_MAX = 2000 };
 static int g_arch_period_max = ARCH_PERIOD_MAX;
+// A run file's size tier from its name, <seq>-<count>.mtl4a: 0 under PSO_ARCH_COMPACT pipelines, each next PSO_ARCH_COMPACT times larger; 8, in none, for a full period's file. One
+// named before (<seq>.mtl4a), or with a count that is not all digits, counts as the largest tier below a full period, so an earlier compaction's files stay until that tier fills
+static int arch_tier(NSString *path) {
+    NSString *n = path.lastPathComponent.stringByDeletingPathExtension; NSRange r = [n rangeOfString:@"-"];
+    NSString *cs = r.location == NSNotFound ? @"" : [n substringFromIndex:r.location + 1];
+    int c = cs.length && cs.length < 10 && [cs rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location == NSNotFound ? cs.intValue : 0, t = 0;
+    if (c <= 0) c = g_arch_period_max - 1;
+    if (c >= g_arch_period_max) return 8;
+    for (; c >= PSO_ARCH_COMPACT && t < 7; c /= PSO_ARCH_COMPACT) t++;
+    return t;
+}
+static void arch_compact_pick(NSArray<NSString *> *paths) {   // at the open: the files of the highest tier with more than PSO_ARCH_COMPACT, and of every smaller one
+    int per[9] = {0}, top = -1;
+    for (NSString *p in paths) per[arch_tier(p)]++;
+    for (int t = 0; t < 8; t++) if (per[t] > PSO_ARCH_COMPACT) top = t;
+    if (top < 0 || !arch_compact_allowed()) return;
+    if (!(g_compact_state = calloc(paths.count + 1, 1))) return;   // no memory for it: no compaction this run
+    for (NSUInteger i = 0; i < paths.count; i++) if (arch_tier(paths[i]) <= top) g_compact_state[i] = 1;
+    g_compact_files = paths; g_compact_enabled = 1;
+}
+static int arch_compact_takes(id<MTL4Archive> a) {   // a pipeline was found in a: this compaction takes that file (every run file without a pick, as before)
+    if (!g_compact_enabled || !g_compact_state) return g_compact_enabled;
+    NSUInteger i = [g_arch4 indexOfObjectIdenticalTo:a]; return i != NSNotFound && g_compact_state[i];
+}
 static _Atomic int g_arch_cap_off;   // capturing failed in a period that held nothing yet: the store was not full, so no more captures this run (arch_cap_failed)
 static int arch_capturing(void) { return g_arch_cap && !atomic_load_explicit(&g_arch_cap_off, memory_order_relaxed); }
 static void arch_flush_from(ArchEpoch *only);
+static void arch_at_exit(void);
 // The capture refused a pipeline the plain compiler built. The archive is a cache and never a condition of drawing: the pipeline is used all the same. A period that has captured
 // pipelines is taken as full and handed over, so the next captures go into a fresh environment (once per period: compiles under way in it fail too); a failure in a period that
 // has captured nothing is not the store's size, and the run captures no more
@@ -7979,7 +8020,7 @@ static void pso4_init(void) {
                 else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
                 g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
             }
-            if (runf.count > PSO_ARCH_COMPACT && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
+            arch_compact_pick(runf);
             MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count - (g_arch_bundle != nil)),
                  (unsigned long)archp.count - (g_arch_bundle != nil), bytes / 1048576.0, (bp_now() - t0) / 1e6);
         }
@@ -7989,6 +8030,7 @@ static void pso4_init(void) {
         if (!g_comp4) MLOG("[RED] no Metal 4 compiler (%s): render pipelines are built through the MTLDevice", ce.localizedDescription.UTF8String);
         else if (g_arch_dir) {
             g_ep = ep_new(); g_arch_cap = g_ep != nil;
+            if (g_arch_cap) atexit(arch_at_exit);   // what is not written yet, written at quit (mtl_arch_save)
             if (!g_ep) MLOG("[RED] pipeline archive: Metal made no pipeline serializer: nothing is captured into %s", g_arch_dir.UTF8String);
         }
     });
@@ -8037,7 +8079,7 @@ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e) {
         if (g_arch_bundle && (ps = [g_arch_bundle newComputePipelineStateWithDescriptor:d error:nil])) atomic_fetch_add(&g_cps_arch, 1);
         else for (id<MTL4Archive> a in g_arch4) if ((ps = [a newComputePipelineStateWithDescriptor:d error:nil])) {   // arch_capture_cs writes them to plain files only
             atomic_fetch_add(&g_cps_run, 1);
-            if (g_compact_enabled && atomic_load(&g_warm_running)) arch_harvest(d, 1);
+            if (arch_compact_takes(a) && atomic_load(&g_warm_running)) arch_harvest(d, 1);
             break;
         }
         atomic_fetch_add(&g_cps_look_ns, bp_now() - t0);
@@ -8060,10 +8102,10 @@ static void arch_write_file(ArchEpoch *ep) {
     if (!n) return;
     [NSFileManager.defaultManager createDirectoryAtPath:g_arch_dir withIntermediateDirectories:YES attributes:nil error:nil];
     uint64_t t0 = bp_now(); NSError *e = nil;
-    NSString *path = [g_arch_dir stringByAppendingPathComponent:[NSString stringWithFormat:vd || cs ? @"%05d.mtl4a" : @"p%05d.mtl4a", g_arch_seq++]], *tmp = [path stringByAppendingString:@".tmp"];
-    if (ep->compacting) [arch_compact_stamp() writeToFile:arch_compact_marker() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *path = [g_arch_dir stringByAppendingPathComponent:vd || cs ? [NSString stringWithFormat:@"%05d-%d.mtl4a", g_arch_seq++, n] : [NSString stringWithFormat:@"p%05d.mtl4a", g_arch_seq++]], *tmp = [path stringByAppendingString:@".tmp"];
+    if (ep->compacting) arch_mark(1);
     BOOL ok = [ep->ser serializeAsArchiveAndFlushToURL:[NSURL fileURLWithPath:tmp] error:&e];
-    if (ep->compacting) unlink(arch_compact_marker().fileSystemRepresentation);
+    if (ep->compacting) arch_mark(0);
     atomic_fetch_sub(&g_arch_new, n); atomic_fetch_sub(&g_arch_new_vd, vd);
     ok = ok && !rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
@@ -8075,9 +8117,11 @@ static void arch_write_file(ArchEpoch *ep) {
 }
 // A flush: the compiles from here on capture into a new period, and the current one is written once its compiles have returned. Returns at once, on any thread; a compile that
 // does not return holds back only its own period's file. only: hand over that period alone, and only while it is the current one (a full period, a failed capture); those go
-// ahead during a compacting prewarm, where the timer's flushes wait so that the recaptured bases make as few files as they can
-static void arch_flush_from(ArchEpoch *only) {
-    if (!g_arch_cap || (!only && g_compact_enabled && atomic_load(&g_warm_running))) return;
+// ahead during the prewarm, where the timer's flushes wait so that its bases, compiled or captured again, make as few files as they can: a cold start's timer flushes wrote a
+// file each 10 s (Ocarina of Time: 80 files; GitHub issue #1747's, 43), more than PSO_ARCH_COMPACT, and the next start compacted them all. any_time: hand it over during the
+// prewarm too (going to the background, quitting: mtl_arch_save)
+static void arch_hand_over(ArchEpoch *only, int any_time) {
+    if (!g_arch_cap || (!only && !any_time && atomic_load(&g_warm_running))) return;
     os_unfair_lock_lock(&g_ep_lock); int any = (!only || g_ep == only) && (atomic_load(&g_ep->n) || atomic_load(&g_ep->active)); os_unfair_lock_unlock(&g_ep_lock);
     if (!any) return;   // nothing captured or under way: the period goes on
     ArchEpoch *ne = ep_new();
@@ -8097,7 +8141,25 @@ static void arch_flush_from(ArchEpoch *only) {
     dispatch_group_enter(g_arch_pending);
     dispatch_group_notify(old->busy, g_arch_q, ^{ @autoreleasepool { arch_write(old); } dispatch_group_leave(g_arch_pending); });
 }
+static void arch_flush_from(ArchEpoch *only) { arch_hand_over(only, 0); }
 static void arch_flush(void) { arch_flush_from(nil); }
+// What the archive has captured and not written, written now, prewarm or not: a quit during a cold start's prewarm otherwise lost the period under way, up to ARCH_PERIOD_MAX
+// bases (Ocarina of Time on an M4: about 2,000 bases, minutes of compiling), built again at the next start. Going to the background (dm_gfx_suspend): wait_ms 0, the write goes
+// on behind (a file is written as .tmp and renamed, so a process killed meanwhile leaves none half-written). Quitting (atexit for ⌘Q, closing the window and exit(); dm_gfx_quit
+// in the graceful exit): ending, waiting up to wait_ms for the compiles under way in the period and the writes (a file of 900 bases took 1.8-4 s on Macs, so a full period some
+// 4-9 s). A write the exit then cuts short is not a compaction that crashed Metal: its marker goes, and none is written from here on (arch_mark)
+enum { ARCH_QUIT_WAIT_MS = 10000 };
+void mtl_arch_save(int wait_ms, int ending) {
+    if (!g_arch_cap) return;
+    int n = atomic_load(&g_arch_new); uint64_t t0 = bp_now();
+    arch_hand_over(nil, 1);
+    if (!wait_ms && !ending) return;
+    long late = wait_ms > 0 && dispatch_group_wait(g_arch_pending, dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC));
+    if (ending) arch_mark(-1);
+    if (n || late) MLOG("pipeline archive at exit: %d pipelines not written yet, %s (%.0f ms)", n,
+                        late ? "not all written in time: those left are built again at the next start" : !wait_ms ? "not waited for" : "written", (bp_now() - t0) / 1e6);
+}
+static void arch_at_exit(void) { mtl_arch_save(ARCH_QUIT_WAIT_MS, 1); }
 // A flush, then every period handed over is written (not on g_arch_q, which writes them)
 static void arch_flush_wait(void) { arch_flush(); if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER); }
 static void arch_note_new(void) {   // a base was compiled: flush 10 s later (one flush for a burst of them)
@@ -8107,8 +8169,8 @@ static void arch_note_new(void) {   // a base was compiled: flush 10 s later (on
 static void arch_compact_finish(void) {   // after every period that may hold recaptured bases is written (arch_write): the old files go once their bases are in the new ones
     if (!g_compact_files || !g_compacted) return;
     if (g_compact_bad) { MLOG("[RED] pipeline archive: compaction left the old files (a flush failed, or a base was not captured again)"); return; }
-    for (NSString *f in g_compact_files) unlink(f.fileSystemRepresentation);
-    MLOG("pipeline archive compacted: %lu files of bases with a vertex layout gave %d bases to the files just written and were removed", (unsigned long)g_compact_files.count, (int)g_compacted);
+    int gone = 0; for (NSUInteger i = 0; i < g_compact_files.count; i++) if (!g_compact_state || g_compact_state[i]) { unlink(g_compact_files[i].fileSystemRepresentation); gone++; }
+    MLOG("pipeline archive compacted: %d files of bases with a vertex layout gave %d bases to the files just written and were removed", gone, (int)g_compacted);
     g_compact_files = nil;
 }
 static void pso_col4(MTL4RenderPipelineColorAttachmentDescriptor *a, MTLRenderPipelineColorAttachmentDescriptor *c) {
@@ -8220,15 +8282,16 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
         int vd = 0; for (int i = 0; i < 31 && !vd; i++) vd = bk.va[i][0] != 0;   // a vertex layout (MTLVertexFormatInvalid is 0)
         if (!vd) for (id<MTL4Archive> a in g_arch4p) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) break;
         int from_run = 0;
-        if (!base) for (id<MTL4Archive> a in g_arch4) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) { from_run = 1; break; }
+        if (!base) for (id<MTL4Archive> a in g_arch4) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) { from_run = arch_compact_takes(a); break; }
         uint64_t t1 = bp_now();
         if (base) { g_pb_archived++; g_pt_hit_n++; g_pt_hit_ns += t1 - t0; }
         if (base && from_run && g_compact_enabled && atomic_load(&g_warm_running)) {
             // Metal can crash in materializeAirNTFromOnlineForSlice when serializing archive imports mixed with fresh bases (#342).
             // Work around that framework bug by capturing the original shader functions, without lookupArchives. The normal compiler cache still applies.
             int cap = 0; id<MTLRenderPipelineState> cb = arch_capturing() ? arch_capture(b, nil, vd, &cap) : nil;
+            g_compact_ns += bp_now() - t1;
             if (cb) base = cb;
-            if (cap) g_compacted++; else g_compact_bad = 1;   // not in the new files: the old ones stay
+            if (cap) { g_compacted++; g_compact_bases++; } else g_compact_bad = 1;   // not in the new files: the old ones stay
         }
         if (!base) {
             if (g_arch4.count + g_arch4p.count) { g_pt_miss_n++; g_pt_miss_ns += t1 - t0; }
@@ -8901,8 +8964,10 @@ static void warm_finish(void) {
          (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
     if (g_warm_mps) MLOG("pipeline prewarm: %llu native task / mesh pipelines; so far %llu taken from the pipeline archive, %llu built and captured for it, %llu built without it",
                          (unsigned long long)g_warm_mps, (unsigned long long)g_mtk_arch, (unsigned long long)g_mtk_built, (unsigned long long)g_mtk_dev);
-    if (g_comp4) MLOG("pipeline bases so far: %llu compiled, %llu from the archive, %llu reused (%.1f ms for the bases); %llu specializations (their descriptors %s), %llu pipelines without a base (MTLDevice)",
-                      (unsigned long long)g_pb_built, (unsigned long long)g_pb_archived, (unsigned long long)g_pb_reused, g_pb_base_ns / 1e6, (unsigned long long)g_pb_spec,
+    char again[96] = "";   // only a compacting start captures bases again
+    if (g_compact_enabled) snprintf(again, sizeof again, " (%d of them captured again for the compaction, %.1f ms)", (int)g_compact_bases, g_compact_ns / 1e6);
+    if (g_comp4) MLOG("pipeline bases so far: %llu compiled, %llu from the archive%s, %llu reused (%.1f ms for the bases); %llu specializations (their descriptors %s), %llu pipelines without a base (MTLDevice)",
+                      (unsigned long long)g_pb_built, (unsigned long long)g_pb_archived, again, (unsigned long long)g_pb_reused, g_pb_base_ns / 1e6, (unsigned long long)g_pb_spec,
                       (const char *[]){"not asked for yet", "returned retained", "returned autoreleased"}[atomic_load(&g_spec_own) % 3], (unsigned long long)g_pb_legacy);
     if (g_arch_bundle || g_arch_cap) MLOG("compute pipelines so far: %llu from the archive bundled with the app, %llu from this device's archive, %llu built (%.1f ms looking up, %.1f ms building)",
                                          (unsigned long long)g_cps_arch, (unsigned long long)g_cps_run, (unsigned long long)g_cps_built, g_cps_look_ns / 1e6, g_cps_build_ns / 1e6);
@@ -8958,10 +9023,12 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
         if (shown) front_progress("Preparing shaders", g_warm_done, lines);
     }
     if (shown) front_progress(NULL, lines, lines);
+    char again[64] = "";   // only a compacting start captures bases again
+    if (g_compact_enabled) snprintf(again, sizeof again, " (%d of them captured again for the compaction)", (int)g_compact_bases);
     MLOG("pipeline prepare: %ld lines (%llu shaders, %llu render pipelines, %llu compute pipelines) in %.2f s on %d workers before the first frame, progress screen %s; "
-         "bases %llu compiled, %llu from the archive, %llu reused; %llu specializations",
+         "bases %llu compiled, %llu from the archive%s, %llu reused; %llu specializations",
          lines, (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_cps, (bp_now() - t0) / 1e9, workers, shown ? "shown" : "not shown",
-         (unsigned long long)(g_pb_built - built0), (unsigned long long)(g_pb_archived - arch0), (unsigned long long)(g_pb_reused - reused0), (unsigned long long)(g_pb_spec - spec0));
+         (unsigned long long)(g_pb_built - built0), (unsigned long long)(g_pb_archived - arch0), again, (unsigned long long)(g_pb_reused - reused0), (unsigned long long)(g_pb_spec - spec0));
 }
 // The prebuild in the prepare step: the bases of every shader pair are made before the game's first frame, behind the progress screen ("Preparing pipelines"), once per chain
 // version, depth mode and pair list (prebuilt.tsv), so a running game never compiles them meanwhile. Built in the background while playing, they took an iPhone 17 Pro Max's GPU
@@ -13320,8 +13387,8 @@ static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, un
     size_t row = (size_t)((r->width + bw - 1) / bw) * bpb, img = row * (size_t)((r->height + bh - 1) / bh);
     id<MTLBuffer> b = mrbuf_get(img * nz);
     if (!b) { mirror_note(-1, t, level, from, 1); return; }
-    id<MTL4ComputeCommandEncoder> e = blit();
-    for (int z = 0; z < nz; z++) enc_b_copy_texture_buffer(e, d, layer0 + r->zoffset + z, level, MTLOriginMake(r->xoffset, r->yoffset, 0), MTLSizeMake(r->width, r->height, 1), b, (size_t)z * img, row, img);
+    id<MTL4ComputeCommandEncoder> e = blit(); int d3 = d.textureType == MTLTextureType3D;   // a 3D texture's images are its depth slices, at origin z; any other's its slices (layers)
+    for (int z = 0; z < nz; z++) enc_b_copy_texture_buffer(e, d, d3 ? 0 : layer0 + r->zoffset + z, level, MTLOriginMake(r->xoffset, r->yoffset, d3 ? r->zoffset + z : 0), MTLSizeMake(r->width, r->height, 1), b, (size_t)z * img, row, img);
     mirror_rb *m = malloc(sizeof *m); *m = (mirror_rb){*t, level, layer0, *r, row, img, (void *)CFBridgingRetain(b), absorb ? (void *)CFBridgingRetain(d.parentTexture ? d.parentTexture : d) : NULL, rb_copy_shift(t, d)};
     post((post_op){4, NULL, 0, 0, 0, 0, m, 0});
     mrb_note(t->serial, 1);
@@ -13356,7 +13423,7 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(23, "buffer→texture copy source is in no memory pool"); return; }
     // The copy's bytes belong in the texture's storage: written there now from the buffer's, unless the GPU writes the buffer (a copy, fill or update queued in this submission: pend_hits; a shader
     // or a texture→buffer copy of it: sbw_hits; one of a submission still running: gw_live) or a readback into the texture is pending (read back after the copy then)
-    int rb = !is3d && tex_storage_dst(c->tex);
+    int rb = tex_storage_dst(c->tex);
     if (rb && img * nz && !mrb_pending(c->tex->serial) && !pend_hits(c->src, img * nz) && !g_sbw_over && !sbw_hits(c->src, c->src + img * nz) && !gw_live(c->src, c->src + img * nz)
         && nvn_host_readable(c->src, img * nz) && !nvn_tex_mirror_b2t(c->tex, level, layer0, &c->r, (const uint8_t *)(uintptr_t)c->src, row, img)) { mirror_note(0, c->tex, level, "buffer", 0); rb = 0; }
     g_cut_copy = 1;
@@ -13625,8 +13692,8 @@ static void copy_t2t(const p_copy_t2t *c) {
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
     // The copy's bytes belong in the destination's storage: written there now from the source's storage when that holds its content and the copy is a plain one (the same Metal format: a
     // format change is drawn below and converts the bytes), else read back after the copy (decided before the draw path gives the destination render-target use, which makes it GPU-owned from then on)
-    int rb = !d3 && tex_storage_dst(c->dst);
-    if (rb && !s3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT)) && s.pixelFormat == d.pixelFormat
+    int rb = tex_storage_dst(c->dst);
+    if (rb && s3 == d3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT)) && s.pixelFormat == d.pixelFormat
         && !mrb_pending(c->dst->serial) && tex_storage_src(c->src) && !nvn_tex_mirror_t2t(c->src, sl, sz0, &c->sr, c->dst, dl, dz0, &c->dr)) { mirror_note(0, c->dst, dl, "texture", 0); rb = 0; }
     // The draw path renders into the destination: one made without render-target use (packaged) gets it first, as a whole-level clear does (Paper Mario: The Thousand-Year Door copies a
     // 128x128 RGBA8 render target into an RG8 texture, mirrored in Y)
