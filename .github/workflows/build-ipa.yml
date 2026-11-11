@@ -595,6 +595,7 @@ jobs:
           name: build-logs
           path: |
             ${{ runner.temp }}/game/*_build/logs/
+            ${{ runner.temp }}/game/*_build/ipa/build/ios/pkg/build.log
             ${{ runner.temp }}/game/*_survey/
           if-no-files-found: ignore
           retention-days: 7
