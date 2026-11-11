@@ -286,6 +286,11 @@ jobs:
           version="${{ inputs.version || 'latest' }}"
           cache_tag="cache-${title_id}-${version}"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          # dmsh_build.py keeps its cache in <build folder>/shader/cache/cas.db, and the build removes that whole
+          # folder first when it is given no key list (a full build, which every CI run is): the database was
+          # unlinked at the start of each run, so the entries the restore had just unpacked never reached the
+          # build's save. DMSH_CAS puts the database beside the shader folder, where the build does not reach.
+          echo "DMSH_CAS=$RUNNER_TEMP/game/${title_id}_build/shader/cas.db" >> "$GITHUB_ENV"
           if gh release view "$cache_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir -p "$RUNNER_TEMP/game"
             gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
@@ -298,7 +303,19 @@ jobs:
                 rm -f "$f"
               fi
             done
-            echo "Restored cache: $cache_tag"
+            # Archives made before the cache moved out of the build folder carry it in shader/cache instead.
+            shader_dir="$RUNNER_TEMP/game/${title_id}_build/shader"
+            if [ -f "$shader_dir/cache/cas.db" ] && [ ! -f "$shader_dir/cas.db" ]; then
+              mv "$shader_dir/cache/cas.db" "$shader_dir/cas.db"
+              if [ -f "$shader_dir/cache/cas.db-wal" ]; then mv "$shader_dir/cache/cas.db-wal" "$shader_dir/cas.db-wal"; fi
+              if [ -f "$shader_dir/cache/cas.db-shm" ]; then mv "$shader_dir/cache/cas.db-shm" "$shader_dir/cas.db-shm"; fi
+            fi
+            if [ -f "$shader_dir/cas.db" ]; then
+              entries=$(/usr/bin/sqlite3 "$shader_dir/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
+              echo "Restored cache: $cache_tag ($entries entries)"
+            else
+              echo "Restored cache: $cache_tag, without a shader cache database (the archive holds no entries)"
+            fi
           else
             echo "No cache release $cache_tag found"
           fi
@@ -392,6 +409,13 @@ jobs:
           if [ ${#cache_items[@]} -eq 0 ]; then
             echo "No cache to save"
             exit 0
+          fi
+          # The archive is worth nothing without the cache database, so say what it carries.
+          if [ -f "$build_folder/shader/cas.db" ]; then
+            entries=$(/usr/bin/sqlite3 "$build_folder/shader/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
+            echo "Saving the shader cache: $entries entries in $build_base/shader/cas.db"
+          else
+            echo "::warning::the build left no $build_base/shader/cas.db: this archive carries no shader cache entries"
           fi
           mkdir -p "$RUNNER_TEMP/cache"
           cache_archive="$RUNNER_TEMP/cache/cache.7z"

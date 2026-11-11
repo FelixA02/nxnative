@@ -315,6 +315,11 @@ jobs:
           version="${{ inputs.version || 'latest' }}"
           cache_tag="x-cache-${title_id}-${version}${CACHE_SUFFIX:-}"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          # dmsh_build.py keeps its cache in <build folder>/shader/cache/cas.db, and the build removes that whole
+          # folder first when it is given no key list (a full build, which every CI run is): the database was
+          # unlinked at the start of each run, so the entries the restore had just unpacked never reached the
+          # build's save. DMSH_CAS puts the database beside the shader folder, where the build does not reach.
+          echo "DMSH_CAS=$RUNNER_TEMP/game/${title_id}_build/shader/cas.db" >> "$GITHUB_ENV"
           if gh release view "$cache_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir -p "$RUNNER_TEMP/game"
             gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
@@ -327,7 +332,19 @@ jobs:
                 rm -f "$f"
               fi
             done
-            echo "Restored cache: $cache_tag"
+            # Archives made before the cache moved out of the build folder carry it in shader/cache instead.
+            shader_dir="$RUNNER_TEMP/game/${title_id}_build/shader"
+            if [ -f "$shader_dir/cache/cas.db" ] && [ ! -f "$shader_dir/cas.db" ]; then
+              mv "$shader_dir/cache/cas.db" "$shader_dir/cas.db"
+              if [ -f "$shader_dir/cache/cas.db-wal" ]; then mv "$shader_dir/cache/cas.db-wal" "$shader_dir/cas.db-wal"; fi
+              if [ -f "$shader_dir/cache/cas.db-shm" ]; then mv "$shader_dir/cache/cas.db-shm" "$shader_dir/cas.db-shm"; fi
+            fi
+            if [ -f "$shader_dir/cas.db" ]; then
+              entries=$(/usr/bin/sqlite3 "$shader_dir/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
+              echo "Restored cache: $cache_tag ($entries entries)"
+            else
+              echo "Restored cache: $cache_tag, without a shader cache database (the archive holds no entries)"
+            fi
           else
             echo "No cache release $cache_tag found"
           fi
@@ -481,6 +498,13 @@ jobs:
           if [ ${#cache_items[@]} -eq 0 ]; then
             echo "No cache to save"
             exit 0
+          fi
+          # The archive is worth nothing without the cache database, so say what it carries.
+          if [ -f "$build_folder/shader/cas.db" ]; then
+            entries=$(/usr/bin/sqlite3 "$build_folder/shader/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
+            echo "Saving the shader cache: $entries entries in $build_base/shader/cas.db"
+          else
+            echo "::warning::the build left no $build_base/shader/cas.db: this archive carries no shader cache entries"
           fi
           mkdir -p "$RUNNER_TEMP/cache"
           cache_archive="$RUNNER_TEMP/cache/cache.7z"
@@ -877,9 +901,11 @@ jobs:
           done
           if [ "$got" -eq 0 ]; then echo "::error::no shard cache to merge: nothing was compiled"; exit 1; fi
           build="$RUNNER_TEMP/game/${title_id}_build"
-          mkdir -p "$build/shader/cache"
+          mkdir -p "$build/shader"
+          # The shard jobs keep their database beside the shader folder (DMSH_CAS), where the build's own cleanup does not remove it;
+          # archives from before that carry it in shader/cache instead.
           dbs=()
-          for f in "$RUNNER_TEMP"/parts/*/"${title_id}"_build/shader/cache/cas.db; do
+          for f in "$RUNNER_TEMP"/parts/*/"${title_id}"_build/shader/cas.db "$RUNNER_TEMP"/parts/*/"${title_id}"_build/shader/cache/cas.db; do
             if [ -f "$f" ]; then dbs+=("$f"); fi
           done
           # A Vulkan or GL game translates the shaders it captured at run time, so its build folder holds no NVN
@@ -887,7 +913,7 @@ jobs:
           # the translated MSL, so the build below picks up where the shards stopped.
           if [ ${#dbs[@]} -eq 0 ]; then echo "::notice::no cas.db in the shard caches: this game translates its shaders from a capture (a Vulkan or GL game), so there is nothing to merge"; fi
           # Merging the databases row by row in SQLite: a Python loop over 130,000 entries would copy gigabytes through the interpreter.
-          if [ ${#dbs[@]} -gt 0 ]; then python3 - "$build/shader/cache/cas.db" "${dbs[@]}" <<'PY'
+          if [ ${#dbs[@]} -gt 0 ]; then python3 - "$build/shader/cas.db" "${dbs[@]}" <<'PY'
           import sqlite3, sys
           sys.path.insert(0, 'dm/tools')
           import shader_cache
@@ -912,6 +938,7 @@ jobs:
           PY
           fi
           rm -rf "$RUNNER_TEMP/parts"
+          echo "DMSH_CAS=$build/shader/cas.db" >> "$GITHUB_ENV"
           cache_tag="$base"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
       - name: Patch the shader tool as the shards did (the cache keys hash its code)
@@ -1043,6 +1070,13 @@ jobs:
           if [ ${#cache_items[@]} -eq 0 ]; then
             echo "No cache to save"
             exit 0
+          fi
+          # The archive is worth nothing without the cache database, so say what it carries.
+          if [ -f "$build_folder/shader/cas.db" ]; then
+            entries=$(/usr/bin/sqlite3 "$build_folder/shader/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
+            echo "Saving the shader cache: $entries entries in $build_base/shader/cas.db"
+          else
+            echo "::warning::the build left no $build_base/shader/cas.db: this archive carries no shader cache entries"
           fi
           mkdir -p "$RUNNER_TEMP/cache"
           cache_archive="$RUNNER_TEMP/cache/cache.7z"
