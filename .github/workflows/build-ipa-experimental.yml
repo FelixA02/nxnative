@@ -686,6 +686,8 @@ jobs:
             rm -f "$cache_archive"
             7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           fi
+          # --romfs separate ships the extraction's image beside the IPA, and extract/ goes here to make room for the archive: move the image out of it first
+          for img in "$build_folder"/extract/*/RomFS.img; do [ -f "$img" ] && mv -f "$img" "$RUNNER_TEMP/game/RomFS.img"; done
           rm -rf "$build_folder/extract"
 
       - name: Say why the app build failed
@@ -1429,6 +1431,8 @@ jobs:
             rm -f "$cache_archive"
             7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
           fi
+          # --romfs separate ships the extraction's image beside the IPA, and extract/ goes here to make room for the archive: move the image out of it first
+          for img in "$build_folder"/extract/*/RomFS.img; do [ -f "$img" ] && mv -f "$img" "$RUNNER_TEMP/game/RomFS.img"; done
           rm -rf "$build_folder/extract"
 
       - name: Say why the app build failed
@@ -1474,8 +1478,8 @@ jobs:
           payload=("$RUNNER_TEMP/out/$name")
           # separate: the game files stay out of the IPA, so the extraction's image goes into the same archive, beside it: one download holds both
           if [ "$IN_ROMFS" = separate ]; then
-            img=$(find "$RUNNER_TEMP/game" -path "*/extract/*/RomFS.img" -type f | head -1)
-            if [ -z "$img" ]; then echo "::error::--romfs separate, but the build left no extract/<version>/RomFS.img to ship"; exit 1; fi
+            img=$(find "$RUNNER_TEMP/game" \( -path "*/extract/*/RomFS.img" -o -path "$RUNNER_TEMP/game/RomFS.img" \) -type f | head -1)   # the cache step moves it out of extract/ to make room for the archive
+            if [ -z "$img" ]; then echo "::error::--romfs separate, but the build left no RomFS.img to ship"; exit 1; fi
             mv "$img" "$RUNNER_TEMP/out/RomFS.img"   # a rename within $RUNNER_TEMP: the image is not copied
             chmod 644 "$RUNNER_TEMP/out/RomFS.img"
             payload+=("$RUNNER_TEMP/out/RomFS.img")
