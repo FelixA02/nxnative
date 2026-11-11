@@ -268,14 +268,20 @@ jobs:
           if gh release view "$stash" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir -p "$RUNNER_TEMP/stash"
             if gh release download "$stash" -R "$GITHUB_REPOSITORY" -p '*.7z*' -D "$RUNNER_TEMP/stash" >/dev/null 2>&1; then
-              first=$(ls "$RUNNER_TEMP/stash"/*.001 "$RUNNER_TEMP/stash"/*.7z 2>/dev/null | head -1)
+              # find, not ls: one of the two globs never matches (a single file .7z, or .001 parts), and ls then exits non-zero, which -e -o pipefail
+              # turns into a silent end of the step. This line reads the first part whichever shape the stash has
+              first=$(find "$RUNNER_TEMP/stash" -maxdepth 1 -type f \( -name '*.7z' -o -name '*.001' \) | sort | head -1) || true
               if [ -n "$first" ] && 7zz x -y -bso0 -bsp0 "-p$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$first" >/dev/null 2>&1 \
                  && [ -n "$(ls -A "$RUNNER_TEMP/game")" ]; then
                 echo "The game came from this run's stash ($stash): the link is not needed again"
                 rm -rf "$RUNNER_TEMP/stash"
                 exit 0
               fi
-              echo "::warning::the stash $stash does not unpack, so the game is downloaded from the link"
+              if [ -z "$first" ]; then
+                echo "::warning::the stash $stash came down with no archive in it, so the game is downloaded from the link"
+              else
+                echo "::warning::the stash $stash does not unpack, so the game is downloaded from the link"
+              fi
             else
               echo "::warning::the stash $stash could not be downloaded, so the game is downloaded from the link"
             fi
@@ -515,11 +521,11 @@ jobs:
           /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%.json' and name not like 'index/%/%.json'" | sed 's/^/  finished-shader marks: /'
           /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%/mac/%'" | sed 's/^/  index rows, mac side: /'
           /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%/ios/%'" | sed 's/^/  index rows, ios side: /'
-          rep=$(ls "$RUNNER_TEMP"/game/*_build/shader/*/b-*/_b_build.json 2>/dev/null | head -1)
+          rep=$(ls "$RUNNER_TEMP"/game/*_build/shader/*/b-*/_b_build.json 2>/dev/null | head -1) || true   # no match: ls exits 2, which -e -o pipefail makes fatal
           if [ -z "$rep" ]; then echo "Cache diagnosis: no _b_build.json, so no shader list to sample"; exit 0; fi
           sh=$(dirname "$(dirname "$(dirname "$rep")")")
-          mac=$(ls -d "$sh"/cache/b-* 2>/dev/null | head -1)
-          ios=$(ls -d "$sh"/ios/b-* 2>/dev/null | head -1)
+          mac=$(ls -d "$sh"/cache/b-* 2>/dev/null | head -1) || true
+          ios=$(ls -d "$sh"/ios/b-* 2>/dev/null | head -1) || true
           echo "Cache diagnosis: three shaders sampled. mark = index/<key>.json in the database, rows = index rows that name the key, the mark included"
           echo "  disk = mac _b.json, mac _b.metal, ios _b.json, ios _b.metallib, as yes or no"
           for key in $(python3 -c 'import json,sys; print("\n".join(x["key"] for x in json.load(open(sys.argv[1]))[:3]))' "$rep"); do
@@ -595,7 +601,7 @@ jobs:
         run: |
           # The artifact service can be unreachable; the job log is not. Keep enough
           # of xcodebuild's own log here that a link error names the symbol it wants.
-          log=$(ls "$RUNNER_TEMP"/game/*_build/ipa/build/ios/pkg/build.log 2>/dev/null | head -1)
+          log=$(ls "$RUNNER_TEMP"/game/*_build/ipa/build/ios/pkg/build.log 2>/dev/null | head -1) || true   # no build.log: ls exits 2, fatal under -e -o pipefail
           if [ -z "$log" ]; then
             echo "no build.log: the build stopped before xcodebuild wrote one"
             exit 0
