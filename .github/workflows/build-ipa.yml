@@ -29,6 +29,11 @@ on:
         description: 'Version to pack, e.g. v0 or v327680 (empty: the newest in the download)'
         type: string
         required: false
+      romfs:
+        description: 'Game files: bundle = inside the IPA (default); separate = kept out for a smaller, faster IPA. separate adds the RomFS image (RomFS.img) to the same encrypted archive as the IPA; copy it to the phone once per game version with scripts/push_romfs.sh'
+        type: choice
+        options: [bundle, separate]
+        default: bundle
       show_fps:
         description: 'Show the frame rate on the iPhone (top left)'
         type: boolean
@@ -298,11 +303,14 @@ jobs:
           IN_VERSION: ${{ inputs.version }}
           IN_SHOW_FPS: ${{ inputs.show_fps }}
           IN_TITLE_ID: ${{ inputs.title_id }}
+          IN_ROMFS: ${{ inputs.romfs }}
         run: |
           keys="$RUNNER_TEMP/keys/prod.keys"
           mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
           printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
           args=(--keep-extracted --progress lines)
+          # separate: the game files stay out of the IPA (DM_COPY_ROMFS=NO); they are shipped beside it instead, as the extraction's RomFS.img
+          if [ "$IN_ROMFS" = separate ]; then args+=(--romfs separate); fi
           if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
           if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
           if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
@@ -332,10 +340,6 @@ jobs:
           CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
         run: |
           version="${{ inputs.version || 'latest' }}"
-            rm -f "$dummy"
-            echo "test mode: made a $size byte dummy cache archive"
-            exit 0
-          fi
           build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
           if [ -z "$build_folder" ]; then
             echo "No build folder found"
@@ -390,6 +394,7 @@ jobs:
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
           IN_RELEASE: ${{ inputs.publish_release }}
+          IN_ROMFS: ${{ inputs.romfs }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
           shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
@@ -397,6 +402,17 @@ jobs:
           ipa=${ipas[0]}; for f in "${ipas[@]}"; do if [ "$f" -nt "$ipa" ]; then ipa=$f; fi; done   # the newest
           name=$(basename "$ipa")
           mv "$ipa" "$RUNNER_TEMP/out/"
+          payload=("$RUNNER_TEMP/out/$name")
+          # separate: the game files stay out of the IPA, so the extraction's image goes into the same archive, beside it: one download holds both
+          if [ "$IN_ROMFS" = separate ]; then
+            img=$(find "$RUNNER_TEMP/game" -path "*/extract/*/RomFS.img" -type f | head -1)
+            if [ -z "$img" ]; then echo "::error::--romfs separate, but the build left no extract/<version>/RomFS.img to ship"; exit 1; fi
+            mv "$img" "$RUNNER_TEMP/out/RomFS.img"   # a rename within $RUNNER_TEMP: the image is not copied
+            chmod 644 "$RUNNER_TEMP/out/RomFS.img"
+            payload+=("$RUNNER_TEMP/out/RomFS.img")
+            echo "SENDS_ROMFS=true" >> "$GITHUB_ENV"
+            echo "adding the game files: $(du -h "$RUNNER_TEMP/out/RomFS.img" | cut -f1) RomFS.img beside the IPA"
+          fi
           rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
           echo "GAME_IPA=$name" >> "$GITHUB_ENV"   # the real game/IPA name, for the summary mapping to the scrambled archive name
           # archive base is scrambled (a public release/artifact name must not reveal the game; the password still guards the contents)
@@ -406,10 +422,10 @@ jobs:
           # No setting for the count: it follows from the size. Both Release and artifact uploads get the same files
           cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
           safe=$(( cap - 1024 * 1024 ))   # leave room for 7z headers and upload rounding
-          size=$(stat -f%z "$RUNNER_TEMP/out/$name")   # bytes; a stored archive is about the size of the IPA
+          size=0; for f in "${payload[@]}"; do size=$(( size + $(stat -f%z "$f") )); done   # bytes; a stored archive is about the size of what it holds
           parts=$(( (size + safe - 1) / safe ))
           zip_path="$RUNNER_TEMP/out"
-          seal() { 7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$@" "$archive" "$RUNNER_TEMP/out/$name"; }   # stored (the IPA is compressed already), file name encrypted too (-mhe)
+          seal() { 7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$@" "$archive" "${payload[@]}"; }   # stored (the IPA is compressed already), file name encrypted too (-mhe)
           split=false
           if [ "$parts" -gt 1 ]; then
             per=$(( (size + parts - 1) / parts ))   # ceil(bytes / parts)
@@ -419,7 +435,7 @@ jobs:
             else echo "::warning::the split failed: making one archive instead"; rm -f "$archive".[0-9][0-9][0-9]; fi
           fi
           if [ "$split" = false ]; then seal; zip_path="$archive"; fi
-          rm -f "$RUNNER_TEMP/out/$name"
+          rm -f "${payload[@]}"
           echo "SPLIT=$split" >> "$GITHUB_ENV"
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"                       # the scrambled archive (or its base) for the summary + upload
           echo "UPLOAD_PATH=$([ "$split" = true ] && echo "$RUNNER_TEMP/out" || echo "$archive")" >> "$GITHUB_ENV"   # the folder holding the parts, or the .7z on its own
@@ -597,6 +613,15 @@ jobs:
               echo "The last lines of the step that failed say why. For the build itself, the tools' logs are in the build-logs artifact below."
             fi
             echo
+            if [ "${SENDS_ROMFS:-}" = true ]; then
+              echo "This archive also holds **RomFS.img**, the game files, which this build kept out of the IPA. Unpack both into one folder, install the IPA, then copy the image to the phone once with:"
+              echo
+              echo '```'
+              echo "scripts/push_romfs.sh <device UDID> <bundle ID> RomFS.img"
+              echo '```'
+              echo
+              echo "The app refuses an image of another game version, so this copy is needed again only when the image changes."
+            fi
             if [ -n "${LOW_FREE:-}" ]; then echo "Lowest free disk space during the build: $LOW_FREE GB."; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
