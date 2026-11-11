@@ -1,0 +1,1355 @@
+# EXPERIMENTAL. The same build as build-ipa.yml, with the shader compile split across jobs, because one job cannot have more than six hours and a big
+# game needs about thirty: a shard job compiles a share of the shader map (a share of the vertex shaders and the pixel shaders built from them, which
+# have to travel together), a gate job checks that every shard reached the end of its share, and a finish job merges the shard caches and packs the
+# IPA, which takes minutes because every shader is then a cache hit. With two shards and a 285-minute slice, a 30-hour game is about 4 attempts of
+# the run instead of 7. The compile grows with the number of shards; the fixed cost (checkout, cleanup, download, and the game's own split) is paid
+# once per shard, about 20 minutes each.
+#
+# Shard caches go to their own releases, x-cache-<title ID>-<version>-s<shard>; the finish job merges them into x-cache-<title ID>-<version> and
+# deletes the shard ones. The separate namespace is not tidiness: a shader's cache key hashes dm/gfx/tools/dmsh_build.py's own code, so the tool
+# with the split and the plain tool of build-ipa.yml cannot read each other's entries. Nothing here edits the repository in the checkout: the
+# split is a few lines added to that tool at build time, and re-applied by the finish job so its keys match the shards'.
+# Packs one game's IPA on GitHub's Mac, for players without a Mac (docs/build-on-github.md). Run by hand: Actions → Build IPA → Run workflow, with a download link to the game's
+# files (NSP, XCI, NSZ, XCZ or NUP, or an archive of them). The IPA comes back as the run's download, a 7z archive encrypted with the IPA_PASSWORD secret and kept for one day: in a public
+# repository anyone signed in to GitHub can download a run's files, and the IPA holds the whole game. The run's log is public too, so the link is masked in it (dm/tools/ci_fetch_game.py),
+# and it can come from the GAME_LINK secret instead. prod.keys comes from the PROD_KEYS secret. The game files and the keys stay on the runner, a virtual Mac deleted after the run.
+# The runner has 3 cores, 7 GB of memory, the disk the image leaves (the "Check the runner only" option reports what is free after the cleanup below), 6 hours at most, and no Metal 4
+# (tests.yml): a game whose build boots it on NVN to capture its shaders (the GLSLC capture: Fire Emblem: Three Houses, Portal, Catherine: Full Body) cannot be built here.
+name: Build IPA (experimental)
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: 'Download link of the game: an NSP, XCI, NSZ, XCZ or NUP (a Switch 2 game''s .nup container), or a .zip / .7z / .rar of one game''s files, or of a Switch 2 game''s dump folder (base/, updates/, dlc/: found automatically); several links separated by spaces (empty: the GAME_LINK secret)'
+        type: string
+        required: false
+      title_id:
+        description: 'Title ID of the base game (16 hex digits), only when a run says it could not read the game (a cartridge dump with no [title ID] in its file name); otherwise empty: the title ID read from the download names the build cache'
+        type: string
+        required: false
+      language:
+        description: 'Game language: ja, fr, de, es, it, ko, zh-Hans, zh-Hant, en-GB, … (empty: English)'
+        type: string
+        required: false
+      app_name:
+        description: 'App name on the home screen (empty: the game''s name)'
+        type: string
+        required: false
+      version:
+        description: 'Version to pack, e.g. v0 or v327680 (empty: the newest in the download)'
+        type: string
+        required: false
+      romfs:
+        description: 'Game files: bundle = inside the IPA (default); separate = kept out for a smaller, faster IPA. separate adds the RomFS image (RomFS.img) to the same encrypted archive as the IPA; copy it to the phone once per game version with scripts/push_romfs.sh'
+        type: choice
+        options: [bundle, separate]
+        default: bundle
+      show_fps:
+        description: 'Show the frame rate on the iPhone (top left)'
+        type: boolean
+        default: true
+      skip_cleanup:
+        description: 'Skip the 5-minute disk cleanup: about 95 GB are free without it, enough for a game of up to about 25 GB (three times its size plus 10 GB)'
+        type: boolean
+        default: false
+      check_only:
+        description: 'Check the runner only: free disk space and tools, no game'
+        type: boolean
+        default: false
+      publish_release:
+        description: 'Publish as a GitHub Release asset instead of a run artifact (no 1-day expiry, faster downloads; needs contents: write). Either way an archive over 2 GiB is split into parts automatically'
+        type: boolean
+        default: false
+      slice:
+        description: 'Long builds: stop after this many minutes of building, save the shader cache, and continue in the next attempt of this run (the chain controller does that). 0 = never slice, the job runs until GitHub''s 6-hour cap and saves nothing. A big game needs about 30 hours, so the default slices it into about 7'
+        type: number
+        default: 285
+      shards:
+        description: 'Experimental: how many jobs compile the shaders in parallel, 1 to 4. 1 is the normal build in two jobs (a shard that does everything, then the pack). Each shard repeats the fixed cost (checkout, cleanup, download, the game split: about 20 minutes) and its share of the compile is finished sooner, so the win is about shards / (shards + 0.3) times fewer hours of compile and about half the attempts per shard'
+        type: number
+        default: 2
+      max_attempts:
+        description: 'Slicing: how many attempts of this run may follow, the first run counted. 285 minutes each is about 38 hours, enough for the biggest games; the chain also stops on its own when an attempt saves no more cache than the one before'
+        type: number
+        default: 8
+
+permissions:
+  contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
+  actions: write    # upload the artifacts, and read this run's artifacts to see whether the previous attempt made progress
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment), as in tests.yml.
+jobs:
+
+  shard:
+    name: 'Shards: iOS shaders (${{ matrix.shard }} of ${{ inputs.shards }})'
+    strategy:
+      fail-fast: false
+      # Written out because a number input cannot be turned into a range: 1 shard is a plain build, 2 to 4 split the compile.
+      matrix:
+        shard: ${{ fromJSON(inputs.shards >= 4 && '[0,1,2,3]' || inputs.shards == 3 && '[0,1,2]' || inputs.shards == 1 && '[0]' || '[0,1]') }}
+    runs-on: xcode-27   # GitHub's Apple-silicon image; Xcode 27.2 provides the Metal compiler in dmsh_chain.lock (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
+    timeout-minutes: 355   # GitHub's cap is 360: the last minutes are for saving the cache and the slice marker, which a hard kill would lose
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      SHARDS: ${{ inputs.shards }}
+      SHARD_INDEX: ${{ matrix.shard }}
+      CACHE_SUFFIX: "-s${{ matrix.shard }}"
+    steps:
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the secrets
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+        run: |
+          missing=
+          if [ -z "$PROD_KEYS" ]; then missing="$missing PROD_KEYS"; fi
+          if [ -z "$IPA_PASSWORD" ]; then missing="$missing IPA_PASSWORD"; fi
+          if [ -z "$CACHE_PASSWORD" ]; then missing="$missing CACHE_PASSWORD"; fi
+          if [ -n "$missing" ]; then echo "::error::missing repository secrets:$missing (Settings → Secrets and variables → Actions; docs/build-on-github.md)"; exit 1; fi
+
+      # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, the simulators of the
+      # other platforms (the iPhone's stays: the app's asset catalog is compiled against it), ~/.dotnet, the tool caches nothing here uses, the browsers, the Spotlight index
+      # and the wallpaper videos. In the background while the tools install; "Wait for the disk cleanup" waits for it.
+      - name: Free disk space (in the background)
+        env:
+          SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
+        run: |
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+          if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
+          sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          echo "selected Xcode (kept): $sel"
+          (
+            set +e
+            # Each removal owns its own subtree, so they run together: this is the only part of the cleanup the tool installs do not
+            # hide, and what "Wait for the disk cleanup" waits on. simctl stays one chain (one runtime database).
+            (
+              case "$sel" in
+                *.app)
+                  for x in /Applications/Xcode*.app; do
+                    if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                    echo "removing $x"; sudo rm -rf "$x"
+                  done ;;
+              esac
+              for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+                if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              # ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's TOOL_PATHS tries first.
+              # Python stays in the tool cache: setup-python installs into it.
+              for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+                if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+              done
+              # the other platforms' simulator MobileAssets, which simctl leaves behind when it cannot unmount the cryptex
+              for r in watchOS tvOS visionOS xrOS; do
+                d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+              if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+                sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
+              fi
+              if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+                echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+              fi
+            ) &
+            (
+              xcrun simctl runtime list -j 2> /dev/null |
+                python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+                while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+              # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+              # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+              # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so the
+              # asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+              kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+              xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+                sort -t. -k1,1n -k2,2n | sed '$d' |
+                while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+              for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+                [ -d "$a" ] || continue
+                b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+                if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                  echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+                fi
+              done
+            ) &
+            wait
+            touch "$RUNNER_TEMP/cleanup.done"
+          ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      # The NSP script looks for dotnet in /usr/local/share/dotnet before ~/.dotnet (its TOOL_PATHS), so .NET 10 goes there: a preinstalled older SDK there would be found first
+      - name: Make room for .NET 10 where the NSP script looks first
+        run: sudo mkdir -p /usr/local/share/dotnet && sudo chown -R "$(id -un)" /usr/local/share/dotnet
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        env:
+          DOTNET_INSTALL_DIR: /usr/local/share/dotnet
+        with:
+          dotnet-version: '10.0.x'   # nx_extract and the shader translator target net10.0
+      - name: Install the tools
+        run: |
+          brew install xcodegen zstd spirv-cross glslang sevenzip   # sevenzip: 7zz, which unpacks the download and encrypts the IPA
+          python -m pip install lz4 capstone fonttools zbic   # backports.zstd is for Python before 3.14 only
+          python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
+          # Xcode 26 installs the Metal toolchain (the shader compiler and metal-tt) separately
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      # The formulae are in and nothing later runs brew: its download cache and the taps' git history go. The taps' working trees stay.
+      - name: Free more disk space (Homebrew)
+        run: |
+          brew cleanup --prune=all -s > /dev/null 2>&1 || true
+          for t in /opt/homebrew/Library/Taps/homebrew/*/.git; do
+            if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
+          done
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      # The image's own MetalToolchain fails the version check in "Install the tools", so a second one is downloaded: once the newer
+      # one is mounted the older asset is dead weight. If the compiler stops working after the removal, it is downloaded again.
+      - name: Trim the duplicate MetalToolchain
+        run: |
+          assets=(/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/*.asset)
+          if [ ${#assets[@]} -gt 1 ]; then
+            ls -dt "${assets[@]}" | tail -n +2 | while read -r d; do echo "removing the unused MetalToolchain asset $d"; sudo rm -rf "$d"; done
+          else
+            echo "one MetalToolchain asset: nothing to trim"
+          fi
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            echo "::warning::the Metal compiler stopped after the removal: downloading the toolchain again"
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Wait for the disk cleanup
+        run: |
+          for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
+          if [ -f "$RUNNER_TEMP/cleanup.log" ]; then cat "$RUNNER_TEMP/cleanup.log"; fi   # not there when the cleanup was skipped
+          if [ ! -e "$RUNNER_TEMP/cleanup.done" ]; then echo "::warning::the disk cleanup did not finish within 30 minutes"; fi
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+
+      - name: Check the runner
+        run: |
+          dn=$(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:$HOME/.dotnet:$PATH" command -v dotnet || true)   # the dotnet the NSP script runs
+          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; if (x < 0) x = 0; printf "%.1f", x }')   # macOS's awk cannot parse a comparison inside printf's arguments
+          {
+            echo "### The runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup, ${FREE_AFTER_TOOLS:-?} GB after the tools) |"
+            echo "| Largest game that should fit | about $fit GB of game files (the build needs about three times the game's size plus 10 GB) |"
+            echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
+            echo "| Metal compiler | $(xcrun -sdk iphoneos metal --version 2>&1 | head -1) |"
+            echo "| metal-tt | $(xcrun -sdk iphoneos metal-tt -version 2>&1 | head -1) |"
+            echo "| .NET SDKs | ${dn:-no dotnet}: $([ -n "$dn" ] && "$dn" --list-sdks 2>&1 | cut -d' ' -f1 | tr '\n' ' ') |"
+            echo "| Python | $(python --version 2>&1) |"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
+          if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
+
+      - name: Download the game
+        if: ${{ !inputs.check_only }}
+        env:
+          GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+
+      # The cache release is named after the game, so the game comes first: the title ID is read from what was just downloaded, by the same scan the
+      # build makes (dm/tools/game_title_id.py: the NUP's program ID, the dump's NPDM, else the NSPs' tickets). The Title ID field stays empty unless
+      # the scan cannot read the game.
+      - name: Find the game's title ID
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          tid=$(python -I dm/tools/game_title_id.py "$RUNNER_TEMP/game" -k "$keys" || true)
+          rm -f "$keys"
+          if [ -z "$tid" ] && [ -n "$IN_TITLE_ID" ]; then tid="$IN_TITLE_ID"; fi   # a game the scan cannot read (a cartridge dump with no [title ID] in its name): the field, when it was filled in
+          if [ -n "$tid" ]; then
+            echo "GAME_TITLE_ID=$tid" >> "$GITHUB_ENV"
+            echo "The game's title ID: $tid"
+          else
+            echo "::warning::the game's title ID could not be read: this run uses no build cache"
+          fi
+
+      # After the download, so the cache's captures (extract/*/vk_capture, …) need no moving out of the way first.
+      - name: Restore build cache
+        if: ${{ !inputs.check_only }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+        run: |
+          title_id="$GAME_TITLE_ID"
+          if [ -z "$title_id" ]; then
+            echo "No title ID determined, skipping cache restore"
+            exit 0
+          fi
+          version="${{ inputs.version || 'latest' }}"
+          cache_tag="x-cache-${title_id}-${version}${CACHE_SUFFIX:-}"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          if gh release view "$cache_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/game"
+            gh release download "$cache_tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$RUNNER_TEMP/game/"
+            for f in "$RUNNER_TEMP/game/"*.7z*; do
+              if [ -f "$f" ]; then
+                case "$f" in
+                  *.7z.001) 7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null ;;
+                  *.7z)     7zz x -y -p"$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$f" >/dev/null ;;
+                esac
+                rm -f "$f"
+              fi
+            done
+            echo "Restored cache: $cache_tag"
+          else
+            echo "No cache release $cache_tag found"
+          fi
+
+      - name: Shard the shader list
+        if: ${{ !inputs.check_only }}
+        env:
+          SHARDS: ${{ inputs.shards }}
+          SHARD_VALUE: ${{ matrix.shard }}/${{ inputs.shards }}
+        run: |
+          # The tool takes a target list, not a part of the map, so this adds one to the checkout on the runner (the repository is untouched):
+          # after the list is built, a shard keeps every n-th group, a group being a vertex shader with the pixel shaders built from it (their
+          # source is generated from its MSL, so a pixel shader cannot be built where its vertex shader was not). Every shard computes the same
+          # grouping from the same inputs, so the shares are disjoint and add up to the whole map.
+          python3 - <<'PY'
+          import sys
+          path = 'dm/gfx/tools/dmsh_build.py'
+          anchor = "keys = build_keys(want, loc, PAIRS)\nif want: want = set(keys)"
+          hook = "\n".join([
+              "keys = build_keys(want, loc, PAIRS)",
+              "_shard = os.environ.get('DMSH_SHARD') or ''",
+              "_i, _n = (int(x) for x in _shard.split('/')) if _shard.count('/') == 1 and _shard.replace('/', '').isdigit() else (0, 1)",
+              "if _n > 1:",
+              "    _i, _n = (int(x) for x in _shard.split('/'))",
+              "    _owner = {_ps: _vs for _vs, _pss in PAIRS.items() for _ps in _pss}",
+              "    _groups = {}",
+              "    for _k in keys:",
+              "        _groups.setdefault(_owner.get(_k, _k), []).append(_k)",
+              "    _all = sum(len(v) for v in _groups.values())",
+              "    keys = sorted(_k for _g, _gk in enumerate(sorted(_groups)) if _g % _n == _i for _k in _groups[_gk])",
+              "    want = set(keys)",
+              "    print('shard %d of %d: %s of %s shaders, %s groups' % (_i, _n, format(len(keys), ','), format(_all, ','),",
+              "          format(len(_groups), ',')), flush=True)",
+              "if want: want = set(keys)",
+          ])
+          src = open(path).read()
+          if anchor not in src:
+              sys.exit('the shard hook in dm/gfx/tools/dmsh_build.py no longer matches: the tool changed where the target list is built')
+          if '_shard = os.environ.get' in src:
+              sys.exit('the shard hook is already in the checkout')
+          open(path, 'w').write(src.replace(anchor, hook))
+          print('shard hook added to dmsh_build.py')
+          PY
+          echo "DMSH_SHARD=$SHARD_VALUE" >> "$GITHUB_ENV"
+      - name: Build the IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_LANGUAGE: ${{ inputs.language }}
+          IN_APP_NAME: ${{ inputs.app_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_SHOW_FPS: ${{ inputs.show_fps }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
+          IN_ROMFS: ${{ inputs.romfs }}
+          IN_SLICE: ${{ inputs.slice }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          args=(--keep-extracted --progress lines)
+          # separate: the game files stay out of the IPA (DM_COPY_ROMFS=NO); they are shipped beside it instead, as the extraction's RomFS.img
+          if [ "$IN_ROMFS" = separate ]; then args+=(--romfs separate); fi
+          if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
+          if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
+          if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
+          # A dump folder has the authoritative program ID in base/exefs/main.npdm.
+          # Do not force the optional title_id input onto Switch 2 dumps; it is
+          # intended for cartridge packages that have no title ID in their name.
+          if [ -n "$IN_TITLE_ID" ] && [ ! -f "$RUNNER_TEMP/game/base/exefs/main.npdm" ]; then
+            args+=(--title-id "$IN_TITLE_ID")
+          fi
+          if [ "$IN_SHOW_FPS" = true ]; then args+=(--show-fps); else args+=(--no-show-fps); fi
+          # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
+          ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
+          rc=0
+          # Slicing: stop before GitHub's 6-hour job cap, so the cache step saves what this attempt compiled and the chain controller runs the next
+          # attempt. `trap - INT; exec` matters: a backgrounded command in a non-interactive shell starts with SIGINT ignored, so without this the
+          # watchdog's SIGINT would do nothing and the job would run to the cap. SIGINT rather than SIGTERM so the script finishes its shader and
+          # closes cas.db instead of being killed with a write in flight.
+          slice="${IN_SLICE:-0}"
+          case "$slice" in ''|*[!0-9]*) slice=0 ;; esac
+          ( trap - INT; exec python scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$keys" "${args[@]}" ) &
+          build_pid=$!
+          watchdog=""
+          if [ "$slice" -gt 0 ]; then
+            # SIGINT, then five minutes to finish the shader in flight and close the database, then SIGTERM: a script that ignores the interrupt
+            # must not turn into a job that runs to the cap anyway.
+            ( sleep $((slice * 60)); touch "$RUNNER_TEMP/slice.hit"; echo "::notice::${slice} minutes of building: stopping here so the shader cache is saved and the next attempt continues"; kill -INT "$build_pid" 2>/dev/null; sleep 300; kill -TERM "$build_pid" 2>/dev/null ) &
+            watchdog=$!
+          fi
+          # A shard compiles shaders and stops: the shader step writes shader/ios/b-<chain>.key when it is done, and everything after it (the Mac
+          # host, the pipeline, the app) is the finish job's work. SIGINT, as the watchdog uses, so the shader in flight ends and cas.db closes.
+          shard_watch=""
+          if [ -n "${SHARD_INDEX:-}" ]; then
+            ( while kill -0 "$build_pid" 2>/dev/null; do
+                if compgen -G "$RUNNER_TEMP/game/*_build/shader/ios/b-*.key" > /dev/null; then
+                  touch "$RUNNER_TEMP/shard.done"
+                  echo "::notice::this shard compiled its share of the shaders: stopping before the pack"
+                  kill -INT "$build_pid" 2>/dev/null
+                  break
+                fi
+                sleep 10
+              done ) &
+            shard_watch=$!
+          fi
+          wait "$build_pid" || rc=$?
+          if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; fi
+          if [ -n "$shard_watch" ]; then kill "$shard_watch" 2>/dev/null || true; fi
+          kill "$sampler" || true
+          rm -f "$keys"
+          low=$(awk 'NR == 1 || $1 < m { m = $1 } END { if (NR) printf "%.1f", m / 1048576 }' "$RUNNER_TEMP/free.log")
+          if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
+          # The watchdog reached its minute: this attempt is a slice, not a failure. Exit 0 so the steps after it run and the cache step, which waits
+          # on success(), saves the shaders compiled so far.
+          if [ -f "$RUNNER_TEMP/shard.done" ]; then
+            echo "SHARD_DONE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ -f "$RUNNER_TEMP/slice.hit" ]; then
+            echo "SLICE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Save and encrypt build cache
+        if: ${{ !inputs.check_only && success() }}
+        id: cache-save
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+        run: |
+          version="${{ inputs.version || 'latest' }}"
+          build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
+          if [ -z "$build_folder" ]; then
+            echo "No build folder found"
+            exit 0
+          fi
+          build_base=$(basename "$build_folder")
+          title_id="${build_base%_build}"
+          cache_tag="x-cache-${title_id}-${version}${CACHE_SUFFIX:-}"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          cache_items=()
+          [ -d "$build_folder/shader" ] && cache_items+=("$build_base/shader")
+          [ -d "$build_folder/pso_archive" ] && cache_items+=("$build_base/pso_archive")
+          [ -d "$build_folder/profile" ] && cache_items+=("$build_base/profile")
+          # Run-time shader captures (Vulkan SPIR-V, GL GLSL, NVN GLSLC) and decoded UE shader archives: without these the capture/decode re-runs every build
+          for cap_dir in "$build_folder"/extract/*/vk_capture "$build_folder"/extract/*/gl_capture "$build_folder"/extract/*/glslc_capture "$build_folder"/extract/*/ue_shaders; do
+            [ -d "$cap_dir" ] && cache_items+=("$build_base/${cap_dir#$build_folder/}")
+          done
+          if [ ${#cache_items[@]} -eq 0 ]; then
+            echo "No cache to save"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/cache"
+          cache_archive="$RUNNER_TEMP/cache/cache.7z"
+          rm -f "$cache_archive" "$cache_archive".*
+          cd "$RUNNER_TEMP/game"
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
+          size=$(stat -f%z "$cache_archive")
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+          safe=$(( cap - 1024 * 1024 ))
+          parts=$(( (size + safe - 1) / safe ))
+          echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
+          if [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))
+            rm -f "$cache_archive"
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
+          fi
+          rm -rf "$build_folder/extract"
+
+      - name: Keep the build logs
+        if: ${{ failure() && !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/game/*_build/logs/
+            ${{ runner.temp }}/game/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish cache release
+        id: cache-release
+        continue-on-error: true
+        if: ${{ !inputs.check_only && success() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$CACHE_TAG"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --title "Build cache: $tag" \
+            --notes "Cache for $tag. Download all parts into the build folder and extract, or let the workflow restore it automatically."
+          shopt -s nullglob
+          files=("$RUNNER_TEMP/cache"/*)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload "$tag" "${files[@]}" -R "$GITHUB_REPOSITORY"
+            echo "RELEASE_URL=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_ENV"
+          fi
+          echo "published cache $tag: ${#files[@]} file(s)"
+
+      - name: Remove failed cache release
+        if: ${{ steps.cache-release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${CACHE_TAG:-}" ]; then
+            gh release delete "$CACHE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          fi
+
+      - name: Upload cache as artifact
+        if: ${{ !inputs.check_only && steps.cache-release.outcome == 'failure' && env.CACHE_TAG != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-cache-${{ env.CACHE_TAG }}
+          path: $RUNNER_TEMP/cache
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Remove the release that failed
+        if: ${{ steps.release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::warning::the Release upload failed: the archive is kept as a run artifact instead"
+          if [ -n "${RELEASE_TAG:-}" ]; then gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true; fi   # a release without its files is no use
+
+      # The run artifact: the way out when Release is off, and when the Release failed. The build takes hours and the IPA exists only on this runner, so each step that fails hands over to a simpler one:
+      #   one file ......... the .7z as it is (`archive: false` takes a single file only)
+      #   several parts .... a zip with no compression around them (the archive is encrypted already), and if that upload fails,
+      #   one file again ... the parts joined into one .7z (they are plain pieces of it: cat gives the archive back), uploaded as it is
+      - name: Decide whether the next attempt continues this build
+        id: chain
+        if: ${{ !inputs.check_only && !cancelled() && (env.SLICE == '1' || env.SHARD_DONE == '1') && steps.cache-save.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          MARKER_SUFFIX: -s${{ matrix.shard }}
+        run: |
+          # The marker's name carries this attempt's number, the cap and how much cache it saved, so the controller needs nothing else. The previous
+          # attempt's marker is in the same run's artifacts: if this attempt saved no more than that one did, the build is spinning, and a chain that
+          # spins would burn hours to learn nothing.
+          saved=$(du -sk "$RUNNER_TEMP"/cache/* 2>/dev/null | awk '{s += $1} END {print s + 0}')
+          saved=${saved:-0}
+          attempt="$GITHUB_RUN_ATTEMPT"
+          if [ "$saved" -eq 0 ]; then
+            echo "::warning::this attempt saved no cache, so the next attempt would start from nothing: stopping the chain"
+            echo "No cache was saved, so this run stops here instead of repeating the same work." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$attempt" -gt 1 ]; then
+            # A shard's markers carry -s<shard>; the finish job's carry -f, so only this job's own history is compared.
+            before=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --jq '.artifacts[].name' \
+              | sed -n "s/^chain-[pd]a$((attempt - 1))m[0-9]*b\([0-9]*\)${MARKER_SUFFIX}\$/\1/p" | head -1)
+            if [ -n "$before" ] && [ "$before" -ge "$saved" ]; then
+              echo "::warning::the attempt before saved $before KB and this one $saved KB: no progress, stopping the chain"
+              echo "This attempt saved no more cache than the one before it, so the chain stops instead of repeating it." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          # p: this job stopped before its work was done, so the next attempt has to continue it. d: the work is done and the marker is only a
+          # history entry, which the no-progress check reads.
+          if [ "${SHARD_DONE:-}" = 1 ]; then kind=d; else kind=p; fi
+          echo "$kind" > "$RUNNER_TEMP/chain.txt"
+          echo "marker=chain-${kind}a${attempt}m${IN_MAX_ATTEMPTS}b${saved}${MARKER_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark this run for the next attempt
+        if: ${{ steps.chain.outputs.marker != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.chain.outputs.marker }}
+          path: ${{ runner.temp }}/chain.txt
+          retention-days: 1
+
+      - name: Delete the keys
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+  gate:
+    name: Did every shard finish its share?
+    needs: shard
+    if: ${{ !cancelled() && needs.shard.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      paused: ${{ steps.check.outputs.paused }}
+    steps:
+      - name: Look for a shard that stopped before the end of its share
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The shard jobs mark themselves: chain-p<attempt>m<cap>b<size>-s<shard> when the slice stopped them, chain-d…-s<shard> when their
+          # share was compiled. A marker of an earlier attempt stays in the run, so only this attempt's number counts.
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --jq '.artifacts[].name')
+          if printf '%s\n' "$names" | grep -qE "^chain-pa${GITHUB_RUN_ATTEMPT}m[0-9]+b[0-9]+-s[0-9]+$"; then paused=1; else paused=0; fi
+          echo "paused=$paused" >> "$GITHUB_OUTPUT"
+          if [ "$paused" = 1 ]; then
+            echo "A shard stopped before the end of its share: the IPA is packed in the next attempt, once every share is compiled."
+          else
+            echo "Every shard reached the end of its share: packing the IPA."
+          fi
+
+  finish:
+    name: Pack the IPA from the shard caches
+    needs: [shard, gate]
+    if: ${{ !cancelled() && needs.shard.result == 'success' && needs.gate.outputs.paused != '1' }}
+    runs-on: xcode-27   # GitHub's Apple-silicon image; Xcode 27.2 provides the Metal compiler in dmsh_chain.lock (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
+    timeout-minutes: 355   # GitHub's cap is 360: the last minutes are for saving the cache and the slice marker, which a hard kill would lose
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      SHARDS: ${{ inputs.shards }}
+      CACHE_SUFFIX: ""
+    steps:
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the secrets
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+        run: |
+          missing=
+          if [ -z "$PROD_KEYS" ]; then missing="$missing PROD_KEYS"; fi
+          if [ -z "$IPA_PASSWORD" ]; then missing="$missing IPA_PASSWORD"; fi
+          if [ -z "$CACHE_PASSWORD" ]; then missing="$missing CACHE_PASSWORD"; fi
+          if [ -n "$missing" ]; then echo "::error::missing repository secrets:$missing (Settings → Secrets and variables → Actions; docs/build-on-github.md)"; exit 1; fi
+
+      # The build needs about three times the game's size plus 10 GB. Freed here: every Xcode but the selected one (the build's), the Android SDK, CodeQL, the simulators of the
+      # other platforms (the iPhone's stays: the app's asset catalog is compiled against it), ~/.dotnet, the tool caches nothing here uses, the browsers, the Spotlight index
+      # and the wallpaper videos. In the background while the tools install; "Wait for the disk cleanup" waits for it.
+      - name: Free disk space (in the background)
+        env:
+          SKIP_CLEANUP: ${{ inputs.skip_cleanup }}
+        run: |
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_START=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+          if [ "$SKIP_CLEANUP" = true ]; then echo "disk cleanup skipped"; touch "$RUNNER_TEMP/cleanup.done"; exit 0; fi
+          sel=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          echo "selected Xcode (kept): $sel"
+          (
+            set +e
+            # Each removal owns its own subtree, so they run together: this is the only part of the cleanup the tool installs do not
+            # hide, and what "Wait for the disk cleanup" waits on. simctl stays one chain (one runtime database).
+            (
+              case "$sel" in
+                *.app)
+                  for x in /Applications/Xcode*.app; do
+                    if [ -L "$x" ] || [ "$(cd "$x" && pwd -P)" = "$sel" ]; then continue; fi
+                    echo "removing $x"; sudo rm -rf "$x"
+                  done ;;
+              esac
+              for d in "${ANDROID_HOME:-}" "$HOME/Library/Android" "${RUNNER_TOOL_CACHE:-/nonexistent}/CodeQL"; do
+                if [ -n "$d" ] && [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              # ~/.dotnet: the build installs .NET 10 into /usr/local/share/dotnet, which the NSP script's TOOL_PATHS tries first.
+              # Python stays in the tool cache: setup-python installs into it.
+              for d in "$HOME/.dotnet" "${RUNNER_TOOL_CACHE:-/nonexistent}/Java_Temurin-Hotspot_jdk" "${RUNNER_TOOL_CACHE:-/nonexistent}/go" "${RUNNER_TOOL_CACHE:-/nonexistent}/node" "${RUNNER_TOOL_CACHE:-/nonexistent}/Ruby"; do
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+            ) &
+            (
+              for a in "Microsoft Edge.app" "Google Chrome.app" "Google Chrome for Testing.app" "Firefox.app"; do
+                if [ -e "/Applications/$a" ]; then echo "removing /Applications/$a"; sudo rm -rf "/Applications/$a"; fi
+              done
+              # the other platforms' simulator MobileAssets, which simctl leaves behind when it cannot unmount the cryptex
+              for r in watchOS tvOS visionOS xrOS; do
+                d="/System/Library/AssetsV2/com_apple_MobileAsset_${r}SimulatorRuntime"
+                if [ -e "$d" ]; then echo "removing $d"; sudo rm -rf "$d"; fi
+              done
+              if [ -d /System/Volumes/Data/.Spotlight-V100 ]; then
+                sudo mdutil -a -i off > /dev/null 2>&1; echo "removing the Spotlight index"; sudo rm -rf /System/Volumes/Data/.Spotlight-V100
+              fi
+              if [ -e "$HOME/Library/Application Support/com.apple.wallpaper/aerials" ]; then
+                echo "removing the wallpaper aerials"; rm -rf "$HOME/Library/Application Support/com.apple.wallpaper/aerials"
+              fi
+            ) &
+            (
+              xcrun simctl runtime list -j 2> /dev/null |
+                python3 -c 'import json, sys; [print(k) for k, v in json.load(sys.stdin).items() if "iphone" not in str(v.get("platformIdentifier", "")).lower()]' |
+                while read -r id; do echo "removing simulator runtime $id"; xcrun simctl runtime delete "$id"; done
+              # Two iOS runtimes are installed and the app's asset catalog needs one: keep the newest. `simctl runtime list -j` carries no
+              # readable version on this image, but the human list does ("iOS 27.0 (24A434) - <UUID> (Ready)"), and each asset's
+              # Info.plist carries the same build. simctl runtime delete does not always reclaim the MobileAsset (the watchOS one), so the
+              # asset whose build is not the kept one goes too. Nothing is removed when either read fails.
+              kept=$(xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; b = $3; gsub(/[()]/, "", b); split(v, n, "."); k = n[1] * 1000 + n[2]; if (k > best) { best = k; keep = b } } END { print keep }')
+              xcrun simctl runtime list 2> /dev/null | awk '/^iOS /{ v = $2; if (match($0, /[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/)) print v "\t" substr($0, RSTART, RLENGTH) }' |
+                sort -t. -k1,1n -k2,2n | sed '$d' |
+                while read -r v id; do echo "removing older iOS runtime $v ($id)"; xcrun simctl runtime delete "$id"; done
+              for a in /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*.asset; do
+                [ -d "$a" ] || continue
+                b=$(sudo plutil -extract MobileAssetProperties.Build raw -o - "$a/Info.plist" 2> /dev/null)
+                if [ -n "$kept" ] && [ -n "$b" ] && [ "$b" != "$kept" ]; then
+                  echo "removing the MobileAsset of iOS build $b (the newest is $kept): $a"; sudo rm -rf "$a"
+                fi
+              done
+            ) &
+            wait
+            touch "$RUNNER_TEMP/cleanup.done"
+          ) > "$RUNNER_TEMP/cleanup.log" 2>&1 &
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      # The NSP script looks for dotnet in /usr/local/share/dotnet before ~/.dotnet (its TOOL_PATHS), so .NET 10 goes there: a preinstalled older SDK there would be found first
+      - name: Make room for .NET 10 where the NSP script looks first
+        run: sudo mkdir -p /usr/local/share/dotnet && sudo chown -R "$(id -un)" /usr/local/share/dotnet
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        env:
+          DOTNET_INSTALL_DIR: /usr/local/share/dotnet
+        with:
+          dotnet-version: '10.0.x'   # nx_extract and the shader translator target net10.0
+      - name: Install the tools
+        run: |
+          brew install xcodegen zstd spirv-cross glslang sevenzip   # sevenzip: 7zz, which unpacks the download and encrypts the IPA
+          python -m pip install lz4 capstone fonttools zbic   # backports.zstd is for Python before 3.14 only
+          python -m pip install nsz || echo "::warning::nsz did not install: NSZ and XCZ files cannot be converted"
+          # Xcode 26 installs the Metal toolchain (the shader compiler and metal-tt) separately
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      # The formulae are in and nothing later runs brew: its download cache and the taps' git history go. The taps' working trees stay.
+      - name: Free more disk space (Homebrew)
+        run: |
+          brew cleanup --prune=all -s > /dev/null 2>&1 || true
+          for t in /opt/homebrew/Library/Taps/homebrew/*/.git; do
+            if [ -d "$t" ]; then echo "removing $t"; sudo rm -rf "$t"; fi
+          done
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE_AFTER_TOOLS=%.1f\n", $4 / 1048576 }' | tee -a "$GITHUB_ENV"
+
+      # The image's own MetalToolchain fails the version check in "Install the tools", so a second one is downloaded: once the newer
+      # one is mounted the older asset is dead weight. If the compiler stops working after the removal, it is downloaded again.
+      - name: Trim the duplicate MetalToolchain
+        run: |
+          assets=(/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/*.asset)
+          if [ ${#assets[@]} -gt 1 ]; then
+            ls -dt "${assets[@]}" | tail -n +2 | while read -r d; do echo "removing the unused MetalToolchain asset $d"; sudo rm -rf "$d"; done
+          else
+            echo "one MetalToolchain asset: nothing to trim"
+          fi
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then
+            echo "::warning::the Metal compiler stopped after the removal: downloading the toolchain again"
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Wait for the disk cleanup
+        run: |
+          for _ in $(seq 360); do if [ -e "$RUNNER_TEMP/cleanup.done" ]; then break; fi; sleep 5; done
+          if [ -f "$RUNNER_TEMP/cleanup.log" ]; then cat "$RUNNER_TEMP/cleanup.log"; fi   # not there when the cleanup was skipped
+          if [ ! -e "$RUNNER_TEMP/cleanup.done" ]; then echo "::warning::the disk cleanup did not finish within 30 minutes"; fi
+          df -k "$RUNNER_TEMP" | awk 'NR == 2 { printf "FREE=%.1f\n", $4 / 1048576 }' >> "$GITHUB_ENV"
+
+      - name: Check the runner
+        run: |
+          dn=$(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:$HOME/.dotnet:$PATH" command -v dotnet || true)   # the dotnet the NSP script runs
+          fit=$(awk -v f="$FREE" 'BEGIN { x = (f - 10) / 3; if (x < 0) x = 0; printf "%.1f", x }')   # macOS's awk cannot parse a comparison inside printf's arguments
+          {
+            echo "### The runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Free disk space | $FREE GB ($FREE_START GB before the cleanup, ${FREE_AFTER_TOOLS:-?} GB after the tools) |"
+            echo "| Largest game that should fit | about $fit GB of game files (the build needs about three times the game's size plus 10 GB) |"
+            echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
+            echo "| Metal compiler | $(xcrun -sdk iphoneos metal --version 2>&1 | head -1) |"
+            echo "| metal-tt | $(xcrun -sdk iphoneos metal-tt -version 2>&1 | head -1) |"
+            echo "| .NET SDKs | ${dn:-no dotnet}: $([ -n "$dn" ] && "$dn" --list-sdks 2>&1 | cut -d' ' -f1 | tr '\n' ' ') |"
+            echo "| Python | $(python --version 2>&1) |"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
+          if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
+
+      - name: Download the game
+        if: ${{ !inputs.check_only }}
+        env:
+          GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+
+      # The cache release is named after the game, so the game comes first: the title ID is read from what was just downloaded, by the same scan the
+      # build makes (dm/tools/game_title_id.py: the NUP's program ID, the dump's NPDM, else the NSPs' tickets). The Title ID field stays empty unless
+      # the scan cannot read the game.
+      - name: Find the game's title ID
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          tid=$(python -I dm/tools/game_title_id.py "$RUNNER_TEMP/game" -k "$keys" || true)
+          rm -f "$keys"
+          if [ -z "$tid" ] && [ -n "$IN_TITLE_ID" ]; then tid="$IN_TITLE_ID"; fi   # a game the scan cannot read (a cartridge dump with no [title ID] in its name): the field, when it was filled in
+          if [ -n "$tid" ]; then
+            echo "GAME_TITLE_ID=$tid" >> "$GITHUB_ENV"
+            echo "The game's title ID: $tid"
+          else
+            echo "::warning::the game's title ID could not be read: this run uses no build cache"
+          fi
+
+      # After the download, so the cache's captures (extract/*/vk_capture, …) need no moving out of the way first.
+      - name: Restore every shard's cache and merge them
+        if: ${{ !inputs.check_only }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          title_id="$GAME_TITLE_ID"
+          if [ -z "$title_id" ]; then echo "::error::no title ID, so the shard caches cannot be found"; exit 1; fi
+          version="${{ inputs.version || 'latest' }}"
+          base="x-cache-${title_id}-${version}"
+          shards="${SHARDS:-2}"
+          rm -rf "$RUNNER_TEMP/parts"; mkdir -p "$RUNNER_TEMP/parts"
+          got=0
+          for i in $(seq 0 $((shards - 1))); do
+            tag="${base}-s${i}"
+            if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "::warning::no cache for shard $i ($tag): its share was never compiled"
+              continue
+            fi
+            d="$RUNNER_TEMP/parts/$i"; mkdir -p "$d"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" -p "*.7z*" -D "$d/"
+            for f in "$d"/*.7z*; do
+              if [ -f "$f" ]; then
+                case "$f" in
+                  *.7z.001) 7zz x -y -p"$CACHE_PASSWORD" -o"$d/" "$f" > /dev/null ;;
+                  *.7z)     7zz x -y -p"$CACHE_PASSWORD" -o"$d/" "$f" > /dev/null ;;
+                esac
+                rm -f "$f"
+              fi
+            done
+            got=$((got + 1))
+          done
+          if [ "$got" -eq 0 ]; then echo "::error::no shard cache to merge: nothing was compiled"; exit 1; fi
+          build="$RUNNER_TEMP/game/${title_id}_build"
+          mkdir -p "$build/shader/cache"
+          dbs=()
+          for f in "$RUNNER_TEMP"/parts/*/"${title_id}"_build/shader/cache/cas.db; do
+            if [ -f "$f" ]; then dbs+=("$f"); fi
+          done
+          if [ ${#dbs[@]} -eq 0 ]; then echo "::error::no cas.db in the shard caches"; exit 1; fi
+          # Merging the databases row by row in SQLite: a Python loop over 130,000 entries would copy gigabytes through the interpreter.
+          python3 - "$build/shader/cache/cas.db" "${dbs[@]}" <<'PY'
+          import sqlite3, sys
+          sys.path.insert(0, 'dm/tools')
+          import shader_cache
+          dst, *srcs = sys.argv[1:]
+          con = sqlite3.connect(dst)
+          for stmt in shader_cache.SCHEMA:
+              con.execute(stmt)
+          # Attached, copied, then left attached: a DETACH fails while a statement of that file is still open, and the exit closes them anyway.
+          for i, path in enumerate(srcs):
+              con.execute(f'ATTACH DATABASE ? AS s{i}', (path,))
+          for i in range(len(srcs)):
+              con.execute(f'INSERT OR IGNORE INTO blob(hash, data) SELECT hash, data FROM s{i}.blob')
+              con.execute(f'INSERT OR REPLACE INTO entry(name, blob, mtime) '
+                          f'SELECT e.name, b.id, e.mtime FROM s{i}.entry e '
+                          f'JOIN s{i}.blob sb ON sb.id = e.blob JOIN blob b ON b.hash = sb.hash')
+              con.commit()
+              print(f'shard {i}: merged')
+          entries = con.execute('SELECT count(*) FROM entry').fetchone()[0]
+          blobs = con.execute('SELECT count(*) FROM blob').fetchone()[0]
+          con.close()
+          print(f"merged {len(srcs)} shard cache(s): {entries:,} entries, {blobs:,} blobs")
+          PY
+          rm -rf "$RUNNER_TEMP/parts"
+          cache_tag="$base"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+      - name: Patch the shader tool as the shards did (the cache keys hash its code)
+        if: ${{ !inputs.check_only }}
+        env:
+          SHARDS: ${{ inputs.shards }}
+          SHARD_VALUE: ""
+        run: |
+          # The tool takes a target list, not a part of the map, so this adds one to the checkout on the runner (the repository is untouched):
+          # after the list is built, a shard keeps every n-th group, a group being a vertex shader with the pixel shaders built from it (their
+          # source is generated from its MSL, so a pixel shader cannot be built where its vertex shader was not). Every shard computes the same
+          # grouping from the same inputs, so the shares are disjoint and add up to the whole map.
+          python3 - <<'PY'
+          import sys
+          path = 'dm/gfx/tools/dmsh_build.py'
+          anchor = "keys = build_keys(want, loc, PAIRS)\nif want: want = set(keys)"
+          hook = "\n".join([
+              "keys = build_keys(want, loc, PAIRS)",
+              "_shard = os.environ.get('DMSH_SHARD') or ''",
+              "_i, _n = (int(x) for x in _shard.split('/')) if _shard.count('/') == 1 and _shard.replace('/', '').isdigit() else (0, 1)",
+              "if _n > 1:",
+              "    _i, _n = (int(x) for x in _shard.split('/'))",
+              "    _owner = {_ps: _vs for _vs, _pss in PAIRS.items() for _ps in _pss}",
+              "    _groups = {}",
+              "    for _k in keys:",
+              "        _groups.setdefault(_owner.get(_k, _k), []).append(_k)",
+              "    _all = sum(len(v) for v in _groups.values())",
+              "    keys = sorted(_k for _g, _gk in enumerate(sorted(_groups)) if _g % _n == _i for _k in _groups[_gk])",
+              "    want = set(keys)",
+              "    print('shard %d of %d: %s of %s shaders, %s groups' % (_i, _n, format(len(keys), ','), format(_all, ','),",
+              "          format(len(_groups), ',')), flush=True)",
+              "if want: want = set(keys)",
+          ])
+          src = open(path).read()
+          if anchor not in src:
+              sys.exit('the shard hook in dm/gfx/tools/dmsh_build.py no longer matches: the tool changed where the target list is built')
+          if '_shard = os.environ.get' in src:
+              sys.exit('the shard hook is already in the checkout')
+          open(path, 'w').write(src.replace(anchor, hook))
+          print('shard hook added to dmsh_build.py')
+          PY
+          echo "DMSH_SHARD=$SHARD_VALUE" >> "$GITHUB_ENV"
+      - name: Build the IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IN_LANGUAGE: ${{ inputs.language }}
+          IN_APP_NAME: ${{ inputs.app_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_SHOW_FPS: ${{ inputs.show_fps }}
+          IN_TITLE_ID: ${{ inputs.title_id }}
+          IN_ROMFS: ${{ inputs.romfs }}
+          IN_SLICE: ${{ inputs.slice }}
+        run: |
+          keys="$RUNNER_TEMP/keys/prod.keys"
+          mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PROD_KEYS" | tr -d '\r' > "$keys"   # a secret pasted from Windows may have CRLF line ends
+          args=(--keep-extracted --progress lines)
+          # separate: the game files stay out of the IPA (DM_COPY_ROMFS=NO); they are shipped beside it instead, as the extraction's RomFS.img
+          if [ "$IN_ROMFS" = separate ]; then args+=(--romfs separate); fi
+          if [ -n "$IN_LANGUAGE" ]; then args+=(-l "$IN_LANGUAGE"); fi
+          if [ -n "$IN_APP_NAME" ]; then args+=(--app-name "$IN_APP_NAME"); fi
+          if [ -n "$IN_VERSION" ]; then args+=(-p "$IN_VERSION"); fi
+          # A dump folder has the authoritative program ID in base/exefs/main.npdm.
+          # Do not force the optional title_id input onto Switch 2 dumps; it is
+          # intended for cartridge packages that have no title ID in their name.
+          if [ -n "$IN_TITLE_ID" ] && [ ! -f "$RUNNER_TEMP/game/base/exefs/main.npdm" ]; then
+            args+=(--title-id "$IN_TITLE_ID")
+          fi
+          if [ "$IN_SHOW_FPS" = true ]; then args+=(--show-fps); else args+=(--no-show-fps); fi
+          # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
+          ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
+          rc=0
+          # Slicing: stop before GitHub's 6-hour job cap, so the cache step saves what this attempt compiled and the chain controller runs the next
+          # attempt. `trap - INT; exec` matters: a backgrounded command in a non-interactive shell starts with SIGINT ignored, so without this the
+          # watchdog's SIGINT would do nothing and the job would run to the cap. SIGINT rather than SIGTERM so the script finishes its shader and
+          # closes cas.db instead of being killed with a write in flight.
+          slice="${IN_SLICE:-0}"
+          case "$slice" in ''|*[!0-9]*) slice=0 ;; esac
+          ( trap - INT; exec python scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$keys" "${args[@]}" ) &
+          build_pid=$!
+          watchdog=""
+          if [ "$slice" -gt 0 ]; then
+            # SIGINT, then five minutes to finish the shader in flight and close the database, then SIGTERM: a script that ignores the interrupt
+            # must not turn into a job that runs to the cap anyway.
+            ( sleep $((slice * 60)); touch "$RUNNER_TEMP/slice.hit"; echo "::notice::${slice} minutes of building: stopping here so the shader cache is saved and the next attempt continues"; kill -INT "$build_pid" 2>/dev/null; sleep 300; kill -TERM "$build_pid" 2>/dev/null ) &
+            watchdog=$!
+          fi
+          wait "$build_pid" || rc=$?
+          if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; fi
+          kill "$sampler" || true
+          rm -f "$keys"
+          low=$(awk 'NR == 1 || $1 < m { m = $1 } END { if (NR) printf "%.1f", m / 1048576 }' "$RUNNER_TEMP/free.log")
+          if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
+          # The watchdog reached its minute: this attempt is a slice, not a failure. Exit 0 so the steps after it run and the cache step, which waits
+          # on success(), saves the shaders compiled so far.
+          if [ -f "$RUNNER_TEMP/slice.hit" ]; then
+            echo "SLICE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Save and encrypt build cache
+        if: ${{ !inputs.check_only && success() }}
+        id: cache-save
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+        run: |
+          version="${{ inputs.version || 'latest' }}"
+          build_folder=$(find "$RUNNER_TEMP/game" -maxdepth 1 -type d -name "*_build" | head -1)
+          if [ -z "$build_folder" ]; then
+            echo "No build folder found"
+            exit 0
+          fi
+          build_base=$(basename "$build_folder")
+          title_id="${build_base%_build}"
+          cache_tag="cache-${title_id}-${version}"
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+          cache_items=()
+          [ -d "$build_folder/shader" ] && cache_items+=("$build_base/shader")
+          [ -d "$build_folder/pso_archive" ] && cache_items+=("$build_base/pso_archive")
+          [ -d "$build_folder/profile" ] && cache_items+=("$build_base/profile")
+          # Run-time shader captures (Vulkan SPIR-V, GL GLSL, NVN GLSLC) and decoded UE shader archives: without these the capture/decode re-runs every build
+          for cap_dir in "$build_folder"/extract/*/vk_capture "$build_folder"/extract/*/gl_capture "$build_folder"/extract/*/glslc_capture "$build_folder"/extract/*/ue_shaders; do
+            [ -d "$cap_dir" ] && cache_items+=("$build_base/${cap_dir#$build_folder/}")
+          done
+          if [ ${#cache_items[@]} -eq 0 ]; then
+            echo "No cache to save"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/cache"
+          cache_archive="$RUNNER_TEMP/cache/cache.7z"
+          rm -f "$cache_archive" "$cache_archive".*
+          cd "$RUNNER_TEMP/game"
+          7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
+          size=$(stat -f%z "$cache_archive")
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+          safe=$(( cap - 1024 * 1024 ))
+          parts=$(( (size + safe - 1) / safe ))
+          echo "CACHE_PARTS=$parts" >> "$GITHUB_ENV"
+          if [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))
+            rm -f "$cache_archive"
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$cache_archive" "${cache_items[@]}"
+          fi
+          rm -rf "$build_folder/extract"
+
+      - name: Keep the build logs
+        if: ${{ failure() && !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/game/*_build/logs/
+            ${{ runner.temp }}/game/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Encrypt the IPA
+        if: ${{ !inputs.check_only && env.SLICE != '1' }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+          IN_RELEASE: ${{ inputs.publish_release }}
+          IN_ROMFS: ${{ inputs.romfs }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          shopt -s nullglob; ipas=("$RUNNER_TEMP"/game/*.ipa)
+          if [ ${#ipas[@]} = 0 ]; then echo "::error::the build made no IPA"; exit 1; fi
+          ipa=${ipas[0]}; for f in "${ipas[@]}"; do if [ "$f" -nt "$ipa" ]; then ipa=$f; fi; done   # the newest
+          name=$(basename "$ipa")
+          mv "$ipa" "$RUNNER_TEMP/out/"
+          payload=("$RUNNER_TEMP/out/$name")
+          # separate: the game files stay out of the IPA, so the extraction's image goes into the same archive, beside it: one download holds both
+          if [ "$IN_ROMFS" = separate ]; then
+            img=$(find "$RUNNER_TEMP/game" -path "*/extract/*/RomFS.img" -type f | head -1)
+            if [ -z "$img" ]; then echo "::error::--romfs separate, but the build left no extract/<version>/RomFS.img to ship"; exit 1; fi
+            mv "$img" "$RUNNER_TEMP/out/RomFS.img"   # a rename within $RUNNER_TEMP: the image is not copied
+            chmod 644 "$RUNNER_TEMP/out/RomFS.img"
+            payload+=("$RUNNER_TEMP/out/RomFS.img")
+            echo "SENDS_ROMFS=true" >> "$GITHUB_ENV"
+            echo "adding the game files: $(du -h "$RUNNER_TEMP/out/RomFS.img" | cut -f1) RomFS.img beside the IPA"
+          fi
+          rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/download"   # the game files and the build folder: room for the archive
+          echo "GAME_IPA=$name" >> "$GITHUB_ENV"   # the real game/IPA name, for the summary mapping to the scrambled archive name
+          # archive base is scrambled (a public release/artifact name must not reveal the game; the password still guards the contents)
+          base="nxnative-${GITHUB_RUN_ID}-$(date +%s)"
+          archive="$RUNNER_TEMP/out/$base.7z"
+          # One file when it fits under GitHub's 2 GiB per-file cap (Release assets are held to it), else the fewest parts that do: -v<size> makes <base>.7z.001, .002, …
+          # No setting for the count: it follows from the size. Both Release and artifact uploads get the same files
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))   # just under 2 GiB
+          safe=$(( cap - 1024 * 1024 ))   # leave room for 7z headers and upload rounding
+          size=0; for f in "${payload[@]}"; do size=$(( size + $(stat -f%z "$f") )); done   # bytes; a stored archive is about the size of what it holds
+          parts=$(( (size + safe - 1) / safe ))
+          zip_path="$RUNNER_TEMP/out"
+          seal() { 7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$IPA_PASSWORD" "$@" "$archive" "${payload[@]}"; }   # stored (the IPA is compressed already), file name encrypted too (-mhe)
+          split=false
+          if [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))   # ceil(bytes / parts)
+            echo "splitting into $parts parts (${per} bytes each)"
+            # 7-Zip wants the size glued to -v: -v1386873831, not -v 1386873831
+            if seal "-v$per"; then split=true
+            else echo "::warning::the split failed: making one archive instead"; rm -f "$archive".[0-9][0-9][0-9]; fi
+          fi
+          if [ "$split" = false ]; then seal; zip_path="$archive"; fi
+          rm -f "${payload[@]}"
+          echo "SPLIT=$split" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"                       # the scrambled archive (or its base) for the summary + upload
+          echo "UPLOAD_PATH=$([ "$split" = true ] && echo "$RUNNER_TEMP/out" || echo "$archive")" >> "$GITHUB_ENV"   # the folder holding the parts, or the .7z on its own
+          echo "ZIP_PATH=$([ "$split" = true ] && echo "$zip_path" || echo "$archive")" >> "$GITHUB_ENV"   # what the zipped upload takes (a wrong folder in test_fallback)
+
+      - name: Publish a GitHub Release
+        id: release
+        continue-on-error: true
+        if: ${{ inputs.publish_release && !inputs.check_only && env.SLICE != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # every file in $RUNNER_TEMP/out: the .7z when not split, or all its parts when the split is on
+          shopt -s nullglob; files=("$RUNNER_TEMP"/out/*)
+          if [ ${#files[@]} = 0 ]; then echo "::error::no archive to publish"; exit 1; fi
+          tag="ipa-${GITHUB_RUN_ID}-$(date +%s)"
+          gh release create "$tag" --title "nxnative IPA: $(basename "$ARCHIVE" .7z)" \
+            --notes "Encrypted with your IPA_PASSWORD. Download all parts (if there are several) into one folder and open the first part (.001) with 7-Zip: the IPA inside is the one to sideload."
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"   # so the next step can remove a release that was made but not filled
+          gh release upload "$tag" "${files[@]}"
+          echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
+          echo "published $tag: ${#files[@]} file(s)"
+
+      - name: Publish cache release
+        id: cache-release
+        continue-on-error: true
+        if: ${{ !inputs.check_only && success() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$CACHE_TAG"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --title "Build cache: $tag" \
+            --notes "Cache for $tag. Download all parts into the build folder and extract, or let the workflow restore it automatically."
+          shopt -s nullglob
+          files=("$RUNNER_TEMP/cache"/*)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload "$tag" "${files[@]}" -R "$GITHUB_REPOSITORY"
+            echo "RELEASE_URL=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_ENV"
+          fi
+          echo "published cache $tag: ${#files[@]} file(s)"
+
+      - name: Prune old cache releases
+        if: ${{ !inputs.check_only && success() && steps.cache-release.outcome == 'success' && env.CACHE_TAG != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title_id="$GAME_TITLE_ID"
+          if [ -z "$title_id" ]; then
+            echo "No title ID determined, skipping prune"
+            exit 0
+          fi
+          current="$CACHE_TAG"
+          old_releases=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && old_releases+=("$tag")
+          done < <(gh release list -R "$GITHUB_REPOSITORY" --json tagName --jq --arg tid "$title_id" '.[] | select(.tagName | startswith("x-cache-" + $tid + "-")) | .tagName' 2>/dev/null || true)
+          for tag in "${old_releases[@]}"; do
+            if [ "$tag" != "$current" ]; then
+              echo "Deleting old cache release: $tag"
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            fi
+          done
+
+      - name: Remove failed cache release
+        if: ${{ steps.cache-release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${CACHE_TAG:-}" ]; then
+            gh release delete "$CACHE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          fi
+
+      - name: Upload cache as artifact
+        if: ${{ !inputs.check_only && steps.cache-release.outcome == 'failure' && env.CACHE_TAG != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-cache-${{ env.CACHE_TAG }}
+          path: $RUNNER_TEMP/cache
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Remove the release that failed
+        if: ${{ steps.release.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::warning::the Release upload failed: the archive is kept as a run artifact instead"
+          if [ -n "${RELEASE_TAG:-}" ]; then gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true; fi   # a release without its files is no use
+
+      # The run artifact: the way out when Release is off, and when the Release failed. The build takes hours and the IPA exists only on this runner, so each step that fails hands over to a simpler one:
+      #   one file ......... the .7z as it is (`archive: false` takes a single file only)
+      #   several parts .... a zip with no compression around them (the archive is encrypted already), and if that upload fails,
+      #   one file again ... the parts joined into one .7z (they are plain pieces of it: cat gives the archive back), uploaded as it is
+      - name: Upload the encrypted IPA
+        id: upload
+        if: ${{ !inputs.check_only && env.SLICE != '1' && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.UPLOAD_PATH }}   # the .7z
+          archive: false   # as it is, not a zip around it; the artifact takes its name
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the encrypted parts
+        id: parts
+        continue-on-error: true
+        if: ${{ !inputs.check_only && env.SLICE != '1' && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-${{ github.run_id }}
+          path: ${{ env.ZIP_PATH }}   # the folder of parts
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Join the parts into one file
+        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        run: |
+          echo "::warning::the upload of the parts failed: joining them into one file"
+          mkdir -p "$RUNNER_TEMP/single"; one="$RUNNER_TEMP/single/$(basename "$ARCHIVE")"; : > "$one"
+          shopt -s nullglob
+          for p in "$ARCHIVE".[0-9][0-9][0-9]; do cat "$p" >> "$one" && rm -f "$p"; done   # one part at a time: the disk holds the growing file and the parts still to come
+          if [ ! -s "$one" ]; then echo "::error::no parts to join"; exit 1; fi
+          echo "SINGLE_PATH=$one" >> "$GITHUB_ENV"
+          ls -l "$one"
+
+      - name: Upload the one file
+        id: single
+        if: ${{ !inputs.check_only && steps.parts.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ env.SINGLE_PATH }}
+          archive: false
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Summary
+        if: ${{ !inputs.check_only && !cancelled() }}
+        env:
+          OUTCOME: ${{ job.status }}
+          URL: ${{ steps.upload.outputs.artifact-url }}
+          PARTS_URL: ${{ steps.parts.outputs.artifact-url }}
+          SINGLE_URL: ${{ steps.single.outputs.artifact-url }}
+          RELEASE_FAILED: ${{ steps.release.outcome == 'failure' }}
+          RELEASE_URL: ${{ env.RELEASE_URL }}
+          GAME_IPA: ${{ env.GAME_IPA }}
+          IN_SLICE: ${{ inputs.slice }}
+          IN_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        run: |
+          {
+            if [ "${SLICE:-}" = 1 ]; then
+              echo "### This attempt stopped at its ${IN_SLICE}-minute slice"
+              echo
+              echo "It compiled what it could and saved the shader cache. The chain controller starts the next attempt of this run from that cache, so the work already done is not repeated. Attempt ${GITHUB_RUN_ATTEMPT}, of at most ${IN_MAX_ATTEMPTS}."
+              echo "There is no IPA yet: it comes from the attempt that finishes the shaders."
+            elif [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
+              echo "### Your IPA"
+              echo
+              echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the release page doesn't reveal the game; the file inside keeps the game's name)."
+              if [ "${SPLIT:-}" = true ]; then echo; echo "The release holds the archive split into parts: download them all into one folder and open the first part (e.g. nxnative-...7z.001)."; fi
+            elif [ "$OUTCOME" = success ] && { [ -n "$URL" ] || [ -n "$PARTS_URL" ] || [ -n "$SINGLE_URL" ]; }; then
+              if [ "$RELEASE_FAILED" = true ]; then echo "### Your IPA (the Release upload failed, so it is a run artifact)"; else echo "### Your IPA"; fi
+              echo
+              if [ -n "$URL" ]; then
+                echo "[$(basename "$ARCHIVE")]($URL), under Artifacts below, for one day. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              elif [ -n "$PARTS_URL" ]; then
+                echo "[$(basename "$ARCHIVE" .7z)]($PARTS_URL), under Artifacts below, for one day. It is a zip of the archive's parts (the archive is over 2 GiB): unzip it, then open the first part (.001) with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              else
+                echo "[$(basename "$ARCHIVE")]($SINGLE_URL), under Artifacts below, for one day. The upload of the parts failed, so the parts were joined and this is the whole archive as one file. Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
+              fi
+              echo "Archive \`$(basename "$ARCHIVE")\` = **${GAME_IPA:-the game}** (name scrambled so the artifact name doesn't reveal the game; the file inside keeps the game's name)."
+              if [ "$RELEASE_FAILED" = true ]; then echo "The Release step's log says why it failed."; fi
+            else
+              echo "### The build failed"
+              echo
+              echo "The last lines of the step that failed say why. For the build itself, the tools' logs are in the build-logs artifact below."
+            fi
+            echo
+            if [ "${SENDS_ROMFS:-}" = true ]; then
+              echo "This archive also holds **RomFS.img**, the game files, which this build kept out of the IPA. Unpack both into one folder, install the IPA, then copy the image to the phone once with:"
+              echo
+              echo '```'
+              echo "scripts/push_romfs.sh <device UDID> <bundle ID> RomFS.img"
+              echo '```'
+              echo
+              echo "The app refuses an image of another game version, so this copy is needed again only when the image changes."
+            fi
+            if [ -n "${LOW_FREE:-}" ]; then echo "Lowest free disk space during the build: $LOW_FREE GB."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide whether the next attempt continues this build
+        id: chain
+        if: ${{ !inputs.check_only && !cancelled() && (env.SLICE == '1' || env.SHARD_DONE == '1') && steps.cache-save.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          MARKER_SUFFIX: -f
+        run: |
+          # The marker's name carries this attempt's number, the cap and how much cache it saved, so the controller needs nothing else. The previous
+          # attempt's marker is in the same run's artifacts: if this attempt saved no more than that one did, the build is spinning, and a chain that
+          # spins would burn hours to learn nothing.
+          saved=$(du -sk "$RUNNER_TEMP"/cache/* 2>/dev/null | awk '{s += $1} END {print s + 0}')
+          saved=${saved:-0}
+          attempt="$GITHUB_RUN_ATTEMPT"
+          if [ "$saved" -eq 0 ]; then
+            echo "::warning::this attempt saved no cache, so the next attempt would start from nothing: stopping the chain"
+            echo "No cache was saved, so this run stops here instead of repeating the same work." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$attempt" -gt 1 ]; then
+            # A shard's markers carry -s<shard>; the finish job's carry -f, so only this job's own history is compared.
+            before=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --jq '.artifacts[].name' \
+              | sed -n "s/^chain-[pd]a$((attempt - 1))m[0-9]*b\([0-9]*\)${MARKER_SUFFIX}\$/\1/p" | head -1)
+            if [ -n "$before" ] && [ "$before" -ge "$saved" ]; then
+              echo "::warning::the attempt before saved $before KB and this one $saved KB: no progress, stopping the chain"
+              echo "This attempt saved no more cache than the one before it, so the chain stops instead of repeating it." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          # p: this job stopped before its work was done, so the next attempt has to continue it. d: the work is done and the marker is only a
+          # history entry, which the no-progress check reads.
+          if [ "${SHARD_DONE:-}" = 1 ]; then kind=d; else kind=p; fi
+          echo "$kind" > "$RUNNER_TEMP/chain.txt"
+          echo "marker=chain-${kind}a${attempt}m${IN_MAX_ATTEMPTS}b${saved}${MARKER_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark this run for the next attempt
+        if: ${{ steps.chain.outputs.marker != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.chain.outputs.marker }}
+          path: ${{ runner.temp }}/chain.txt
+          retention-days: 1
+
+      - name: Delete the keys
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/keys"
