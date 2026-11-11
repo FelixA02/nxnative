@@ -588,6 +588,21 @@ jobs:
           fi
           rm -rf "$build_folder/extract"
 
+      - name: Say why the app build failed
+        if: ${{ failure() && !inputs.check_only }}
+        run: |
+          # The artifact service can be unreachable; the job log is not. Keep enough
+          # of xcodebuild's own log here that a link error names the symbol it wants.
+          log=$(ls "$RUNNER_TEMP"/game/*_build/ipa/build/ios/pkg/build.log 2>/dev/null | head -1)
+          if [ -z "$log" ]; then
+            echo "no build.log: the build stopped before xcodebuild wrote one"
+            exit 0
+          fi
+          echo "----- error lines from ${log##*/game/} -----"
+          grep -nE "ld: |Undefined symbols|duplicate symbol|framework not found|library not found|error: " "$log" | tail -60 || true
+          echo "----- last 30 lines of build.log -----"
+          tail -30 "$log" || true
+
       - name: Keep the build logs
         if: ${{ failure() && !inputs.check_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
