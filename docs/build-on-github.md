@@ -82,9 +82,19 @@ A big game compiles its shaders for hours: one run of a Switch 2 game reached 16
 - **Attempts** (8 by default) caps the chain, about 38 hours of building. When it is reached the run stops with the cache saved: run the build again with the same game to continue from it.
 - The chain also stops by itself when an attempt saved no more cache than the one before it, which means the build is stuck, and it sends no further attempts.
 
-A download link often expires within hours, and a later attempt comes back to the download hours later, so the files the first attempt downloaded are kept in a release of the run (`x-input-<run number>`), encrypted with the **IPA password** and split under GitHub's 2 GiB asset limit (see it as an asset list in the run's page when a build is chained). A later attempt takes them from there and never touches the link again. The release is deleted when the build finishes or its chain gives up, and one left behind by a cancelled run is swept by the next build, a day later. Turn **Keep the download for later attempts** off to download afresh each attempt; nothing in that path can fail a build, since a stash that cannot be read is downloaded over.
+A download link often expires within hours, and a later attempt comes back to the download hours later, so the files the first attempt downloaded are kept in a release of the run (`x-input-<run number>`), encrypted with the **IPA password** and split under GitHub's 2 GiB asset limit (it sits in the repository's Releases page, tagged with the run's number, one asset per part). A later attempt takes them from there and never touches the link again. The release is deleted when the build finishes or its chain gives up, and one left behind by a cancelled run is swept by the next build, a day later. Turn **Keep the download for later attempts** off to download afresh each attempt; nothing in that path can fail a build, since a stash that cannot be read is downloaded over.
 
 The only thing to do during a chain is nothing. Leave the run alone: its summary gains a **Continuing the build** entry at each pause, and the final attempt publishes the IPA as usual. The cache release gets big (3 to 12 GB for the games built so far), which is what makes the next attempt cheap: it restores that cache and only compiles what is missing.
+
+A pause costs whatever the attempt had in flight. The cache counts a shader as reusable only once the build has finished it, and the part-finished outputs of the shader it was still working on stay in a staging area that the next build clears at its start. Two shader caches taken from a stopped two-shard build showed the size of that loss: 9,186 entries, of which 58 were finished shaders, and a resumed attempt then reported `4,963 not cached` out of 5,021. So each build now ends with three lines that say what the cache did for it:
+
+```
+Cache accounting: after the build  total=27894 index=73 shader=300 metallib=5000 stage=22500
+Cache accounting: before the build total=9186 index=58 shader=256 metallib=2537 stage=6335
+Cache accounting: added index +15 (reusable), staged +16165 (thrown away), metallib +2463, shader outputs +44, total +18708
+```
+
+`index` is the finished shaders, the only count that makes the next attempt cheaper. `staged` is work this attempt paid for and the next one deletes. A build that adds thousands to `staged` and a handful to `index` is compiling twice for the same result, however large its cache release looks.
 
 ## When a build fails
 

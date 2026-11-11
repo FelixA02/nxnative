@@ -423,6 +423,11 @@ jobs:
             if [ -f "$shader_dir/cas.db" ]; then
               entries=$(/usr/bin/sqlite3 "$shader_dir/cas.db" 'select count(*) from entry' 2>/dev/null || echo '?')
               echo "Restored cache: $cache_tag ($entries entries)"
+              # Kept for the accounting step after the build: what came back, by namespace, so what the build adds can be told apart.
+              before=$(/usr/bin/sqlite3 "$shader_dir/cas.db" "select substr(name,1,instr(name,'/')-1), count(*) from entry group by 1" 2>/dev/null \
+                | awk -F'|' '{c[$1]=$2; t+=$2} END {printf "total=%d index=%d shader=%d metallib=%d stage=%d", t, c["index"], c["shader"], c["metallib"], c["stage"]}' || true)
+              if [ -n "$before" ]; then echo "$before" > "$RUNNER_TEMP/cache_before.txt"; fi
+              echo "Cache before the build: ${before:-unknown}"
             else
               echo "Restored cache: $cache_tag, without a shader cache database (the archive holds no entries)"
             fi
@@ -549,6 +554,40 @@ jobs:
             exit 0
           fi
           exit "$rc"
+
+      - name: Report the cache accounting
+        # A build that stops early leaves the shaders it finished in the database's stage area, which the next build clears; only the entries
+        # marked in index/ come back as hits. These counts say how much of the work crossed that line, which separates a cache that is not being
+        # written from a build that simply ran out of slice.
+        if: always() && !inputs.check_only
+        run: |
+          set -u
+          cache_counts() {   # entries by the database's own namespaces
+            /usr/bin/sqlite3 "$1" "select substr(name,1,instr(name,'/')-1), count(*) from entry group by 1" 2>/dev/null \
+              | awk -F'|' '{c[$1]=$2; t+=$2} END {printf "total=%d index=%d shader=%d metallib=%d stage=%d", t, c["index"], c["shader"], c["metallib"], c["stage"]}'
+          }
+          db="${DMSH_CAS:-}"
+          if [ -z "$db" ] || [ ! -f "$db" ]; then
+            echo "Cache accounting: the build left no shader cache database at ${db:-the expected path}"
+            exit 0
+          fi
+          after=$(cache_counts "$db" || true)
+          echo "Cache accounting: after the build  ${after:-unknown}"
+          if [ -f "$RUNNER_TEMP/cache_before.txt" ]; then
+            before=$(cat "$RUNNER_TEMP/cache_before.txt")
+            echo "Cache accounting: before the build $before"
+          else
+            before=""
+            echo "Cache accounting: before the build nothing (cold start)"
+          fi
+          # The additions, split by whether they are reusable: index/ is a finished shader, stage/ is work the next build throws away.
+          awk -v b="${before:-total=0 index=0 shader=0 metallib=0 stage=0}" -v a="${after:-total=0 index=0 shader=0 metallib=0 stage=0}" 'BEGIN {
+            n = split(b, B, " "); for (i = 1; i <= n; i++) { split(B[i], kv, "="); was[kv[1]] = kv[2] }
+            n = split(a, A, " "); for (i = 1; i <= n; i++) { split(A[i], kv, "="); now[kv[1]] = kv[2] }
+            printf "Cache accounting: added index +%d (reusable), staged +%d (thrown away), metallib +%d, shader outputs +%d, total +%d\n",
+              now["index"] - was["index"], now["stage"] - was["stage"], now["metallib"] - was["metallib"],
+              now["shader"] - was["shader"], now["total"] - was["total"]
+          }'
 
       - name: Save and encrypt build cache
         if: ${{ !inputs.check_only && success() }}
@@ -1100,6 +1139,13 @@ jobs:
           fi
           rm -rf "$RUNNER_TEMP/parts"
           echo "DMSH_CAS=$build/shader/cas.db" >> "$GITHUB_ENV"
+          # Kept for the accounting step after the build: what the merge produced, so what the finish build adds can be told apart.
+          if [ -f "$build/shader/cas.db" ]; then
+            before=$(/usr/bin/sqlite3 "$build/shader/cas.db" "select substr(name,1,instr(name,'/')-1), count(*) from entry group by 1" 2>/dev/null \
+              | awk -F'|' '{c[$1]=$2; t+=$2} END {printf "total=%d index=%d shader=%d metallib=%d stage=%d", t, c["index"], c["shader"], c["metallib"], c["stage"]}' || true)
+            if [ -n "$before" ]; then echo "$before" > "$RUNNER_TEMP/cache_before.txt"; fi
+            echo "Cache before the build: ${before:-unknown}"
+          fi
           cache_tag="$base"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
       - name: Patch the shader tool as the shards did (the cache keys hash its code)
@@ -1201,6 +1247,40 @@ jobs:
             exit 0
           fi
           exit "$rc"
+
+      - name: Report the cache accounting
+        # A build that stops early leaves the shaders it finished in the database's stage area, which the next build clears; only the entries
+        # marked in index/ come back as hits. These counts say how much of the work crossed that line, which separates a cache that is not being
+        # written from a build that simply ran out of slice.
+        if: always() && !inputs.check_only
+        run: |
+          set -u
+          cache_counts() {   # entries by the database's own namespaces
+            /usr/bin/sqlite3 "$1" "select substr(name,1,instr(name,'/')-1), count(*) from entry group by 1" 2>/dev/null \
+              | awk -F'|' '{c[$1]=$2; t+=$2} END {printf "total=%d index=%d shader=%d metallib=%d stage=%d", t, c["index"], c["shader"], c["metallib"], c["stage"]}'
+          }
+          db="${DMSH_CAS:-}"
+          if [ -z "$db" ] || [ ! -f "$db" ]; then
+            echo "Cache accounting: the build left no shader cache database at ${db:-the expected path}"
+            exit 0
+          fi
+          after=$(cache_counts "$db" || true)
+          echo "Cache accounting: after the build  ${after:-unknown}"
+          if [ -f "$RUNNER_TEMP/cache_before.txt" ]; then
+            before=$(cat "$RUNNER_TEMP/cache_before.txt")
+            echo "Cache accounting: before the build $before"
+          else
+            before=""
+            echo "Cache accounting: before the build nothing (cold start)"
+          fi
+          # The additions, split by whether they are reusable: index/ is a finished shader, stage/ is work the next build throws away.
+          awk -v b="${before:-total=0 index=0 shader=0 metallib=0 stage=0}" -v a="${after:-total=0 index=0 shader=0 metallib=0 stage=0}" 'BEGIN {
+            n = split(b, B, " "); for (i = 1; i <= n; i++) { split(B[i], kv, "="); was[kv[1]] = kv[2] }
+            n = split(a, A, " "); for (i = 1; i <= n; i++) { split(A[i], kv, "="); now[kv[1]] = kv[2] }
+            printf "Cache accounting: added index +%d (reusable), staged +%d (thrown away), metallib +%d, shader outputs +%d, total +%d\n",
+              now["index"] - was["index"], now["stage"] - was["stage"], now["metallib"] - was["metallib"],
+              now["shader"] - was["shader"], now["total"] - was["total"]
+          }'
 
       - name: Save and encrypt build cache
         if: ${{ !inputs.check_only && success() }}
