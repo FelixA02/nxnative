@@ -40,9 +40,11 @@ class TitleID(unittest.TestCase):
         (d / (f'Game [{TID:016X}][v0].nsp' if not ticket else 'Game [v0].nsp')).write_bytes(pfs0(names))
         return d
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'the packages are read through nx_extract, a macOS binary')
     def test_nsps_ticket(self):
         self.assertEqual(self.run_tool(self.nsp_folder()), (0, f'{TID:016X}\n', ''))
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'the packages are read through nx_extract, a macOS binary')
     def test_nsps_name_tag_when_there_is_no_ticket(self):
         self.assertEqual(self.run_tool(self.nsp_folder(ticket=False))[:2], (0, f'{TID:016X}\n'))
 
@@ -57,6 +59,7 @@ class TitleID(unittest.TestCase):
         fixtures.write_nup(d / 'game.nup', [(0, TID, 0, fixtures.version(), b'')])
         self.assertEqual(self.run_tool(d), (0, f'{TID:016X}\n', ''))
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'the packages are read through nx_extract, a macOS binary')
     def test_only_the_answer_goes_to_standard_output(self):   # the scan's own lines must not be mistaken for the answer
         d = self.nsp_folder()
         (d / 'empty.nsp').write_bytes(b'')   # the scan says it skips this one
@@ -66,11 +69,40 @@ class TitleID(unittest.TestCase):
     def test_a_game_it_cannot_read_fails_with_the_builds_message(self):
         d = self.dir / 'nothing'; d.mkdir()
         rc, out, err = self.run_tool(d)
-        self.assertEqual((rc, out), (1, '')); self.assertIn('[RED] no NSP with a readable title ID', err)
+        self.assertEqual((rc, out), (1, '')); self.assertIn('[RED] no game package with a readable content meta', err)
 
     def test_a_title_id_of_the_wrong_shape_is_refused(self):
         rc, out, err = self.run_tool(self.nsp_folder(), '--title-id', '040074A01BF12')
         self.assertEqual((rc, out), (1, '')); self.assertIn('16 hex digits', err)
+
+class CallsIntoTheBuild(unittest.TestCase):
+    """game_title_id.py is a thin wrapper over build_ipa_from_nsp.py, so the names it calls and the arguments it passes are the build's business, not this
+    file's: a renamed or re-signatured helper is an AttributeError on the one run that needed the cache, after the download. Bind every call against the
+    real signature instead of trusting the source to have been read correctly."""
+
+    def test_every_call_matches_the_build(self):
+        import ast, inspect, build_ipa_from_nsp as build
+        src = (HERE.parent / 'game_title_id.py').read_text()
+        checked = 0
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == 'build'):
+                continue
+            name = node.func.attr
+            self.assertTrue(hasattr(build, name), f'game_title_id.py calls build.{name}, which the build does not have')
+            target = getattr(build, name)
+            if inspect.isclass(target):   # build.BuildError(...): an exception, its arguments are its own
+                continue
+            kwargs = {}
+            for k in node.keywords:
+                self.assertIsNotNone(k.arg, f'build.{name} is called with **{ast.unparse(k.value)}: cannot check it')
+                kwargs[k.arg] = None
+            try:
+                inspect.signature(target).bind(*[None] * len(node.args), **kwargs)
+            except TypeError as e:
+                self.fail(f'game_title_id.py calls build.{name}({ast.unparse(node)}), which does not fit its signature: {e}')
+            checked += 1
+        self.assertGreater(checked, 5, 'no calls were checked: the parse of game_title_id.py found none')
 
 
 if __name__ == '__main__':

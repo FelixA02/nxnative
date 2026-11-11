@@ -16,15 +16,14 @@ def title_id(path, keys=None, want=None):   # the game's title ID; raises build.
     path = Path(path).resolve()
     nup = build.nup_file(path)                     # path when it is a .nup, else the one .nup in the folder
     folder = path.parent if path.is_file() else path
-    env = dict(os.environ, PATH=os.pathsep.join(build.TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
-    build.configure_dotnet(env)
+    env = build.tool_env()                         # the same environment the build's own scan runs in
     if nup:
         app, fam = build.scan_nup(nup, want)
     elif build.dump_folder(folder):                # a Switch 2 dump, or a dump of any game: its NPDM names the program
         app, fam = build.scan_dump(folder, want)
     else:
-        with build.package_title_reader(build.find_repo(Path(__file__).resolve()), str(keys or ''), env) as from_package:
-            app, fam = build.scan_nsps(folder, from_package, from_package.contents, want)
+        with build.package_reader(build.find_repo(Path(__file__).resolve()), str(keys or ''), env) as packages:
+            app, fam = build.scan_nsps(folder, packages.contents, want)
     if fam.get('nup'): fam['nup'].close()          # the container's map, opened by scan_nup
     return f'{app:016X}'
 

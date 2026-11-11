@@ -268,7 +268,7 @@ jobs:
             echo "GAME_TITLE_ID=$tid" >> "$GITHUB_ENV"
             echo "The game's title ID: $tid"
           else
-            echo "::warning::the game's title ID could not be read: this run uses no build cache"
+            echo "::warning::the game's title ID could not be read, so this run uses no build cache; fill in the Title ID field to name the cache anyway"
           fi
 
       # After the download, so the cache's captures (extract/*/vk_capture, …) need no moving out of the way first.
