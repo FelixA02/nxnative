@@ -500,6 +500,38 @@ jobs:
               now["shader"] - was["shader"], now["total"] - was["total"]
           }'
 
+      - name: Diagnose the shader cache (temporary)
+        # Most shaders land in metallib/ and stage/ and almost none in index/, but index/ is the entry that lets the next build skip a shader
+        # outright. This names what is missing for a few shaders, beside the files the build still has on disk, so the reason is a fact in the log
+        # instead of a guess. Remove the step once that is answered.
+        if: always() && !inputs.check_only
+        continue-on-error: true
+        run: |
+          set -u
+          db="${DMSH_CAS:-}"
+          if [ -z "$db" ] || [ ! -f "$db" ]; then echo "Cache diagnosis: no cache database at ${db:-the expected path}"; exit 0; fi
+          echo "Cache diagnosis: $(du -h "$db" | cut -f1) database"
+          /usr/bin/sqlite3 "$db" "select substr(name,1,instr(name,'/')-1), count(*) from entry group by 1 order by 2 desc" | sed 's/^/  rows in /'
+          /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%.json' and name not like 'index/%/%.json'" | sed 's/^/  finished-shader marks: /'
+          /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%/mac/%'" | sed 's/^/  index rows, mac side: /'
+          /usr/bin/sqlite3 "$db" "select count(*) from entry where name like 'index/%/ios/%'" | sed 's/^/  index rows, ios side: /'
+          rep=$(ls "$RUNNER_TEMP"/game/*_build/shader/*/b-*/_b_build.json 2>/dev/null | head -1)
+          if [ -z "$rep" ]; then echo "Cache diagnosis: no _b_build.json, so no shader list to sample"; exit 0; fi
+          sh=$(dirname "$(dirname "$(dirname "$rep")")")
+          mac=$(ls -d "$sh"/cache/b-* 2>/dev/null | head -1)
+          ios=$(ls -d "$sh"/ios/b-* 2>/dev/null | head -1)
+          echo "Cache diagnosis: three shaders sampled. mark = index/<key>.json in the database, rows = index rows that name the key, the mark included"
+          echo "  disk = mac _b.json, mac _b.metal, ios _b.json, ios _b.metallib, as yes or no"
+          for key in $(python3 -c 'import json,sys; print("\n".join(x["key"] for x in json.load(open(sys.argv[1]))[:3]))' "$rep"); do
+            mark=$(/usr/bin/sqlite3 "$db" "select count(*) from entry where name='index/$key.json'")
+            rows=$(/usr/bin/sqlite3 "$db" "select count(*) from entry where instr(name,'$key')>0 and name like 'index/%'")
+            p=""
+            for f in "${mac}/${key}_b.json" "${mac}/${key}_b.metal" "${ios}/${key}_b.json" "${ios}/${key}_b.metallib"; do
+              if [ -e "$f" ]; then p="$p yes"; else p="$p no"; fi
+            done
+            echo "  $key mark=$mark rows=$rows disk=$p"
+          done
+
       - name: Save and encrypt build cache
         # Not success(): an attempt that dies after compiling shaders has that work published in cas.db, and a cache that is not saved is a cache
         # the next attempt pays for again. A cancelled run is the one case where there is nothing to save: its steps never get this far.
