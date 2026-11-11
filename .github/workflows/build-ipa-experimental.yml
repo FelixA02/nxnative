@@ -545,6 +545,17 @@ jobs:
           if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
           # The watchdog reached its minute: this attempt is a slice, not a failure. Exit 0 so the steps after it run and the cache step, which waits
           # on success(), saves the shaders compiled so far.
+          if [ "$rc" -ne 0 ] && [ -n "${SHARD_INDEX:-}" ]; then
+            prog=$(ls "$RUNNER_TEMP"/game/*_build/shader/progress.json 2>/dev/null | head -1)
+            share=0
+            if [ -n "$prog" ]; then
+              share=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(1 if d.get("total") and d.get("done") == d.get("total") else 0)' "$prog" 2>/dev/null) || share=0
+            fi
+            if [ "$share" = "1" ]; then
+              echo "::warning::this shard compiled every shader it was given; the script refused the partial library (a build that does not finish the whole map writes no stamp), so the cache is saved and the finish job makes the library from the shard caches"
+              touch "$RUNNER_TEMP/shard.done"
+            fi
+          fi
           if [ -f "$RUNNER_TEMP/shard.done" ]; then
             echo "SHARD_DONE=1" >> "$GITHUB_ENV"
             exit 0
@@ -590,7 +601,9 @@ jobs:
           }'
 
       - name: Save and encrypt build cache
-        if: ${{ !inputs.check_only && success() }}
+        # Not success(): an attempt that dies after compiling shaders has that work published in cas.db, and a cache that is not saved is a cache
+        # the next attempt pays for again. A cancelled run is the one case where there is nothing to save: its steps never get this far.
+        if: ${{ !inputs.check_only && !cancelled() }}
         id: cache-save
         continue-on-error: true
         env:
@@ -657,7 +670,7 @@ jobs:
       - name: Publish cache release
         id: cache-release
         continue-on-error: true
-        if: ${{ !inputs.check_only && success() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
+        if: ${{ !inputs.check_only && !cancelled() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1283,7 +1296,9 @@ jobs:
           }'
 
       - name: Save and encrypt build cache
-        if: ${{ !inputs.check_only && success() }}
+        # Not success(): an attempt that dies after compiling shaders has that work published in cas.db, and a cache that is not saved is a cache
+        # the next attempt pays for again. A cancelled run is the one case where there is nothing to save: its steps never get this far.
+        if: ${{ !inputs.check_only && !cancelled() }}
         id: cache-save
         continue-on-error: true
         env:
@@ -1420,7 +1435,7 @@ jobs:
       - name: Publish cache release
         id: cache-release
         continue-on-error: true
-        if: ${{ !inputs.check_only && success() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
+        if: ${{ !inputs.check_only && !cancelled() && env.CACHE_TAG != '' && env.CACHE_PARTS != '0' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

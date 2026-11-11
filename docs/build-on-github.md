@@ -96,6 +96,8 @@ Cache accounting: added index +15 (reusable), staged +16165 (thrown away), metal
 
 `index` is the finished shaders, the only count that makes the next attempt cheaper. `staged` is work this attempt paid for and the next one deletes. A build that adds thousands to `staged` and a handful to `index` is compiling twice for the same result, however large its cache release looks.
 
+A sharded build ends each shard when it has compiled its share, and a share is a partial build: a build that does not finish the whole map writes no library stamp, so the script refuses it (`no stamped Mac shader outputs … did not finish a full build`) even when the shard reached its last shader. That is the shard's normal end, not a failure. When the progress file says the share finished, the shard job reports the refusal as a warning, saves its cache, and the finish job merges the shard caches, makes the stamp from them and packs the app. A share that stops short is still a failure, and it now saves its cache as well: an attempt saves what it compiled when it fails, not only when it succeeds, because a cache left unsaved is a cache the next attempt pays for again. A cancelled run is the exception, since its steps never reach the save.
+
 ## When a build fails
 
 The run's summary and the last lines of the step that failed say why. Common ones:
