@@ -882,9 +882,12 @@ jobs:
           for f in "$RUNNER_TEMP"/parts/*/"${title_id}"_build/shader/cache/cas.db; do
             if [ -f "$f" ]; then dbs+=("$f"); fi
           done
-          if [ ${#dbs[@]} -eq 0 ]; then echo "::error::no cas.db in the shard caches"; exit 1; fi
+          # A Vulkan or GL game translates the shaders it captured at run time, so its build folder holds no NVN
+          # compile cache and there is nothing to merge. The caches restored above still carry that capture and
+          # the translated MSL, so the build below picks up where the shards stopped.
+          if [ ${#dbs[@]} -eq 0 ]; then echo "::notice::no cas.db in the shard caches: this game translates its shaders from a capture (a Vulkan or GL game), so there is nothing to merge"; fi
           # Merging the databases row by row in SQLite: a Python loop over 130,000 entries would copy gigabytes through the interpreter.
-          python3 - "$build/shader/cache/cas.db" "${dbs[@]}" <<'PY'
+          if [ ${#dbs[@]} -gt 0 ]; then python3 - "$build/shader/cache/cas.db" "${dbs[@]}" <<'PY'
           import sqlite3, sys
           sys.path.insert(0, 'dm/tools')
           import shader_cache
@@ -907,6 +910,7 @@ jobs:
           con.close()
           print(f"merged {len(srcs)} shard cache(s): {entries:,} entries, {blobs:,} blobs")
           PY
+          fi
           rm -rf "$RUNNER_TEMP/parts"
           cache_tag="$base"
           echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
