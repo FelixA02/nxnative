@@ -549,7 +549,7 @@ jobs:
             prog=$(ls "$RUNNER_TEMP"/game/*_build/shader/progress.json 2>/dev/null | head -1)
             share=0
             if [ -n "$prog" ]; then
-              share=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(1 if d.get("total") and d.get("done") == d.get("total") else 0)' "$prog" 2>/dev/null) || share=0
+              share=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(1 if d.get("step") == "compiling" and d.get("total") and d.get("done") == d.get("total") else 0)' "$prog" 2>/dev/null || echo 0)
             fi
             if [ "$share" = "1" ]; then
               echo "::warning::this shard compiled every shader it was given; the script refused the partial library (a build that does not finish the whole map writes no stamp), so the cache is saved and the finish job makes the library from the shard caches"
