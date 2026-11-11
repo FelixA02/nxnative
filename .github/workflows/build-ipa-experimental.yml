@@ -295,6 +295,10 @@ jobs:
           else
             echo "::warning::the game's title ID could not be read, so this run uses no build cache; fill in the Title ID field to name the cache anyway"
           fi
+          if [ -z "${GAME_TITLE_ID:-}" ]; then
+            echo "::error::no title ID, so a shard cannot name or publish a cache, and the finish job would have nothing to merge: fill in the Title ID field"
+            exit 1
+          fi
 
       # After the download, so the cache's captures (extract/*/vk_capture, …) need no moving out of the way first.
       - name: Restore build cache
