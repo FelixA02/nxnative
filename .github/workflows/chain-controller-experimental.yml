@@ -1,0 +1,61 @@
+# Continues a sliced experimental build (docs/build-on-github.md, "Builds longer than six hours").
+#
+# Build IPA (experimental) has three jobs: one per shard, a gate that reads the shard markers, and a finish job that packs the IPA. A shard that
+# stops at its slice exits 0 and leaves a marker artifact named chain-pa<attempt>m<cap>b<cache KB>-s<shard>; the gate sees it and the finish job
+# does not run. A finish job that runs out of slice on a cache the shards left incomplete marks itself chain-pa…-f, which is continued the same way.
+# This workflow then re-runs the whole run: every job keeps the run's commit, inputs and secrets, so a push during a 30-hour build
+# cannot move the next attempt onto other code, and the shards restore the caches they published, so their work is not repeated.
+#
+# The re-run is at the run level rather than the job level (unlike chain-controller.yml) because a shard is a matrix job and the run has three
+# jobs: re-running one of them would leave the gate and the finish job on the attempt that ended.
+#
+# It stops on its own when: no shard left a paused marker (the shares were compiled and the IPA packed, or a job failed), the cap is reached, or
+# the last attempt saved no more cache than the one before it (the build is not moving forward).
+name: Chain a sliced experimental build
+
+on:
+  workflow_run:
+    workflows: ["Build IPA (experimental)"]
+    types: [completed]
+
+permissions:
+  actions: write   # re-run the run, and read its artifacts
+  contents: read
+
+jobs:
+  next:
+    name: Continue
+    runs-on: ubuntu-latest
+    # Only a dispatched build slices, and a slice exits 0: a failed attempt has no marker to find.
+    if: ${{ github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Re-run the build when a shard stopped at its slice
+        env:
+          # GITHUB_TOKEN can re-run a run of its own repository. A token with a longer life or another owner (a fine-grained PAT in CHAIN_TOKEN,
+          # Actions: write) is used instead when the secret is set.
+          GH_TOKEN: ${{ secrets.CHAIN_TOKEN || github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # The shards read their own previous sizes, so the biggest of this attempt's paused markers is the one the no-progress check needs.
+          markers=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --paginate --jq '.artifacts[].name' \
+                    | sed -n "s/^chain-pa${ATTEMPT}m\([0-9]*\)b\([0-9]*\)\(-s[0-9]*\|-f\)$/max=\1 saved_kb=\2/p" | sort -t= -k3 -n | tail -1)
+          if [ -z "$markers" ]; then
+            echo "Attempt $ATTEMPT left no paused shard marker: every share was compiled, or a job failed or was cancelled. Nothing to continue."
+            exit 0
+          fi
+          eval "$markers"
+          saved_mb=$(( saved_kb / 1024 ))
+          if [ "$ATTEMPT" -ge "$max" ]; then
+            echo "::notice::Attempt $ATTEMPT reached the cap of $max attempts with ${saved_mb} MB of cache saved. Run Build IPA (experimental) again to continue from that cache."
+            exit 0
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun" > /dev/null
+          echo "Attempt $ATTEMPT sliced with ${saved_mb} MB of cache saved: re-ran the run (attempt $((ATTEMPT + 1)) of at most $max)."
+          {
+            echo "### Continuing the build"
+            echo
+            echo "Attempt $ATTEMPT of at most $max stopped at its slice with ${saved_mb} MB of shader cache saved."
+            echo "The run was re-run from the same commit and the same inputs: attempt $((ATTEMPT + 1)) continues from the shard caches."
+          } >> "$GITHUB_STEP_SUMMARY"

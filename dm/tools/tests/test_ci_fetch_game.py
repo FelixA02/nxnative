@@ -1,0 +1,330 @@
+"""The game download of the build on GitHub's Mac (dm/tools/ci_fetch_game.py): names from the server and the URL, file kinds from their headers, archives unpacked (nested, folders
+flattened, junk dropped, names kept unique), links masked and never printed, a download that breaks off resumed. A local HTTP server stands in for the file host; no game files,
+keys or network needed (temporary files only in a temporary folder)."""
+import contextlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import ci_fetch_game as ci   # noqa: E402
+
+BASE, UPDATE = 'Game [0100000000010000][v0]', 'Game [0100000000010800][v65536]'
+
+
+def pfs0(names, pad=4096):   # a PFS0 (an NSP's container) with these entry names
+    strs = b''.join(n.encode() + b'\0' for n in names)
+    ent = b''.join(struct.pack('<QQII', 0, 0, sum(len(m.encode()) + 1 for m in names[:i]), 0) for i in range(len(names)))
+    return b'PFS0' + struct.pack('<III', len(names), len(strs), 0) + ent + strs + b'\0' * pad
+
+
+def xci():
+    return b'\0' * 0x100 + b'HEAD' + b'\0' * 4096
+
+
+def nup():   # a NUP container (https://github.com/a55uka/nup, SPEC v1): the fetcher reads its magic; pack_nup.py checks the rest
+    return b'NUP\x01' + b'\0' * 0x2000
+
+
+def zipped(members):   # {name: bytes} → a .zip's bytes
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, 'w', zipfile.ZIP_DEFLATED) as z:
+        for n, data in members.items(): z.writestr(n, data)
+    return b.getvalue()
+
+
+def dump_files(wrap='', others=25, update=True, dlc=True):   # a console dump's layout (Donkey Kong Bananza): paths only matter, the bytes are not an NPDM
+    f = {f'{wrap}base/exefs/main.npdm': b'META', f'{wrap}base/exefs/main': b'MAIN', f'{wrap}base/exefs/sdk': b'SDK', f'{wrap}base/romfs/Phive': b'phive'}
+    f.update({f'{wrap}base/romfs/System/Resource/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 40 for i in range(others)})
+    if update: f.update({f'{wrap}updates/458752/exefs/main.npdm': b'META', f'{wrap}updates/458752/exefs/main': b'MAIN2', f'{wrap}updates/458752/romfs/a.zs': b'\x28\xb5\x2f\xfdz'})
+    if dlc: f[f'{wrap}dlc/040074a01bf13001/0/romfs/Dlc.bin'] = b'dlc'
+    return f
+
+
+class Names(unittest.TestCase):
+    def test_served_name(self):
+        self.assertEqual(ci.served_name(f'attachment; filename="{BASE}.nsp"', 'https://h/x?id=1'), f'{BASE}.nsp')
+        self.assertEqual(ci.served_name("attachment; filename*=UTF-8''Game%20%5Bv0%5D.nsp", 'https://h/x'), 'Game [v0].nsp')   # RFC 5987
+        self.assertEqual(ci.served_name('attachment; filename="../../etc/x.zip"', 'https://h/x'), 'x.zip')   # no folders
+        self.assertEqual(ci.served_name('attachment; filename="C:\\dl\\x.7z"', 'https://h/x'), 'x.7z')
+        self.assertEqual(ci.served_name('', 'https://h/files/Game%20%5Bv0%5D.NSP'), 'Game [v0].NSP')   # the URL's, with a game extension
+        self.assertEqual(ci.served_name('', 'https://h/d/AbC123secret'), '')   # a segment without one may be the link's secret: not taken, so never printed
+        self.assertEqual(ci.served_name('', 'https://h/'), '')
+
+    def test_game_name(self):
+        with tempfile.TemporaryDirectory() as t:
+            nsp, nsz, x = Path(t, 'a'), Path(t, 'b'), Path(t, 'c')
+            nsp.write_bytes(pfs0(['0100000000010000000000000000000a.tik', 'x.nca'])); nsz.write_bytes(pfs0(['x.ncz'])); x.write_bytes(xci())
+            self.assertEqual(ci.sniff(nsp), 'pfs0'); self.assertEqual(ci.sniff(x), 'xci')
+            self.assertEqual(ci.game_name(nsp, f'{BASE}.NSP', 'pfs0'), f'{BASE}.nsp')   # the NSP script looks for lower-case extensions
+            self.assertEqual(ci.game_name(nsp, 'download', 'pfs0'), 'download.nsp')
+            self.assertEqual(ci.game_name(nsz, 'download', 'pfs0'), 'download.nsz')   # .ncz entries: compressed
+            self.assertEqual(ci.game_name(nsz, 'g.nsz', 'pfs0'), 'g.nsz')
+            self.assertEqual(ci.game_name(x, '', 'xci'), 'game.xci')
+            self.assertEqual(ci.game_name(x, 'g.XCZ', 'xci'), 'g.xcz')
+            u = Path(t, 'd'); u.write_bytes(nup())
+            self.assertEqual(ci.sniff(u), 'nup')
+            self.assertEqual(ci.game_name(u, 'Age of Imprisonment.NUP', 'nup'), 'Age of Imprisonment.nup')   # the NSP script scans for *.nup
+            self.assertEqual(ci.game_name(u, 'download', 'nup'), 'download.nup')
+
+    def test_command_value(self):   # what the runner unescapes back to the link
+        self.assertEqual(ci.command_value('https://h/a%20b?c=1\n'), 'https://h/a%2520b?c=1%0A')
+
+
+class VersionTag(unittest.TestCase):
+    def test_round_brackets_get_the_square_ones(self):   # the real update of run 30
+        n = 'Pokemon Violet (World) (En,Ja,Fr,De,Es,It,Zh-Hant,Zh-Hans,Ko) (v786432) (v4.0.0) (Update) [01008F6008C5E000].nsp'
+        self.assertEqual(ci.version_tagged(n), n[:-4] + ' [v786432].nsp')
+        self.assertEqual(ci.version_tagged('Game (v65536).NSZ'), 'Game (v65536) [v65536].NSZ')
+
+    def test_other_names_stay(self):
+        for n in ('Game [0100000000010800][v65536].nsp',          # already tagged
+                  'Game (v65536) [v65536].nsp',                    # already tagged, both ways
+                  'Game (v4.0.0) (Update).nsp',                    # a display version, not a number
+                  'Game (Rev 4).xci', 'Game (v65536).xci',         # cartridge dumps are not updates
+                  'Game.nsp'):
+            self.assertEqual(ci.version_tagged(n), n, n)
+
+
+class Take(unittest.TestCase):
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
+        self.out, self.work = self.t / 'nsp', self.t / 'work'; self.out.mkdir(); self.work.mkdir()
+
+    def take(self, data, name):
+        p = self.work / 'download'; p.write_bytes(data)
+        with contextlib.redirect_stdout(io.StringIO()): return ci.take(p, name, self.out, self.work)
+
+    def test_archive_flattened_nested_and_junk_dropped(self):
+        inner = zipped({f'{UPDATE}.nsp': pfs0(['u.nca'])})
+        got = self.take(zipped({f'Game/Base/{BASE}.NSP': pfs0(['b.nca']), f'Other/{BASE}.NSP': pfs0(['c.nca']), 'Game/readme.txt': b'hello', 'Game/update.zip': inner}), 'game.zip')
+        self.assertEqual(sorted(p.name for p in got), sorted([f'{BASE}.nsp', f'{BASE} (2).nsp', f'{UPDATE}.nsp']))
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), sorted(p.name for p in got))   # the folder's top level, where the NSP script reads
+        self.assertEqual(list(self.work.iterdir()), [])   # archives and unpacked folders gone: the runner's disk is short
+
+    def test_game_file_as_is(self):
+        got = self.take(pfs0(['x.nca']), f'{BASE}.nsp')
+        self.assertEqual([p.name for p in got], [f'{BASE}.nsp'])
+
+    def test_a_nup_is_a_game_file_and_is_not_unpacked(self):   # a Switch 2 game in one container: the NSP script reads it itself
+        data = nup()
+        got = self.take(data, 'Hyrule Warriors Age of Imprisonment.nup')
+        self.assertEqual([p.name for p in got], ['Hyrule Warriors Age of Imprisonment.nup'])
+        self.assertEqual(got[0].read_bytes(), data)   # as it came
+        self.assertEqual([p.name for p in self.work.iterdir()], [])   # nothing unpacked: the file was moved, not unpacked beside a copy
+
+    def test_a_nup_without_an_extension_gets_one(self):
+        got = self.take(nup(), 'the-download')
+        self.assertEqual([p.name for p in got], ['the-download.nup'])
+
+    def test_a_nup_in_an_archive(self):
+        ci.SKIPPED['n'] = 0
+        got = self.take(zipped({'Game/Age of Imprisonment.nup': nup(), 'Game/readme.txt': b'x'}), 'game.zip')
+        self.assertEqual([p.name for p in got], ['Age of Imprisonment.nup'])
+        self.assertEqual(ci.SKIPPED['n'], 1)   # the readme
+        self.assertEqual([p.name for p in self.work.iterdir()], [])   # the archive and its unpacked folder are gone
+
+    def test_extracted_game_folder_is_refused_before_unpacking(self):   # run 38: tens of thousands of files, none a game file
+        z = zipped({f'romfs/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 50 for i in range(30)} | {'romfs/Phive': b'x'})
+        with self.assertRaisesRegex(ci.Fail, r'holds 31 files and none is an NSP.*extracted game folder'):
+            self.take(z, 'game.zip')
+        self.assertEqual([p.name for p in self.work.iterdir()], ['download'])   # nothing was unpacked
+
+    def test_a_game_file_among_many_others_is_taken_and_the_others_left_out(self):
+        files = {f'romfs/World_{i}.bphsc.zs': b'\x28\xb5\x2f\xfd' + b'x' * 50 for i in range(30)}
+        files[f'{BASE}.nsp'] = pfs0(['x.nca'])
+        p = self.work / 'download'; p.write_bytes(zipped(files)); out = io.StringIO()
+        ci.SKIPPED['n'] = 0
+        with contextlib.redirect_stdout(out): got = ci.take(p, 'game.zip', self.out, self.work)
+        self.assertEqual([g.name for g in got], [f'{BASE}.nsp'])
+        self.assertEqual(ci.SKIPPED['n'], 30)
+        self.assertNotIn('.zs', out.getvalue())   # the .zs files (zstd streams) were not unpacked one by one, nor listed
+
+    def test_a_small_archive_without_game_extensions_is_still_unpacked(self):   # a renamed dump
+        got = self.take(zipped({'dump': pfs0(['x.nca'])}), 'game.zip')
+        self.assertEqual([g.name for g in got], ['dump.nsp'])
+
+    def test_unreadable_files_and_folders_are_opened_up(self):
+        d = self.t / 'tree'; (d / 'sub').mkdir(parents=True)
+        (d / 'sub' / 'Phive').write_bytes(b'x'); (d / 'sub' / 'Phive').chmod(0o000); (d / 'sub').chmod(0o000)
+        ci.readable(d)
+        self.assertEqual((d / 'sub').stat().st_mode & 0o700, 0o700)
+        self.assertEqual((d / 'sub' / 'Phive').stat().st_mode & 0o600, 0o600)
+
+    def tree(self):   # every file under the NSP folder, relative
+        return sorted(str(p.relative_to(self.out)) for p in self.out.rglob('*') if p.is_file())
+
+    def test_dump_in_a_wrapper_folder_goes_into_the_nsp_folder_as_it_is(self):
+        got = self.take(zipped(dump_files('Donkey Kong Bananza/')), 'bananza.zip')
+        self.assertEqual(sorted(p.name for p in got), ['base', 'dlc', 'updates'])
+        self.assertTrue(all(p.is_dir() for p in got))
+        self.assertIn('base/exefs/main.npdm', self.tree()); self.assertIn('updates/458752/exefs/main', self.tree()); self.assertIn('dlc/040074a01bf13001/0/romfs/Dlc.bin', self.tree())
+        self.assertEqual(len(self.tree()), 33)   # base: 3 exefs files + Phive + 25 .zs = 29; the update: 3 files; the DLC: 1
+        self.assertEqual(list(self.work.iterdir()), [])   # the archive and its unpacked folder are gone
+
+    def test_dump_without_a_wrapper_folder(self):
+        got = self.take(zipped(dump_files('', update=False, dlc=False)), 'b.zip')
+        self.assertEqual(sorted(p.name for p in got), ['base'])
+
+    def test_base_and_update_in_separate_archives_merge(self):
+        self.take(zipped(dump_files('G/', update=False, dlc=False)), 'base.zip')
+        got = self.take(zipped({'G/updates/458752/exefs/main.npdm': b'META', 'G/updates/458752/exefs/main': b'M', 'G/updates/458752/romfs/a.bin': b'a'}), 'update.zip')
+        self.assertEqual([p.name for p in got], ['updates'])
+        self.assertTrue(any(f.startswith('base/') for f in self.tree()) and any(f.startswith('updates/458752/romfs/') for f in self.tree()))
+
+    def test_two_archives_with_the_same_file_are_refused(self):
+        self.take(zipped(dump_files('', update=False, dlc=False)), 'one.zip')
+        with self.assertRaisesRegex(ci.Fail, 'in two of the downloads'): self.take(zipped(dump_files('', update=False, dlc=False)), 'two.zip')
+
+    def test_many_files_without_a_dump_layout_are_still_refused(self):
+        with self.assertRaisesRegex(ci.Fail, 'extracted game folder'): self.take(zipped({f'romfs/{i}.bin': b'x' for i in range(30)}), 'junk.zip')
+
+    def test_dump_roots_and_size(self):
+        d = self.t / 'x'; (d / 'a/b/base/exefs').mkdir(parents=True); (d / 'a/b/base/exefs/main.npdm').write_bytes(b'12345'); (d / 'a/b/base/romfs').mkdir()
+        (d / 'other').mkdir(); (d / 'other/file').write_bytes(b'z')
+        self.assertEqual(ci.dump_roots(d), [d / 'a/b']); self.assertEqual(ci.size_of(d / 'a/b'), 5)
+        self.assertEqual(ci.dump_roots(self.t / 'work'), [])
+
+    def test_web_page_fails(self):
+        with self.assertRaisesRegex(ci.Fail, 'web page'): self.take(b'<!DOCTYPE html><html><body>Download</body></html>', '')
+
+    def test_web_page_in_an_archive_is_dropped(self):
+        got = self.take(zipped({'index.html': b'<html></html>', f'{BASE}.nsp': pfs0(['x.nca'])}), 'g.zip')
+        self.assertEqual([p.name for p in got], [f'{BASE}.nsp'])
+
+    def test_nothing_usable(self):
+        self.assertEqual(self.take(b'just text', 'notes.txt'), [])
+
+
+class Host(BaseHTTPRequestHandler):
+    """Serves the server's routes: {path: (body, headers, breaks once)}; a range request gets the rest (206). A route that breaks sends half its body and closes, once"""
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        if path not in self.server.routes: self.send_error(404); return   # type: ignore[attr-defined]
+        body, headers, breaks = self.server.routes[path]   # type: ignore[attr-defined]
+        m = re.match(r'bytes=(\d+)-', self.headers.get('Range', '')); start = int(m.group(1)) if m else 0
+        self.server.ranges.append(start)   # type: ignore[attr-defined]
+        self.send_response(206 if m else 200)
+        if m: self.send_header('Content-Range', f'bytes {start}-{len(body) - 1}/{len(body)}')
+        for k, v in headers.items(): self.send_header(k, v)
+        self.send_header('Content-Length', str(len(body) - start)); self.end_headers()
+        if breaks and path not in self.server.broke:   # type: ignore[attr-defined]
+            self.server.broke.add(path); self.wfile.write(body[start:len(body) // 2]); self.wfile.flush(); self.close_connection = True; return   # type: ignore[attr-defined]
+        self.wfile.write(body[start:])
+
+    def log_message(self, format, *args): pass   # noqa: A002
+
+
+class Main(unittest.TestCase):
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
+        self.srv = ThreadingHTTPServer(('127.0.0.1', 0), Host); self.srv.routes, self.srv.broke, self.srv.ranges = {}, set(), []   # type: ignore[attr-defined]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start(); self.addCleanup(self.srv.server_close); self.addCleanup(self.srv.shutdown)
+        self.base = f'http://127.0.0.1:{self.srv.server_address[1]}'
+        env = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'github_event_path', 'game_link', 'github_step_summary')}
+        p = mock.patch.dict(os.environ, env, clear=True); p.start(); self.addCleanup(p.stop)
+
+    def run_main(self, *links):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(ci.time, 'sleep'): rc = ci.main(['--out', str(self.t / 'nsp'), '--work', str(self.t / 'work'), *links])
+        return rc, out.getvalue()
+
+    def test_link_masked_and_never_printed(self):
+        data = pfs0(['x.nca'], pad=200_000)
+        self.srv.routes['/dl/secret%20token'] = (data, {'Content-Disposition': "attachment; filename*=UTF-8''Game%20%5B0100000000010000%5D%5Bv0%5D.nsp"}, False)   # type: ignore[attr-defined]
+        link = f'{self.base}/dl/secret%20token?key=s3cret'
+        rc, text = self.run_main(link)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual((self.t / 'nsp' / f'{BASE}.nsp').read_bytes(), data)
+        lines = text.splitlines()
+        self.assertIn(f'::add-mask::{link.replace("%", "%25")}', lines)
+        self.assertIn('::add-mask::127.0.0.1', lines)
+        for ln in lines:
+            if not ln.startswith('::add-mask::'): self.assertNotRegex(ln, 'secret|s3cret|127\\.0\\.0\\.1', ln)
+
+    def test_broken_download_resumes(self):
+        data = zipped({f'Folder/{BASE}.nsp': pfs0(['x.nca'], pad=300_000)})
+        self.srv.routes['/g.zip'] = (data, {}, True)   # type: ignore[attr-defined]
+        rc, text = self.run_main(f'{self.base}/g.zip')
+        self.assertEqual(rc, 0, text)
+        self.assertIn('broke off', text)
+        self.assertEqual(self.srv.ranges[0], 0); self.assertGreater(self.srv.ranges[-1], 0)   # type: ignore[attr-defined]  # the second request went on where the first stopped
+        self.assertEqual([p.name for p in (self.t / 'nsp').iterdir()], [f'{BASE}.nsp'])
+
+    def test_refused_link(self):
+        rc, text = self.run_main(f'{self.base}/gone.nsp')
+        self.assertEqual(rc, 1); self.assertIn('::error::downloading the link failed: curl exit 22', text)
+        self.assertNotIn('gone.nsp', text.replace(f'::add-mask::{self.base}/gone.nsp', ''))
+
+    def test_dead_host_fails_at_once(self):   # nothing came: no tries of our own on top of curl's
+        import socket
+        s = socket.socket(); s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]; s.close()
+        with mock.patch.object(ci.time, 'sleep') as slept:
+            rc, text = self.run_main(f'http://127.0.0.1:{port}/g.nsp')
+        self.assertEqual(rc, 1); self.assertIn('curl exit 7', text); self.assertNotIn('broke off', text); slept.assert_not_called()
+
+    def test_update_named_with_round_brackets_is_tagged_in_the_folder(self):
+        self.srv.routes['/u'] = (pfs0(['u.nca']), {'Content-Disposition': 'attachment; filename="Game (v786432) (v4.0.0) (Update).nsp"'}, False)   # type: ignore[attr-defined]
+        self.srv.routes['/b'] = (pfs0(['b.nca']), {'Content-Disposition': 'attachment; filename="Game [v0].nsp"'}, False)   # type: ignore[attr-defined]
+        rc, text = self.run_main(f'{self.base}/u', f'{self.base}/b')
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['Game (v786432) (v4.0.0) (Update) [v786432].nsp', 'Game [v0].nsp'])
+        self.assertIn('tagged Game (v786432) (v4.0.0) (Update).nsp with its version', text)
+
+    def test_dump_download_with_a_title_id_set_keeps_its_folders_unrenamed(self):   # the Title ID field is for cartridge dumps (.xci); it must not touch a dump's folders
+        self.srv.routes['/d.zip'] = (zipped(dump_files('Donkey Kong Bananza/')), {}, False)   # type: ignore[attr-defined]
+        with mock.patch.dict(os.environ, {'IN_TITLE_ID': '040074A01BF12000'}): rc, text = self.run_main(f'{self.base}/d.zip')
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), ['base', 'dlc', 'updates'])
+        self.assertIn('3 game folders', text); self.assertIn('a game dump: base, dlc, updates', text)
+
+    def test_nup_download_is_a_game_file_and_a_title_id_does_not_rename_it(self):   # a NUP carries its own program ID; the Title ID field is for cartridge dumps
+        data = nup(); self.srv.routes['/n'] = (data, {}, False)   # type: ignore[attr-defined]
+        with mock.patch.dict(os.environ, {'IN_TITLE_ID': '04003F40232DE000'}): rc, text = self.run_main(f'{self.base}/n')
+        self.assertEqual(rc, 0, text)
+        got = list((self.t / 'nsp').iterdir())
+        self.assertEqual(len(got), 1)                       # placed, not unpacked
+        self.assertEqual(got[0].suffix, '.nup')             # what build_ipa_from_nsp.py's nup_file scans for
+        self.assertEqual(got[0].read_bytes(), data)
+        self.assertNotIn('04003F40232DE000', got[0].name)
+        self.assertIn('1 game file', text); self.assertNotIn('tagged', text)
+
+    def test_several_links(self):
+        path = '/' + BASE.replace(' ', '%20').replace('[', '%5B').replace(']', '%5D') + '.nsp'   # the name only in the URL: taken for its game extension
+        self.srv.routes[path] = (pfs0(['b.nca']), {}, False)   # type: ignore[attr-defined]
+        self.srv.routes['/u'] = (pfs0(['u.nca']), {'Content-Disposition': f'attachment; filename="{UPDATE}.nsp"'}, False)   # type: ignore[attr-defined]
+        rc, text = self.run_main(self.base + path, f'{self.base}/u')
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sorted(p.name for p in (self.t / 'nsp').iterdir()), [f'{BASE}.nsp', f'{UPDATE}.nsp'])
+
+    def test_not_http(self):
+        rc, text = self.run_main('file:///etc/passwd')
+        self.assertEqual(rc, 1); self.assertIn('is not an http:// or https:// link', text)
+        self.assertNotIn('passwd', text.replace('::add-mask::file:///etc/passwd', ''))
+
+    def test_no_link(self):
+        rc, text = self.run_main()
+        self.assertEqual(rc, 1); self.assertIn('::error::no link', text)
+
+    def test_links_from_the_run_then_the_secret(self):
+        ev = self.t / 'event.json'; ev.write_text(json.dumps({'inputs': {'link': ' https://a/1.nsp\nhttps://a/2.nsp '}}))
+        with mock.patch.dict(os.environ, {'GITHUB_EVENT_PATH': str(ev), 'GAME_LINK': 'https://s/x.zip'}):
+            self.assertEqual(ci.given_links([]), ['https://a/1.nsp', 'https://a/2.nsp'])
+            ev.write_text(json.dumps({'inputs': {'link': ''}}))
+            self.assertEqual(ci.given_links([]), ['https://s/x.zip'])
+            self.assertEqual(ci.given_links(['https://c/y.nsp']), ['https://c/y.nsp'])
+
+
+if __name__ == '__main__':
+    unittest.main()
