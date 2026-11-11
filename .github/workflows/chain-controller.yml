@@ -1,0 +1,67 @@
+# Continues a build that is too long for one job (docs/build-on-github.md, "Builds longer than six hours").
+#
+# Build IPA stops itself at its `slice` minute (285 by default) and saves the shader cache, then leaves a marker artifact named
+# chain-a<attempt>m<cap>b<cache KB>. This workflow runs whenever a Build IPA run completes; when the attempt that just ended left a marker and
+# is under its cap, it re-runs the build job.
+#
+# A re-run is what makes this safe to leave alone: it keeps the run's commit, its inputs and its secrets, so pushing to the branch during a
+# 30-hour build cannot move the next attempt onto other code, and nothing has to be re-typed or passed along. run_attempt counts the attempts
+# by itself, so the cap costs no bookkeeping either. The next attempt restores the cache release, so the shaders the last one compiled are
+# already done (dm/gfx/tools/dmsh_build.py translates and compiles only what the cache does not hold).
+#
+# It stops on its own when: an attempt finishes the build (no marker), an attempt fails or is cancelled (no marker), the cap is reached, the
+# attempt saved no cache, or an attempt saved no more cache than the one before it (the build is not moving forward).
+name: Chain a sliced build
+
+on:
+  workflow_run:
+    workflows: ["Build IPA"]
+    types: [completed]
+
+permissions:
+  actions: write   # re-run the job, and read this run's artifacts
+  contents: read
+
+jobs:
+  next:
+    name: Continue
+    runs-on: ubuntu-latest
+    # Only a dispatched build slices, and a slice exits 0: a failed attempt has no marker to find.
+    if: ${{ github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Re-run the build job when this attempt stopped at its slice
+        env:
+          # GITHUB_TOKEN can re-run a job of its own repository. A token with a longer life or another owner (a fine-grained PAT in CHAIN_TOKEN,
+          # Actions: write) is used instead when the secret is set.
+          GH_TOKEN: ${{ secrets.CHAIN_TOKEN || github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          marker=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --jq '.artifacts[].name' \
+                   | sed -n "s/^chain-a${ATTEMPT}m\([0-9]*\)b\([0-9]*\)$/max=\1 saved_kb=\2/p" | head -1)
+          if [ -z "$marker" ]; then
+            echo "Attempt $ATTEMPT left no marker: the build finished, or it failed or was cancelled. Nothing to continue."
+            exit 0
+          fi
+          eval "$marker"
+          saved_mb=$(( saved_kb / 1024 ))
+          if [ "$ATTEMPT" -ge "$max" ]; then
+            echo "::notice::Attempt $ATTEMPT reached the cap of $max attempts with ${saved_mb} MB of cache saved. Run Build IPA again to continue from that cache."
+            exit 0
+          fi
+          job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
+                --jq ".jobs[] | select(.name == \"Build the IPA\" and .run_attempt == $ATTEMPT) | .id" | head -1)
+          if [ -z "$job" ]; then
+            echo "::error::No build job found for attempt $ATTEMPT of run $RUN_ID, so the chain cannot continue."
+            exit 1
+          fi
+          # The re-run starts from the same commit, with the same inputs, as attempt $ATTEMPT: this is the whole point of not dispatching a new run.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/jobs/$job/rerun" > /dev/null
+          echo "Attempt $ATTEMPT sliced with ${saved_mb} MB of cache saved: re-ran job $job (attempt $((ATTEMPT + 1)) of at most $max)."
+          {
+            echo "### Continuing the build"
+            echo
+            echo "Attempt $ATTEMPT of at most $max stopped at its slice with ${saved_mb} MB of shader cache saved."
+            echo "The build job was re-run from the same commit and the same inputs: attempt $((ATTEMPT + 1)) continues from that cache."
+          } >> "$GITHUB_STEP_SUMMARY"

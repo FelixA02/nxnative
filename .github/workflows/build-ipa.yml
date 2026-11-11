@@ -50,9 +50,18 @@ on:
         description: 'Publish as a GitHub Release asset instead of a run artifact (no 1-day expiry, faster downloads; needs contents: write). Either way an archive over 2 GiB is split into parts automatically'
         type: boolean
         default: false
+      slice:
+        description: 'Long builds: stop after this many minutes of building, save the shader cache, and continue in the next attempt of this run (the chain controller does that). 0 = never slice, the job runs until GitHub''s 6-hour cap and saves nothing. A big game needs about 30 hours, so the default slices it into about 7'
+        type: number
+        default: 285
+      max_attempts:
+        description: 'Slicing: how many attempts of this run may follow, the first run counted. 285 minutes each is about 38 hours, enough for the biggest games; the chain also stops on its own when an attempt saves no more cache than the one before'
+        type: number
+        default: 8
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
+  actions: write    # upload the artifacts, and read this run's artifacts to see whether the previous attempt made progress
 
 defaults:
   run:
@@ -63,7 +72,7 @@ jobs:
   build:
     name: Build the IPA
     runs-on: xcode-27   # GitHub's Apple-silicon image; Xcode 27.2 provides the Metal compiler in dmsh_chain.lock (macos-26 defaults to Xcode 26.x, Metal .883, which the build refuses)
-    timeout-minutes: 360   # GitHub's limit for a job
+    timeout-minutes: 355   # GitHub's cap is 360: the last minutes are for saving the cache and the slice marker, which a hard kill would lose
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer   # pin the exact tested Xcode by path, as upstream CI does, so a new default on the image can't change it
       HOMEBREW_NO_AUTO_UPDATE: 1
@@ -304,6 +313,7 @@ jobs:
           IN_SHOW_FPS: ${{ inputs.show_fps }}
           IN_TITLE_ID: ${{ inputs.title_id }}
           IN_ROMFS: ${{ inputs.romfs }}
+          IN_SLICE: ${{ inputs.slice }}
         run: |
           keys="$RUNNER_TEMP/keys/prod.keys"
           mkdir -p "$RUNNER_TEMP/keys" && chmod 700 "$RUNNER_TEMP/keys"
@@ -324,11 +334,33 @@ jobs:
           # the lowest free disk space during the build, for the summary: a build that ran out of space shows by how much
           ( while :; do df -k "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; sleep 15; done ) > "$RUNNER_TEMP/free.log" & sampler=$!
           rc=0
-          python scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$keys" "${args[@]}" || rc=$?
+          # Slicing: stop before GitHub's 6-hour job cap, so the cache step saves what this attempt compiled and the chain controller runs the next
+          # attempt. `trap - INT; exec` matters: a backgrounded command in a non-interactive shell starts with SIGINT ignored, so without this the
+          # watchdog's SIGINT would do nothing and the job would run to the cap. SIGINT rather than SIGTERM so the script finishes its shader and
+          # closes cas.db instead of being killed with a write in flight.
+          slice="${IN_SLICE:-0}"
+          case "$slice" in ''|*[!0-9]*) slice=0 ;; esac
+          ( trap - INT; exec python scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$keys" "${args[@]}" ) &
+          build_pid=$!
+          watchdog=""
+          if [ "$slice" -gt 0 ]; then
+            # SIGINT, then five minutes to finish the shader in flight and close the database, then SIGTERM: a script that ignores the interrupt
+            # must not turn into a job that runs to the cap anyway.
+            ( sleep $((slice * 60)); touch "$RUNNER_TEMP/slice.hit"; echo "::notice::${slice} minutes of building: stopping here so the shader cache is saved and the next attempt continues"; kill -INT "$build_pid" 2>/dev/null; sleep 300; kill -TERM "$build_pid" 2>/dev/null ) &
+            watchdog=$!
+          fi
+          wait "$build_pid" || rc=$?
+          if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; fi
           kill "$sampler" || true
           rm -f "$keys"
           low=$(awk 'NR == 1 || $1 < m { m = $1 } END { if (NR) printf "%.1f", m / 1048576 }' "$RUNNER_TEMP/free.log")
           if [ -n "$low" ]; then echo "lowest free disk space during the build: $low GB"; echo "LOW_FREE=$low" >> "$GITHUB_ENV"; fi
+          # The watchdog reached its minute: this attempt is a slice, not a failure. Exit 0 so the steps after it run and the cache step, which waits
+          # on success(), saves the shaders compiled so far.
+          if [ -f "$RUNNER_TEMP/slice.hit" ]; then
+            echo "SLICE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
           exit "$rc"
 
       - name: Save and encrypt build cache
@@ -390,7 +422,7 @@ jobs:
           retention-days: 7
 
       - name: Encrypt the IPA
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && env.SLICE != '1' }}
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
           IN_RELEASE: ${{ inputs.publish_release }}
@@ -444,7 +476,7 @@ jobs:
       - name: Publish a GitHub Release
         id: release
         continue-on-error: true
-        if: ${{ inputs.publish_release && !inputs.check_only }}
+        if: ${{ inputs.publish_release && !inputs.check_only && env.SLICE != '1' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -536,7 +568,7 @@ jobs:
       #   one file again ... the parts joined into one .7z (they are plain pieces of it: cat gives the archive back), uploaded as it is
       - name: Upload the encrypted IPA
         id: upload
-        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
+        if: ${{ !inputs.check_only && env.SLICE != '1' && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ env.UPLOAD_PATH }}   # the .7z
@@ -547,7 +579,7 @@ jobs:
       - name: Upload the encrypted parts
         id: parts
         continue-on-error: true
-        if: ${{ !inputs.check_only && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
+        if: ${{ !inputs.check_only && env.SLICE != '1' && (!inputs.publish_release || steps.release.outcome == 'failure') && env.SPLIT == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nxnative-${{ github.run_id }}
@@ -587,9 +619,16 @@ jobs:
           RELEASE_FAILED: ${{ steps.release.outcome == 'failure' }}
           RELEASE_URL: ${{ env.RELEASE_URL }}
           GAME_IPA: ${{ env.GAME_IPA }}
+          IN_SLICE: ${{ inputs.slice }}
+          IN_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         run: |
           {
-            if [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
+            if [ "${SLICE:-}" = 1 ]; then
+              echo "### This attempt stopped at its ${IN_SLICE}-minute slice"
+              echo
+              echo "It compiled what it could and saved the shader cache. The chain controller starts the next attempt of this run from that cache, so the work already done is not repeated. Attempt ${GITHUB_RUN_ATTEMPT}, of at most ${IN_MAX_ATTEMPTS}."
+              echo "There is no IPA yet: it comes from the attempt that finishes the shaders."
+            elif [ "$OUTCOME" = success ] && [ -n "$RELEASE_URL" ]; then
               echo "### Your IPA"
               echo
               echo "[$(basename "$ARCHIVE")]($RELEASE_URL). Open it with 7-Zip and your IPA_PASSWORD: the IPA inside is the one to sideload."
@@ -624,6 +663,46 @@ jobs:
             fi
             if [ -n "${LOW_FREE:-}" ]; then echo "Lowest free disk space during the build: $LOW_FREE GB."; fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide whether the next attempt continues this build
+        id: chain
+        if: ${{ !inputs.check_only && !cancelled() && env.SLICE == '1' && steps.cache-save.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        run: |
+          # The marker's name carries this attempt's number, the cap and how much cache it saved, so the controller needs nothing else. The previous
+          # attempt's marker is in the same run's artifacts: if this attempt saved no more than that one did, the build is spinning, and a chain that
+          # spins would burn hours to learn nothing.
+          saved=$(du -sk "$RUNNER_TEMP"/cache/* 2>/dev/null | awk '{s += $1} END {print s + 0}')
+          saved=${saved:-0}
+          attempt="$GITHUB_RUN_ATTEMPT"
+          if [ "$saved" -eq 0 ]; then
+            echo "::warning::this attempt saved no cache, so the next attempt would start from nothing: stopping the chain"
+            echo "No cache was saved, so this run stops here instead of repeating the same work." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$attempt" -gt 1 ]; then
+            before=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+              | python3 -c 'import json,sys;print(" ".join(a["name"] for a in json.load(sys.stdin).get("artifacts",[])))' \
+              | tr ' ' '\n' | sed -n "s/^chain-a$((attempt - 1))m[0-9]*b\([0-9]*\)$/\1/p" | head -1)
+            if [ -n "$before" ] && [ "$before" -ge "$saved" ]; then
+              echo "::warning::the attempt before saved $before KB and this one $saved KB: no progress, stopping the chain"
+              echo "This attempt saved no more cache than the one before it, so the chain stops instead of repeating it." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo "slice" > "$RUNNER_TEMP/chain.txt"
+          echo "marker=chain-a${attempt}m${IN_MAX_ATTEMPTS}b${saved}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark this run for the next attempt
+        if: ${{ steps.chain.outputs.marker != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.chain.outputs.marker }}
+          path: ${{ runner.temp }}/chain.txt
+          retention-days: 1
 
       - name: Delete the keys
         if: ${{ always() }}

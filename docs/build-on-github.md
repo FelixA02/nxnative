@@ -42,10 +42,12 @@ Before the first game, run it once with **Check the runner only** ticked (no lin
    | Version | the version to pack, e.g. `v0` (empty: the newest in the download) |
    | Skip the disk cleanup | saves about 5 minutes: without the cleanup the runner has about 95 GB free, enough for a game of up to about 25 GB; leave it off for a bigger one |
    | Show the frame rate | the frame counter at the top left on the iPhone |
+   | Minutes before a pause | `285` by default: see [Builds longer than six hours](#builds-longer-than-six-hours) |
+   | Attempts | `8` by default: the most attempts of the run, the first one counted |
 
 3. Click **Run workflow**. The run appears in the list; you can close the browser meanwhile, and GitHub emails you when a run fails.
 
-GitHub's Mac has 3 cores, so a build takes longer than on a recent Mac, and every run starts from nothing: nothing of an earlier build is reused. A run stops after 6 hours.
+GitHub's Mac has 3 cores, so a build takes longer than on a recent Mac. A run stops at 6 hours: [Builds longer than six hours](#builds-longer-than-six-hours) covers what happens then.
 
 ## Get the IPA
 
@@ -66,9 +68,21 @@ Your fork is public, and so are its runs:
 
 - **Disk space**: about three times the game files' size plus 10 GB; [Check the runner](#check-the-runner) says what is free. The biggest games may not fit.
 - **A dump needs more disk than NSPs do** (the archive, its unpacked folder, a RomFS image of it, then the IPA): leave **Skip the disk cleanup** off, and check the summary's lowest free disk space.
-- **6 hours** per run.
+- **6 hours** per job: a bigger game is built in slices instead, see below.
 - **Fire Emblem: Three Houses, Portal and Catherine: Full Body** cannot be built here: their build boots the game to capture its shaders, which needs Metal 4, and GitHub's Macs are virtual Macs without it.
 - One game per run.
+
+## Builds longer than six hours
+
+A big game compiles its shaders for hours: one run of a Switch 2 game reached 16 percent of them in five hours, which is about thirty hours. A job stops at six, so the build pauses and carries on by itself.
+
+- **Minutes before a pause** (285 by default) is when the build stops on purpose: early enough that saving the cache still fits in the six hours. Set it to `0` to never pause, which is what you want for a game that finishes in one job.
+- At that minute the build stops, the shader cache it compiled so far is saved as a cache release (`cache-<title ID>-latest`), and the run's summary says the attempt paused.
+- `.github/workflows/chain-controller.yml` sees that and re-runs the job. A re-run keeps the run's commit, its inputs and its secrets, so pushing to your fork during those thirty hours does not move the build onto other code: the next attempt starts where the last one stopped.
+- **Attempts** (8 by default) caps the chain, about 38 hours of building. When it is reached the run stops with the cache saved: run the build again with the same game to continue from it.
+- The chain also stops by itself when an attempt saved no more cache than the one before it, which means the build is stuck, and it sends no further attempts.
+
+The only thing to do during a chain is nothing. Leave the run alone: its summary gains a **Continuing the build** entry at each pause, and the final attempt publishes the IPA as usual. The cache release gets big (3 to 12 GB for the games built so far), which is what makes the next attempt cheap: it restores that cache and only compiles what is missing.
 
 ## When a build fails
 
