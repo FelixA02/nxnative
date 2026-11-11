@@ -58,6 +58,10 @@ on:
         description: 'Slicing: how many attempts of this run may follow, the first run counted. 285 minutes each is about 38 hours, enough for the biggest games; the chain also stops on its own when an attempt saves no more cache than the one before'
         type: number
         default: 8
+      stash_game:
+        description: 'Keep the download in a temporary encrypted release of this run, so a later attempt reuses it instead of the link (a personal link usually expires within hours, and a sliced build comes back to it hours later). The release is deleted when the build finishes, kept while the chain continues, and swept 24 hours after it was made if the run never got there. Off: every attempt downloads the game again'
+        type: boolean
+        default: true
 
 permissions:
   contents: write   # publish_release: creating a Release and attaching asset(s); the artifact path needs only read
@@ -242,12 +246,89 @@ jobs:
           if ! xcrun -sdk iphoneos metal --version > /dev/null 2>&1; then echo "::error::the Metal compiler does not run (xcodebuild -downloadComponent MetalToolchain failed)"; exit 1; fi
           if [ -z "$dn" ] || ! "$dn" --list-sdks | grep -q '^10\.'; then echo "::error::${dn:-dotnet}, the dotnet the NSP script runs, has no .NET 10 SDK"; exit 1; fi
 
+      # The link is often a personal one that expires within hours, and a sliced build returns to this step in the next attempt, hours later:
+      # the download is kept in a release of this run, so a later attempt needs no link at all. Nothing here may fail the build, so every stash
+      # fault falls back to the link.
       - name: Download the game
         if: ${{ !inputs.check_only }}
         env:
           GAME_LINK: ${{ secrets.GAME_LINK }}   # used when the link field is empty
           IN_TITLE_ID: ${{ inputs.title_id }}
-        run: python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"   # reads the link from the run itself: it never appears in this file's commands
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_PASSWORD: ${{ secrets.CACHE_PASSWORD }}
+          STASH_GAME: ${{ inputs.stash_game }}
+        run: |
+          stash="x-input-${GITHUB_RUN_ID}"
+          repair=0
+          mkdir -p "$RUNNER_TEMP/game"
+          if [ "$STASH_GAME" != 'true' ]; then
+            python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"
+            exit 0
+          fi
+          if gh release view "$stash" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/stash"
+            if gh release download "$stash" -R "$GITHUB_REPOSITORY" -p '*.7z*' -D "$RUNNER_TEMP/stash" >/dev/null 2>&1; then
+              first=$(ls "$RUNNER_TEMP/stash"/*.001 "$RUNNER_TEMP/stash"/*.7z 2>/dev/null | head -1)
+              if [ -n "$first" ] && 7zz x -y -bso0 -bsp0 "-p$CACHE_PASSWORD" -o"$RUNNER_TEMP/game/" "$first" >/dev/null 2>&1 \
+                 && [ -n "$(ls -A "$RUNNER_TEMP/game")" ]; then
+                echo "The game came from this run's stash ($stash): the link is not needed again"
+                rm -rf "$RUNNER_TEMP/stash"
+                exit 0
+              fi
+              echo "::warning::the stash $stash does not unpack, so the game is downloaded from the link"
+            else
+              echo "::warning::the stash $stash could not be downloaded, so the game is downloaded from the link"
+            fi
+            repair=1   # it is damaged or unfinished: the copy downloaded below replaces it, so the attempt after this one has a good one
+            rm -rf "$RUNNER_TEMP/stash"
+          fi
+          python -I dm/tools/ci_fetch_game.py --out "$RUNNER_TEMP/game" --work "$RUNNER_TEMP/download"
+          # A shard downloading beside this job may have stashed the game already, complete: its copy is this copy, so there is nothing to add.
+          if [ "$repair" = 0 ] && [ "$(gh release view "$stash" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo 0)" != '0' ]; then
+            echo "Another job of this run stashed the game already: nothing to add"
+            exit 0
+          fi
+          # Stored (a game file is packed already, so compressing it buys nothing), encrypted with the cache password because the release is
+          # public, and split under GitHub's 2 GiB asset limit.
+          rm -rf "$RUNNER_TEMP/stash"
+          mkdir -p "$RUNNER_TEMP/stash"
+          # Leftovers of runs that were cancelled or failed: dropped here, at least 24 hours after they were made.
+          cutoff=$(date -j -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
+          stale=$(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq --arg cutoff "$cutoff" --arg keep "$stash" \
+                 '.[] | select(.tagName | startswith("x-input-")) | select(.tagName != $keep) | select(.createdAt < $cutoff) | .tagName' 2>/dev/null || true)
+          for tag in $stale; do
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 && echo "Dropped an old game stash: $tag" || true
+          done
+          archive="$RUNNER_TEMP/stash/input.7z"
+          cd "$RUNNER_TEMP/game"
+          shopt -s nullglob
+          items=(*)
+          if [ ${#items[@]} -eq 0 ]; then
+            echo "::warning::the download left no file to stash, so a later attempt downloads the game again"
+            exit 0
+          fi
+          if ! 7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-p$CACHE_PASSWORD" "$archive" "${items[@]}" >/dev/null 2>&1; then
+            echo "::warning::the game could not be packed for the stash, so a later attempt downloads it again"
+            exit 0
+          fi
+          size=$(stat -f%z "$archive")
+          cap=$(( (2 * 1024 * 1024 * 1024) - 1 ))
+          safe=$(( cap - 1024 * 1024 ))
+          parts=$(( (size + safe - 1) / safe ))
+          if [ "$parts" -gt 1 ]; then
+            per=$(( (size + parts - 1) / parts ))
+            rm -f "$archive"
+            7zz a -t7z -mx=0 -mhe=on -bd -bso0 -bsp0 "-v$per" "-p$CACHE_PASSWORD" "$archive" "${items[@]}" >/dev/null 2>&1 || true
+          fi
+          gh release create "$stash" -R "$GITHUB_REPOSITORY" --title "Game files for this run" \
+            --notes "Temporary: the files run $GITHUB_RUN_ID downloaded, encrypted with CACHE_PASSWORD, kept so a later attempt of the same run needs no download link. Deleted when the build finishes." >/dev/null 2>&1 || true
+          if gh release upload "$stash" -R "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/stash"/input.7z* >/dev/null 2>&1; then
+            echo "Stashed the game in $stash ($parts part(s), $(( size / 1024 / 1024 )) MB) so a later attempt of this run needs no link"
+          else
+            echo "::warning::the game could not be stashed, so a later attempt downloads it again from the link"
+          fi
+          rm -rf "$RUNNER_TEMP/stash"
 
       # The cache release is named after the game, so the game comes first: the title ID is read from what was just downloaded, by the same scan the
       # build makes (dm/tools/game_title_id.py: the NUP's program ID, the dump's NPDM, else the NSPs' tickets). The Title ID field stays empty unless
@@ -731,3 +812,14 @@ jobs:
       - name: Delete the keys
         if: ${{ always() }}
         run: rm -rf "$RUNNER_TEMP/keys"
+
+      # The build is done, or the chain is stopping (no marker: it finished, gave up, or saved no more cache), so nothing will ask for the
+      # download again. A chain that continues keeps it: the marker is what the next attempt is told to expect.
+      - name: Drop the game stash
+        if: ${{ !inputs.check_only && success() && inputs.stash_game && steps.chain.outputs.marker == '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          stash="x-input-${GITHUB_RUN_ID}"
+          gh release delete "$stash" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 \
+            && echo "Dropped $stash: no attempt follows this one" || echo "No game stash to drop for this run"

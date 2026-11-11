@@ -82,6 +82,8 @@ A big game compiles its shaders for hours: one run of a Switch 2 game reached 16
 - **Attempts** (8 by default) caps the chain, about 38 hours of building. When it is reached the run stops with the cache saved: run the build again with the same game to continue from it.
 - The chain also stops by itself when an attempt saved no more cache than the one before it, which means the build is stuck, and it sends no further attempts.
 
+A download link often expires within hours, and a later attempt comes back to the download hours later, so the files the first attempt downloaded are kept in a release of the run (`x-input-<run number>`), encrypted with the **IPA password** and split under GitHub's 2 GiB asset limit (see it as an asset list in the run's page when a build is chained). A later attempt takes them from there and never touches the link again. The release is deleted when the build finishes or its chain gives up, and one left behind by a cancelled run is swept by the next build, a day later. Turn **Keep the download for later attempts** off to download afresh each attempt; nothing in that path can fail a build, since a stash that cannot be read is downloaded over.
+
 The only thing to do during a chain is nothing. Leave the run alone: its summary gains a **Continuing the build** entry at each pause, and the final attempt publishes the IPA as usual. The cache release gets big (3 to 12 GB for the games built so far), which is what makes the next attempt cheap: it restores that cache and only compiles what is missing.
 
 ## When a build fails
