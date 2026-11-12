@@ -1513,7 +1513,8 @@ static int g_pass_order;    // ordering barriers came in the open draw pass afte
 static int g_pass_late_res; // a draw of the open pass reads memory in a stage after the vertex stage (order_note)
 static uint64_t g_order_vbar;   // ordering barriers kept inside the pass as a vertex-to-vertex barrier (prog_swrites)
 static void img_fit_upgrade(void); static int g_imfit_npend;   // textures an image slot needs a format view of (img_fit), upgraded before the next draw pass opens
-static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the game issued nvnCommandBufferBarrier since the last draw pass began
+static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the bits of the game's nvnCommandBufferBarrier calls since the last draw pass began
+#define GAME_BARRIER_FULL (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_INDIRECT_DATA_BIT)   // the bits that order earlier work before later vertex or indirect fetch: the next draw pass takes the full barrier (barrier_game)
 static uint64_t g_bar_skip, g_bar_full;            // draw passes begun without / with the consumer barrier (DM_NVN_BARRIER=game)
 static void gp_end(id e);
 // An encoder's end barrier flushes to the device coherence point only. MTL4VisibilityOptionResourceAlias (aliased virtual addresses: overlapping large-pool chunks, image family heaps,
@@ -1533,8 +1534,10 @@ static inline void m4_end(id e) {
 }
 // DM_NVN_BARRIER=game (default the profile's draw_barriers, full unless it says game): draw passes are ordered by the game's own barriers. A draw pass ends with a barrier from its vertex and fragment stages to the fragment, compute and copy stages of
 // later work, so the next pass's vertex work can overlap this pass's fragments (with the full barriers every pass waited for the previous one to finish completely: about 350 passes a frame in Breath of
-// the Wild). The next draw pass adds the full consumer barrier when the game called nvnCommandBufferBarrier since the last one (NVN asks for one before results of rendering are read as textures, shader data or
-// indirect arguments), or when anything other than a draw pass ran in between (compute, copies and uploads keep their full barriers). Only vertex-stage reads of the previous pass's results without a barrier change order
+// the Wild). The next draw pass adds the full consumer barrier when the game's barriers since the last one ordered primitives or indirect data (GAME_BARRIER_FULL: later vertex, task, mesh or indirect
+// fetch after earlier work; ORDER_FRAGMENTS and the invalidations ask only for what the relaxed end barrier gives), or when anything other than a draw pass ran in between (compute, copies and uploads
+// keep their full barriers). The end barrier flushes to the device only; while aliases exist (resource_vis) the next pass, if it skips the full barrier, flushes them in a start barrier before its
+// fragment stage, which costs no allocator memory (see m4_end). Only vertex-stage reads of the previous pass's results without a primitive barrier change order, which NVN does not order either
 // DM_NVN_BARRIER=ab... alternates game and full with the DM_AB phases (measurement)
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
 static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strncmp(e, "ab", 2) ? sw_mode("DM_NVN_BARRIER", 0) : e ? !strcmp(e, "game") : DM_GAME_DRAW_BARRIERS_GAME; if (v == 1) MLOG("DM_NVN_BARRIER=game: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments)"); } return sw_on(v); }
@@ -1619,14 +1622,15 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2);   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0);
-    if (g_last_end_relaxed && !g_game_barrier && barrier_game() && !g_image_heap_n) g_bar_skip++;
+    if (g_last_end_relaxed && !(g_game_barrier & GAME_BARRIER_FULL) && barrier_game()) { g_bar_skip++;   // ordered by the relaxed end barrier; the alias flush, when aliases exist, is a consumer barrier before this pass's fragments (see m4_end)
+        MTL4VisibilityOptions vis = resource_vis(); if (vis & MTL4VisibilityOptionResourceAlias) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:vis]; }
     else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
 }
 static inline void enc_r_end_pass(id e) {
-    if (!barrier_game() || g_image_heap_n) { m4_end(e); return; }
-    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:resource_vis()];
+    if (!barrier_game()) { m4_end(e); return; }
+    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
     [e endEncoding]; g_last_end_relaxed = 1;
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e; }
@@ -2590,7 +2594,19 @@ static int tex_need_pfv(MTLPixelFormat base, MTLPixelFormat view) {
 // Cache tables on the replay hot path always use nvn_hmap (C hash, keys not boxed); the table stores CFBridgingRetain'ed objects, CFRelease'd on replace / delete
 static void hm_rel(void *v) { CFRelease(v); }
 static __unsafe_unretained id hm_get_id(const nvn_hmap *m, const void *k) { return (__bridge id)nvn_hm_get(m, k); }
-static void hm_put_id(nvn_hmap *m, const void *k, id o) { void *old = nvn_hm_put(m, k, (void *)CFBridgingRetain(o)); if (old) CFRelease(old); }
+// The map owns the reference CFBridgingRetain makes until the entry is replaced (old, released here) or removed (hm_rel). The static analyzer cannot follow a reference into
+// nvn_hmap's C arrays and took every object put here for a leak (clang-analyzer-osx.cocoa.RetainCount): for its eyes only, a declaration with no body hands the reference over
+// (CF_CONSUMED), which is what the map does. No build compiles it (__clang_analyzer__ is defined only during analysis)
+#ifdef __clang_analyzer__
+void dm_analyzer_map_takes(CFTypeRef CF_CONSUMED ref);
+#endif
+static void hm_put_id(nvn_hmap *m, const void *k, id o) {
+    CFTypeRef ref = CFBridgingRetain(o);
+#ifdef __clang_analyzer__
+    dm_analyzer_map_takes(ref);
+#endif
+    void *old = nvn_hm_put(m, k, (void *)ref); if (old) CFRelease(old);
+}
 static void hm_del_id(nvn_hmap *m, const void *k) { void *old = nvn_hm_del(m, k); if (old) CFRelease(old); }
 static nvn_hmap g_by_serial = {.klen = 8};     // Serial → MTLTexture / NvPkg / NvProg
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
@@ -6190,6 +6206,7 @@ static FnOff *fn_off(id<MTLFunction> f) {
             cv = [sd.constantValues copy]; fd = sd.functionDescriptor;
         }
         MTL4LibraryFunctionDescriptor *ld = [fd isKindOfClass:MTL4LibraryFunctionDescriptor.class] ? (MTL4LibraryFunctionDescriptor *)fd : nil;
+        // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): the descriptor's name is set when it is made (fn4_note refuses a nil name, pre_fn takes the name its function was made from) and never changed
         if (!ld || ![ld.library newFunctionWithName:ld.name].functionConstantsDictionary[@"dm_border_off"]) { o->none = 1; return nil; }   // the entry's, not f's: a specialized f lists no constants
         if (!cv) cv = [MTLFunctionConstantValues new];
         BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
@@ -6207,6 +6224,7 @@ static id<MTLFunction> fn_dev_b(id<MTLFunction> f, int off) {
     @synchronized(o) {
         if (!o->dev && !o->dev_failed) {
             MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)((MTL4SpecializedFunctionDescriptor *)o->d4).functionDescriptor;
+            // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): fn_off made o->d4 from this ld after looking its name up; names are never nil (fn4_note, pre_fn)
             NSError *e = nil; o->dev = [ld.library newFunctionWithName:ld.name constantValues:o->cv error:&e];
             if (!o->dev) { o->dev_failed = 1; MLOG("[RED] function %s: specializing it without the border corrections failed: %s (its pipelines keep them)", f.name.UTF8String, e.localizedDescription.UTF8String); }
         }
@@ -8976,6 +8994,7 @@ static int fd_border_fc(MTL4FunctionDescriptor *fd) {
     MTL4FunctionDescriptor *ld = ((MTL4SpecializedFunctionDescriptor *)fd).functionDescriptor;
     if (![ld isKindOfClass:MTL4LibraryFunctionDescriptor.class]) return 0;
     MTL4LibraryFunctionDescriptor *l = (MTL4LibraryFunctionDescriptor *)ld;
+    // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): the descriptor's name is set when it is made (fn4_note refuses a nil name, pre_fn takes the name its function was made from) and never changed
     return [l.library newFunctionWithName:l.name].functionConstantsDictionary[@"dm_border_off"] != nil;
 }
 static id<MTLComputePipelineState> cps_new_b(id<MTLFunction> f, int off, NSError **e) {   // off: without the border corrections (fn_off), the common dispatch's
@@ -9218,9 +9237,9 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
         else if (!known) hm_put_id(&g_pbase_miss, &bk, NSNull.null);   // searched and not there, compiled or not
         hm_rel(nvn_hm_del(&g_pbase_pending, &bk)); dispatch_group_leave(job->done);
         os_unfair_lock_unlock(&g_pbase_lock);
-        if (!base) { if (compile && e) *e = job->error; return nil; }   // NOLINT(clang-analyzer-osx.cocoa.RetainCount): job stays in g_pbase_pending (hm_put_id's CFBridgingRetain) until hm_rel releases it, not a leak
+        if (!base) { if (compile && e) *e = job->error; return nil; }
     }
-    if (!rast) return base;   // NOLINT(clang-analyzer-osx.cocoa.RetainCount): job stays in g_pbase_pending (hm_put_id's CFBridgingRetain) until hm_rel releases it, not a leak
+    if (!rast) return base;
     uint64_t ts = bp_now();
     MTL4RenderPipelineDescriptor *s = spec_desc(base, &g_spec_own);
     for (int i = 0; i < 8; i++) pso_col4(s.colorAttachments[i], d.colorAttachments[i]);
@@ -10973,18 +10992,26 @@ static __unsafe_unretained id<MTLBuffer> g_c0_dim_buf; static size_t g_c0_dim_of
 // {mask, log2 samples, z, w} at 0x630; each byte holds the sample's x (low nibble) and y (high nibble) in 1/16 pixel. Metroid Prime Remastered's G-buffer shaders pack it into an
 // integer target (30 of its pixel shaders read it); left at 0, every sample sat in the pixel's corner instead of its centre (0x88 for one sample). Metal rasterizes at its default
 // positions, the same for every pixel, so the grid masks stay 0 and the table holds those positions. Only one sample was met: the nibble order for several is the hardware's
-// (nouveau's sample locations), not seen in a game
-static void c0_sample_rows(uint8_t *d, uint32_t samples) {
-    static uint8_t table[17][DMSH_C0_SAMPLE_BYTES]; static uint32_t made;   // per sample count, made on first use
+// (nouveau's sample locations), not seen in a game.
+// NVN2's table (ounce) holds each nibble as a signed offset from the pixel centre instead (the corner form with bit 3 flipped, so 0x00 for one sample): its shaders either
+// flip it back before use (PRAGMATA's 154 sample position readers: (byte ^ 0x88) nibbles / 16 - 0.5, added to the pixel centre) or pass the nibbles as they are to IPA's
+// offset, which is signed from the centre (its pixel shader 4a9d4507eea6c837; Mesa NAK's load_barycentric_offset subtracts the half pixel from its corner table for the same
+// operand). With the corner form there, every sample position read half a pixel up and left. Whether NVN1's table is the same was not checked (Metroid Prime Remastered
+// only stores the byte): open
+static void c0_sample_rows(uint8_t *d, uint32_t samples, int ounce) {
+    static uint8_t table[2][17][DMSH_C0_SAMPLE_BYTES]; static uint32_t made[2];   // per driver and sample count, made on first use
     if (samples < 1 || samples > DMSH_C0_SAMPLE_BYTES) samples = 1;
-    if (!(made >> samples & 1)) {
-        if (samples == 1) table[1][0] = 0x88;
+    ounce = !!ounce;
+    if (!(made[ounce] >> samples & 1)) {
+        uint8_t *t = table[ounce][samples];
+        if (samples == 1) t[0] = 0x88;
         else { MTLSamplePosition pos[DMSH_C0_SAMPLE_BYTES]; [g_dev getDefaultSamplePositions:pos count:samples];
-               for (uint32_t i = 0; i < samples; i++) table[samples][i] = (uint8_t)(((int)(pos[i].x * 16) & 15) | ((int)(pos[i].y * 16) & 15) << 4); }
-        made |= 1u << samples;
+               for (uint32_t i = 0; i < samples; i++) t[i] = (uint8_t)(((int)(pos[i].x * 16) & 15) | ((int)(pos[i].y * 16) & 15) << 4); }
+        if (ounce) for (uint32_t i = 0; i < samples; i++) t[i] ^= 0x88;
+        made[ounce] |= 1u << samples;
     }
     uint32_t info[4] = { samples - 1, (uint32_t)__builtin_ctz(samples), 0, 0 };
-    memcpy(d + DMSH_C0_SAMPLE_TABLE, table[samples], DMSH_C0_SAMPLE_BYTES); memcpy(d + DMSH_C0_SAMPLE_INFO, info, sizeof info);
+    memcpy(d + DMSH_C0_SAMPLE_TABLE, table[ounce][samples], DMSH_C0_SAMPLE_BYTES); memcpy(d + DMSH_C0_SAMPLE_INFO, info, sizeof info);
 }
 static uint64_t g_geo_bind[5];
 // Which game shaders a failed command buffer encoded. A GPU fault's error names no pass or shader (Metal 4's commit feedback has only the error and two times), and a fault does not always stop
@@ -11403,7 +11430,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                     // transform this way, and 1,550 reads in 793 of its vertex shaders. Left at 0, every box was box 0: all six queries came back empty, and the game, taking its characters for
                     // hidden, posed their legs straight back from the hips. 0x640 (read by 58 shaders, added to the vertex ID) stays 0: what the driver puts there is not established
                     if (nvn_stage != 5) memcpy(d + DMSH_C0_BASE_INSTANCE, &g_draw_binst, 4);
-                    if (nvn_stage == 1) c0_sample_rows(d, g_pass.samples);
+                    if (nvn_stage == 1) c0_sample_rows(d, g_pass.samples, dm_sdk_ounce());
                     if (nvn_stage == 5) {
                         memcpy(d + DMSH_C0_DISPATCH, g_dispatch_dim, 12); g_c0_dim_buf = db; g_c0_dim_off = doff + DMSH_C0_DISPATCH;
                         // NVN2 compute also reads them below its per-shader layout: a light culling shader's cluster is (z * c0[8] + y) * c0[4] + x, and at zero every cluster of a column wrote the same entry
@@ -15602,7 +15629,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
-                if (bits) { g_game_barrier = 1; g_fb_bar++; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
+                if (bits) { g_game_barrier |= bits; g_fb_bar++; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
             default: break;
         }
