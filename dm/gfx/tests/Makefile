@@ -52,6 +52,8 @@ t_gfx_suspend: t_gfx_suspend.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hl
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gfx_suspend.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
+t_rt_comp: t_rt_comp.c ../nvn/hle_nvn.c ../nvn/nvn_rt.h ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_comp.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -88,6 +90,8 @@ t_counter_clock: t_counter_clock.m ../../host/hle_os.c ../../host/dm.h $(MTL_T_D
 	clang $(CFLAGS) -fobjc-arc -o $@ t_counter_clock.m ../../host/hle_os.c $(MTL_T_SRC) $(FW)
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
+t_thread_rt: t_thread_rt.c ../nvn/nvn_rt.h
+	clang -O1 -Wall -o $@ t_thread_rt.c
 t_thermal: t_thermal.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_thermal.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
