@@ -49,6 +49,8 @@ DM_FSLOG	diagnostic	`=<file>` writes one TSV line per ReadFile: seconds since bo
 DM_FSLOG_HASH	diagnostic	With `DM_FSLOG`, adds a column with the FNV-1a 64 hash of the bytes read
 DM_FSTEP_PROBE_RAMP	switch	`0` ends a frame-step probe's grace after its 30 frames as before; by default the grace is renewed while the probe's frames keep getting cheaper (macOS raises the GPU clock for the shorter deadline over seconds); `ab` alternates with `DM_AB`
 DM_FULLSCREEN	player	`1` (any value but `0`) starts the Mac window in fullscreen; `0` or unset, a window. The Mac settings window's Display mode
+DM_FX_DIRECT	switch	With `DM_PRESENT_UPSCALE=metalfx`, `0` keeps the present pass after MetalFX's spatial scaler; by default the scaler writes the drawable itself when the picture fills it unflipped and the drawable takes the scaler's output (iOS)
+DM_FX_INPLACE	switch	With `DM_PRESENT_UPSCALE=metalfx`, `0` keeps the copy into MetalFX's input; by default the scaler reads the presented texture itself when the picture is all of it
 DM_GAME	switch	Selects the game profile (a title ID under `dm/games` or `DM_GAMES_DIR`) for the Python tools and the rewriter; there is no default
 DM_GAMES_DIR	path	Profile folders outside the repository, separated by `:`, searched after `dm/games`; the NSP script points it at a provisional or derived profile
 DM_GAMES_FIRST	switch	`=1` searches `DM_GAMES_DIR` before `dm/games`, so a provisional or derived profile wins over the game's own (the NSP script's `--provisional`)
@@ -185,6 +187,7 @@ DM_NVN_LINE_WIDTH	switch	`0` draws every NVN line 1 pixel wide, as before; by de
 DM_NVN_LOADPROBE	diagnostic	`=1`, `2` or `3`: attachments whose load is skipped are cleared to a sentinel colour (`3` NaN; `1` NaN for float formats) and the sentinel pixels left at pass end are counted (should be 0)
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels
+DM_NVN_MDX_PRESCAN	switch	`0` copies an indirect-count multi-draw's records at its own first draw, which splits a render pass an earlier draw opened; by default the draw that opens a pass copies those of the multi-draws after it first (ab with DM_AB)
 DM_NVN_PARTIAL_UPLOAD	switch	`0` reads a texture whole from its storage at every re-upload; by default a re-upload reads only the images (a layer's level) with a page written since the last upload and copies the others from the texture it replaces
 DM_NVN_PASSDUMP	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs every render pass of those frames (attachments, clears, shader keys, bindings, draw state, presents, and the host function and line that ended each pass) for the `tbdr_*.py` tools
 DM_NVN_PASSDUMP_ALL	diagnostic	`=1` makes `DM_NVN_PASSDUMP` record every draw and binding change, not only the first per pass and stage, including copies and inline uniform updates
@@ -230,6 +233,7 @@ DM_NVN_TEXDUMP	diagnostic	`=<frame>:<path>`, `size=<W>x<H>:<path>` or `layers=<n
 DM_NVN_TEXINFO	diagnostic	`=<W>x<H>` logs storage and description of every texture of that size on first use, registration and initialization (pool, flags, packaged, non-zero bytes, swizzles)
 DM_NVN_TEXRAW	diagnostic	`=<serial>,…` or `info` (the textures `DM_NVN_TEXINFO` picked out): saves those textures' raw bytes at the `DM_NVN_TEXDUMP` frame, with a text header line
 DM_NVN_TEXSNAP	diagnostic	`=<in-frame pass index>,…`: with `DM_NVN_TEXDUMP`, copies those passes' colour attachments as they end and saves them with the end-of-frame dump
+DM_NVN_TF_CPU	switch	`0` sends every transform feedback capture through the `tf_prepare` dispatch in a render pass of its own, as before; by default the capture state is kept on the CPU from a begin until a resume or a geometry capture takes it from the GPU, and captures that follow each other share one pass, behind barriers inside it where one may touch what another read or wrote
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
 DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
 DM_NVN_TSV_CALLS	diagnostic	`0` makes `DM_NVN_TSV` write only the timing rows, without the call counts (about two thirds of the file)
@@ -250,6 +254,7 @@ DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a c
 DM_NVN_VCONV_CPU	switch	`=1` converts integer vertex inputs fed formats of another class on the CPU, as before, instead of through the shader's shadow inputs (`<key>_bv`)
 DM_NVN_VCONV_KEEP	switch	`=0` turns off the kept vertex conversions (`vk_get`); `=<n>` sets the smallest range kept, in vertices (default 4096, which `=1` also gives)
 DM_NVN_VCONV_RANGE	switch	`0` / `1` overrides the profile's `vconv_range`: CPU vertex conversion only over the vertices each draw reads instead of the whole bound range
+DM_NVN_VC_KEEP	switch	`1` (default) keeps the texture-view set of a finalized texture that a registered ID still resolves through the ghost table, until the owner lets the serial go (vc_ghost_sweep, at the first commit of each frame); `0` refuses such sets, so each submission that reads the ID makes its view again; `ab` alternates it with the DM_AB phases
 DM_NVN_VLOG	diagnostic	Set: logs each NVN memory pool as it is created (address, memory, size, flags) with a backtrace
 DM_NVN_VSDUMP	path	Output file for post-vertex captures; used with DM_NVN_VSDUMP_KEY and the frame/count bounds
 DM_NVN_VSDUMP_FROM	diagnostic	First presented frame eligible for a post-vertex capture (default 0)
