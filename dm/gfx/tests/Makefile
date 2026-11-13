@@ -125,6 +125,9 @@ t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
+t_read_owner: t_read_owner.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_read_owner.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+check_t_read_owner: RUN_ENV = MTL_DEBUG_LAYER=1
 # DM_NVN_CAPTURE: the replayer (a tool, not a test: it needs a capture, docs/agents/05-debugging.md) and the CPU-only test of the capture format and record relocation
 nvn_replay: nvn_replay.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ nvn_replay.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
@@ -370,6 +373,9 @@ check_t_pull: RUN_ENV = MTL_DEBUG_LAYER=1
 t_pull_inv: t_pull_inv.m ../tools/dmsh_pull.py ../tools/dmsh_pull.metal
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_pull_inv.m -framework Metal -framework Foundation
 check_t_pull_inv: RUN_ENV = MTL_DEBUG_LAYER=1
+t_wline: t_wline.m ../tools/dmsh_pull.py ../tools/dmsh_pull.metal
+	clang -O1 -g -Wall -fobjc-arc -o $@ t_wline.m -framework Metal -framework Foundation
+check_t_wline: RUN_ENV = MTL_DEBUG_LAYER=1
 t_pso_archive: t_pso_archive.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_archive.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_pso_archive
@@ -398,6 +404,12 @@ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
 t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_view_swizzle.m $(MTL_T_SRC) $(FW)
 check_t_view_swizzle: RUN_ENV = MTL_DEBUG_LAYER=1
+# Tessellation's layout and expansion kernel on the GPU (nvn_tess.inc, dmsh_tess.py), from the shipped MSL test_dmsh_tess.py writes
+t_tess: t_tess.m
+	clang $(CFLAGS) -fobjc-arc -o $@ t_tess.m -framework Metal -framework Foundation
+.PHONY: check_t_tess
+check_t_tess: t_tess
+	DM_TEST_TESS="$(CURDIR)/t_tess" MTL_DEBUG_LAYER=1 python3 -m unittest test_dmsh_tess.py
 t_border: t_border.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_border.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_border
@@ -407,6 +419,12 @@ check_t_border: t_border
 t_view_levels: t_view_levels.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_view_levels.m $(MTL_T_SRC) $(FW)
 check_t_view_levels: RUN_ENV = MTL_DEBUG_LAYER=1
+t_res_commit: t_res_commit.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_res_commit.m $(MTL_T_SRC) $(FW)
+check_t_res_commit: RUN_ENV = MTL_DEBUG_LAYER=1
+t_upload_src: t_upload_src.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_src.m $(MTL_T_SRC) $(FW)
+check_t_upload_src: RUN_ENV = MTL_DEBUG_LAYER=1
 t_upload_budget: t_upload_budget.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_budget.m $(MTL_T_SRC) $(FW)
 check_t_upload_budget: t_upload_budget
@@ -525,6 +543,9 @@ t_dlss_mfx: t_dlss_mfx.m $(MTL_T_DEP)
 check_t_dlss_mfx: t_dlss_mfx
 	NSZombieEnabled=YES DM_NVN_ENC_THREAD=0 ./t_dlss_mfx
 	NSZombieEnabled=YES DM_NVN_ENC_THREAD=1 ./t_dlss_mfx
+t_buffer_image_bias: t_buffer_image_bias.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_buffer_image_bias.m $(MTL_T_SRC) $(FW)
+check_t_buffer_image_bias: RUN_ENV = MTL_DEBUG_LAYER=1
 t_image_usage: t_image_usage.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_image_usage.m $(MTL_T_SRC) $(FW)
 check_t_image_usage: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -554,6 +575,9 @@ t_vk_dontcare: t_vk_dontcare.m ../vk/hle_vk.m $(MTL_T_DEP)
 # The validation layer fills every DontCare load with a pattern, so a DontCare load fails the check whatever the tile memory happens to hold
 check_t_vk_dontcare: RUN_ENV = MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_VALIDATE_LOAD_ACTIONS=1
 # A Vulkan 1D image is a one-row 2D texture: drawn into, mipmapped, layered and depth, under the validation layer that aborts on each with a Metal 1D texture
+# Swap chain images are released once the presents that showed them are done, over more recreations than the window-texture list holds
+t_vk_swapchain_life: t_vk_swapchain_life.m ../vk/hle_vk.m $(MTL_T_DEP)
+	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_swapchain_life.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 t_vk_1d: t_vk_1d.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_1d.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 check_t_vk_1d: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -648,3 +672,23 @@ check_t_pool_standin: t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_POOL_STANDIN=0 ./t_pool_standin
+
+# A virtual pool's first whole mapping aliases it only while no address of its own range has left the host; sampler IDs past the pool are empty slots (issue #2513, PR #2519)
+t_vpool_first_map: t_vpool_first_map.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_vpool_first_map.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+.PHONY: check_t_vpool_first_map
+check_t_vpool_first_map: t_vpool_first_map
+	MTL_DEBUG_LAYER=1 ./t_vpool_first_map
+
+# A texture pool table of another layered type than the ID's texture holds a view of it when a shader read the ID through that type (pool_fit): a 2D sprite read as a 2D array, a cube read as a cube
+t_pool_typebridge: t_pool_typebridge.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_typebridge.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_pool_typebridge
+check_t_pool_typebridge: t_pool_typebridge
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_typebridge
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_typebridge
+
+# Sparse mappings reach texture ID views, pool tables and handle tables as notes of the textures they change (treg_sparse_notes), read back on the GPU
+t_sparse_pool_cache: t_sparse_pool_cache.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_sparse_pool_cache.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+check_t_sparse_pool_cache: RUN_ENV = MTL_DEBUG_LAYER=1
