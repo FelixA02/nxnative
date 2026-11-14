@@ -51,7 +51,7 @@ static void mp(uintptr_t a, size_t len, int prot) {
     atomic_fetch_add(&g_mp_ticks, mach_absolute_time() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
 }
 
-static mach_timebase_info_data_t g_tb;   // obtained when the first pool is registered (the fault path only multiplies and divides)
+static mach_timebase_info_data_t g_tb;   // obtained when the host loads (dirty_init; the fault path only multiplies and divides)
 static _Atomic int g_busy_red;
 // Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, mach_absolute_time and sched_yield
 static int busy_wait(range_t *r, uintptr_t p) {
@@ -146,9 +146,16 @@ static void prep_write(void *addr, size_t len) {
     if (in) own_note();   // whatever its pages' state: one another thread wrote first is writable already
 }
 
+// Page geometry, the timebase and both hooks are set when the host loads, on one thread before main: every pool registration, fault and host pre-write sees them complete.
+// They were set by the first nvn_dirty_add_range behind a plain flag, published before the geometry and the hooks and with no lock: a pool registered on another thread
+// at that moment could get zero geometry or return before the hooks existed, and a host write into guest memory (hle_fs.c reading a file on a game thread) read crash.c's
+// hook table while it grew (PR #2225). With no pool registered the hooks scan an empty table, so a game that never makes one pays nothing for them
+__attribute__((constructor)) static void dirty_init(void) {
+    g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb);
+    dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write);
+}
+
 void nvn_dirty_add_range(const void *mem, size_t size) {
-    static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
