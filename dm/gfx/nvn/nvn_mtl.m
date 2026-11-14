@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
+#include <sys/file.h>   // flock: the lock beside Metal's build folders (ga_claim)
 #include <TargetConditionals.h>
 #include <os/os_sync_wait_on_address.h>   // the uniform copy hand-off (nvn_rec.h ubc_wait)
 #if TARGET_OS_IPHONE
@@ -9211,17 +9212,46 @@ static void pso_bundle_open_prewarm(NSMutableArray<id<MTL4Archive>> *arch) {
     g_prewarm_files = n;
     MLOG("prewarm archive bundled with the app: %lu of %lu files, %lu with an index of %lu bases, %.1f MB, opened in %.1f ms", (unsigned long)n, (unsigned long)names.count, (unsigned long)nidx, (unsigned long)nkeys, bytes / 1048576.0, (bp_now() - t0) / 1e6);
 }
-// gpuarchiver-* folders are Metal's private compiler state. On the Mac their parent is shared by every program: a directory appearing during our capture or flush may belong
-// to another compiler, and serialization success does not end its lifetime. Only our output archives are ours to remove. iOS can reclaim previous runs' app-private folders
-// at cold start, before this run captures anything; never infer ownership from a live directory delta or remove compiler state at flush/exit.
+// gpuarchiver-* folders are Metal's private compiler state: one per pipeline data set serializer, so one per flush period (ep_new), up to about 127 MB each, never removed by
+// Metal. Metal puts them in <user cache folder>/<main bundle ID>/com.apple.gpuarchiver, or <user cache folder>/com.apple.gpuarchiver for a process without a bundle ID
+// (getCacheMainFolder in Metal; its exported MTLGetGPUArchiverCachePath returns the folder). A host without a bundle (dmhost from a build) shares that folder with every other
+// such program: a directory appearing there during our capture or flush may belong to another compiler, so it removes none (scripts/clean_metal_cache.py does, from outside). A
+// host with a bundle ID (the Mac app, the iOS app) has a folder of its own, shared only with other copies of the same game's app. Every such host holds a shared lock on
+// gpuarchiver.lock beside the folder for its whole run, from before its first serializer; at start it tries an exclusive one first, and with it no other copy is running, so the
+// folders there are earlier runs' and it removes them. Never infer ownership from a live directory delta or remove compiler state at flush or exit: serialization success does not
+// end a folder's lifetime (docs/reference/shaders.md, "Metal's build folders left by pipeline archive flushes")
 static NSString *ga_dir(void) {
     static NSString *dir; static dispatch_once_t once;
-    dispatch_once(&once, ^{ char b[PATH_MAX]; if (confstr(_CS_DARWIN_USER_CACHE_DIR, b, sizeof b)) dir = [@(b) stringByAppendingPathComponent:@"com.apple.gpuarchiver"]; });
+    dispatch_once(&once, ^{
+        NSString *(*metal)(void) = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "MTLGetGPUArchiverCachePath");
+        NSString *d = metal ? metal() : nil;
+        if (![d isKindOfClass:NSString.class] || !d.length) {   // a system without it: the same rule. confstr gives nothing in an iOS simulator app, where Metal takes Library/Caches
+            char b[PATH_MAX]; NSString *base = confstr(_CS_DARWIN_USER_CACHE_DIR, b, sizeof b) > 1 ? @(b) : NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+            d = base ? [(bid.length ? [base stringByAppendingPathComponent:bid] : base) stringByAppendingPathComponent:@"com.apple.gpuarchiver"] : nil;
+        }
+        dir = d.stringByStandardizingPath;
+    });
     return dir;
 }
-static NSSet<NSString *> *ga_list(void) {
-    NSArray<NSString *> *a = ga_dir() ? [NSFileManager.defaultManager contentsOfDirectoryAtPath:ga_dir() error:nil] : nil;
+static int ga_own(void) { return NSBundle.mainBundle.bundleIdentifier.length > 0 && ga_dir() != nil; }   // the folder is this game's app's, not every program's
+static NSSet<NSString *> *ga_list(NSString *dir) {
+    NSArray<NSString *> *a = dir ? [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil] : nil;
     return [NSSet setWithArray:[a filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self BEGINSWITH 'gpuarchiver-'"]] ?: @[]];
+}
+// The lock beside dir, held shared from here on through *fd (left open for the run: the lock ends with the process, a forked child sharing it). → the folders of earlier runs
+// to remove, when no other copy holds the lock; nil otherwise. Listed under the exclusive lock, before this process makes a serializer: a copy starting meanwhile waits for the
+// listing at its shared lock, so no folder of a running copy is ever among them. A copy that cannot take the lock at all removes nothing and goes on unprotected
+static NSSet<NSString *> *ga_claim(NSString *dir, int *fd) {
+    *fd = -1;
+    if (!dir || ![NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
+    int f = open([dir.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"gpuarchiver.lock"].fileSystemRepresentation, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (f < 0) return nil;
+    NSSet<NSString *> *old = flock(f, LOCK_EX | LOCK_NB) ? nil : ga_list(dir);
+    int r; while ((r = flock(f, LOCK_SH)) && errno == EINTR) {}   // from the exclusive lock, or after a starting copy's listing
+    if (r) { close(f); return nil; }
+    *fd = f;
+    return old;
 }
 static ArchEpoch *ep_new(void) {   // a flush period: its compiler and serializer, nil when Metal makes none
     MTL4PipelineDataSetSerializerDescriptor *sd = [MTL4PipelineDataSetSerializerDescriptor new]; sd.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
@@ -9377,13 +9407,15 @@ static void pso4_init(void) {
         if (g_arch_dir) {
             g_arch_q = dispatch_queue_create("dm.nvn.pso-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
             g_arch_pending = dispatch_group_create();
-#if TARGET_OS_IPHONE
-            NSSet<NSString *> *old = ga_list();   // listed before any capture, so this run's own folder is never among them
-            if (old.count) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                int n = 0; for (NSString *name in old) n += [NSFileManager.defaultManager removeItemAtPath:[ga_dir() stringByAppendingPathComponent:name] error:nil];
-                MLOG("pipeline archive: %d of Metal's build folders left by earlier runs removed", n);
-            });
-#endif
+            if (ga_own()) {   // before the first serializer (ep_new below): this run's folder is never among them
+                static int lock_fd; NSString *gd = ga_dir(); NSSet<NSString *> *old = ga_claim(gd, &lock_fd);
+                if (lock_fd < 0) MLOG("[RED] pipeline archive: no lock beside %s: Metal's build folders there are left alone this run, and this run's may go with another copy's start", gd.UTF8String);
+                else if (!old) MLOG("pipeline archive: another copy of this app is running: Metal's build folders in %s are left alone", gd.UTF8String);
+                if (old.count) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    uint64_t t0 = bp_now(); int n = 0; for (NSString *name in old) n += [NSFileManager.defaultManager removeItemAtPath:[gd stringByAppendingPathComponent:name] error:nil];
+                    MLOG("pipeline archive: %d of %lu of Metal's build folders left by earlier runs removed from %s in %.1f s", n, (unsigned long)old.count, gd.UTF8String, (bp_now() - t0) / 1e9);
+                });
+            }
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *all = [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil]; NSSet<NSString *> *present = [NSSet setWithArray:all ?: @[]];

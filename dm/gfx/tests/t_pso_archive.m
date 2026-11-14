@@ -566,6 +566,26 @@ static void repeated_archive_miss(void) {
     nvn_hm_clear(&g_pbase_miss, hm_rel);
 }
 
+// An app's folder of Metal's build folders (ga_claim): a start with no other copy running lists the earlier runs' folders; a copy started beside it lists none; and once the first
+// exits, a third start still lists none while the second runs, whose folders are live. Each claim opens the lock anew, and flock locks of separate opens conflict as between processes
+static void app_folder_claim(void) {
+    EXPECT("app folder: a host without a bundle shares Metal's folder", 0, ga_own());
+    EXPECT("app folder: Metal's folder", 1, [ga_dir() hasSuffix:@"/com.apple.gpuarchiver"]);
+    NSString *dir = [@(archive_cache_root) stringByAppendingPathComponent:@"org.nxnative.test/com.apple.gpuarchiver"];
+    for (NSString *n in @[@"gpuarchiver-aaaaaa", @"gpuarchiver-bbbbbb"]) [NSFileManager.defaultManager createDirectoryAtPath:[dir stringByAppendingPathComponent:n] withIntermediateDirectories:YES attributes:nil error:nil];
+    [@"x" writeToFile:[dir stringByAppendingPathComponent:@"other"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    int a, b, c, d;
+    NSSet<NSString *> *got = ga_claim(dir, &a), *want = [NSSet setWithObjects:@"gpuarchiver-aaaaaa", @"gpuarchiver-bbbbbb", nil];
+    EXPECT("app folder: the first copy lists the earlier runs' folders", 1, a >= 0 && [got isEqualToSet:want]);
+    EXPECT("app folder: a second copy lists none", 1, ga_claim(dir, &b) == nil && b >= 0);
+    close(a);   // the first copy quits
+    EXPECT("app folder: a third copy lists none while the second runs", 1, ga_claim(dir, &c) == nil && c >= 0);
+    close(b); close(c);
+    EXPECT("app folder: with no copy running, a start lists them again", 2, ga_claim(dir, &d).count);
+    close(d);
+    EXPECT("app folder: no folder, no lock", 1, ga_claim(nil, &d) == nil && d < 0);
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
     if (!mkdtemp(archive_cache_root)) abort();
     atexit(archive_cache_cleanup);
@@ -1046,6 +1066,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     repeated_archive_miss();
     spec_desc_ownership();
     capture_preserves_foreign_folder();
+    app_folder_claim();
     [NSFileManager.defaultManager removeItemAtPath:@(dir) error:nil];
     printf("t_pso_archive: %d checks, %d failed\n", checks, failed);
     return failed != 0;
