@@ -92,6 +92,8 @@ t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thread_rt: t_thread_rt.c ../nvn/nvn_rt.h
 	clang -O1 -Wall -o $@ t_thread_rt.c
+t_link_drain: t_link_drain.c ../nvn/nvn_link_drain.h
+	clang -O1 -Wall -o $@ t_link_drain.c
 t_thermal: t_thermal.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_thermal.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
@@ -129,12 +131,9 @@ t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
-t_vc_ghost: t_vc_ghost.m $(MTL_T_DEP)
-	clang $(CFLAGS) -fobjc-arc -o $@ t_vc_ghost.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
-.PHONY: check_t_vc_ghost
-check_t_vc_ghost: t_vc_ghost
-	MTL_DEBUG_LAYER=1 ./t_vc_ghost
-	MTL_DEBUG_LAYER=1 ./t_vc_ghost --off
+t_vc_lifetime: t_vc_lifetime.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_vc_lifetime.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+check_t_vc_lifetime: RUN_ENV = MTL_DEBUG_LAYER=1
 t_read_owner: t_read_owner.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_read_owner.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 check_t_read_owner: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -238,6 +237,8 @@ check_t_present_snap: t_present_snap
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_present_snap resize
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap resize
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap queued
+	DM_PRESENT_LINK=0 MTL_DEBUG_LAYER=1 ./t_present_snap screen
+	DM_PRESENT_LINK=0 MTL_DEBUG_LAYER=1 ./t_present_snap screen_snap
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_present_snap queued
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap ticket
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_present_snap ticket
@@ -425,6 +426,9 @@ t_tess: t_tess.m
 .PHONY: check_t_tess
 check_t_tess: t_tess
 	DM_TEST_TESS="$(CURDIR)/t_tess" MTL_DEBUG_LAYER=1 python3 -m unittest test_dmsh_tess.py
+t_view_reuse: t_view_reuse.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_view_reuse.m $(MTL_T_SRC) $(FW)
+check_t_view_reuse: RUN_ENV = MTL_DEBUG_LAYER=1
 t_border: t_border.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_border.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_border
@@ -550,6 +554,7 @@ check_t_upscaler_mfx: t_upscaler_mfx
 	DM_NVN_ENC_THREAD=0 DM_UPSCALER=metalfx ./t_upscaler_mfx
 	DM_NVN_ENC_THREAD=1 DM_UPSCALER=metalfx ./t_upscaler_mfx
 	DM_NVN_ENC_THREAD=1 DM_UPSCALER=metalfx DM_NVN_BARRIER=game ./t_upscaler_mfx
+	DM_NVN_ENC_THREAD=1 DM_UPSCALER=metalfx DM_NVN_MFX_DIRECT=0 ./t_upscaler_mfx
 	MTL_DEBUG_LAYER=1 ./t_upscaler_mfx
 # NVN2's DLSS on MetalFX's temporal scaler, with and without the encoding thread (MetalFX encodes into the real command buffer; validation stops its Metal 4 scalers, as above)
 t_dlss_mfx: t_dlss_mfx.m t_mfx_passes.h $(MTL_T_DEP)
@@ -582,8 +587,8 @@ t_gl_imports: t_gl_imports.m ../gl/hle_gl.m ../../host/hle.c ../../host/hle.h $(
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gl_imports.m ../../host/hle.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 .PHONY: check_t_gl_imports gl-imports
 check_t_gl_imports: t_gl_imports
-	./t_gl_imports
-	./t_gl_imports --stubs
+	MTL_DEBUG_LAYER=1 ./t_gl_imports
+	MTL_DEBUG_LAYER=1 ./t_gl_imports --stubs
 gl-imports: check_t_gl_imports
 check_t_vk_desc: RUN_ENV = MTL_DEBUG_LAYER=1
 # An attachment opened with LOAD_OP_DONT_CARE keeps what the image held, colour, depth and stencil (Re:ZERO's post chain)
