@@ -6231,6 +6231,8 @@ static os_unfair_lock g_warm_lock = OS_UNFAIR_LOCK_INIT;
 static _Atomic int g_warm_ready;
 static uint64_t g_warm_t0;
 static _Atomic int g_warm_running;   // Background warm-up has not finished yet (the loading screen on entering a run waits a little longer based on this, see mtl_warm_wait)
+static _Atomic int g_warm_bg;   // the prewarm runs beside the game (no prepare step: no window, or DM_PSO_PREPARE=0), not before its first frame
+static _Atomic int g_warm_stop;   // the process is ending (mtl_warm_stop): the prewarm takes no more lines
 static _Atomic uint64_t g_warm_shaders, g_warm_rps, g_warm_mps, g_warm_cps, g_warm_skip_fz, g_warm_skip_stale;   // the prewarm's workers count into them
 static id<MTLRenderPipelineState> mtk_build(const pso_key *, NvShader *, NvShader *, NvShader *, NSError **, int *);
 static _Atomic uint64_t g_mtk_arch, g_mtk_built, g_mtk_dev;   // native mesh pipelines (mtk_build, all threads): taken from the pipeline archive, built and captured for it (arch_harvest), built with no Metal 4 descriptor (not kept)
@@ -9077,6 +9079,7 @@ static id arch_lookup(MTL4PipelineDescriptor *d, int plain, int *from_run) {
     return nil;
 }
 static ArchEpoch *g_ep; static os_unfair_lock g_ep_lock = OS_UNFAIR_LOCK_INIT;   // the current period
+static _Atomic uint64_t g_ep_t0;   // when the current period began (bp_now): a prewarm's timer flush hands it over once it is old enough (arch_warm_flush_due)
 static int g_arch_cap;   // compiles are captured (an archive folder, a serializer): immutable after pso4_init
 static dispatch_group_t g_arch_pending;   // periods handed over and not written yet
 static _Atomic uint64_t g_pb_built, g_pb_archived, g_pb_reused, g_pb_spec, g_pb_legacy, g_pb_base_ns;
@@ -9435,6 +9438,10 @@ static void pso4_init(void) {
                 });
             }
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
+            // A write a stopped run left (arch_write_file writes <file>.mtl4a.tmp and renames it once its index is written; the graceful exit's hard deadline can end the
+            // process inside the write). Nothing writes the folder yet
+            for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil])
+                if ([f hasSuffix:@".mtl4a.tmp"]) { [NSFileManager.defaultManager removeItemAtPath:[g_arch_dir stringByAppendingPathComponent:f] error:nil]; MLOG("pipeline archive: %s removed (a write a stopped run left)", f.UTF8String); }
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *all = [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil]; NSSet<NSString *> *present = [NSSet setWithArray:all ?: @[]];
             NSArray<NSString *> *names = [[all filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]] sortedArrayUsingComparator:^NSComparisonResult(NSString *x, NSString *y) {
@@ -9499,7 +9506,7 @@ static void pso4_init(void) {
         NSError *ce = nil; g_comp4 = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&ce];
         if (!g_comp4) MLOG("[RED] no Metal 4 compiler (%s): render pipelines are built through the MTLDevice", ce.localizedDescription.UTF8String);
         else if (g_arch_dir) {
-            g_ep = ep_new(); g_arch_cap = g_ep != nil;
+            g_ep = ep_new(); g_arch_cap = g_ep != nil; atomic_store(&g_ep_t0, bp_now());
             if (g_arch_cap) atexit(arch_at_exit);   // what is not written yet, written at quit (mtl_arch_save)
             if (!g_ep) MLOG("[RED] pipeline archive: Metal made no pipeline serializer: nothing is captured into %s", g_arch_dir.UTF8String);
         }
@@ -9621,8 +9628,22 @@ static void arch_write_file(ArchEpoch *ep) {
 // ahead during the prewarm, where the timer's flushes wait so that its bases, compiled or captured again, make as few files as they can: a cold start's timer flushes wrote a
 // file each 10 s (Ocarina of Time: 80 files; GitHub issue #1747's, 43), more than PSO_ARCH_COMPACT, and the next start compacted them all. any_time: hand it over during the
 // prewarm too (going to the background, quitting: mtl_arch_save)
+// A timer flush during a prewarm the game plays through (g_warm_bg; DM_PSO_ARCH_WARM_FLUSH_MS, default 60000; 0: none, the prewarm writes full periods alone): the period is handed
+// over once it is that old, and each next one waits twice as long, up to 16 times (60 s, 120 s, ... 16 min), so a long cold start's prewarm adds a file per doubling and not one per
+// 10 s. Without it, a prewarm that outlived the run (Ocarina of Time without a window: 31,663 lines after the first frame, every warm-up run of 2026-11-10) wrote nothing until the
+// exit, and the 1.3 s the SIGTERM exit left could not write the ~425 bases it held (1.8-4 s for 900): every next run compiled them again, 57-167 bases at area loads (PR #2625). Not
+// in the prepare step, which ends before the first frame (a quit there gets MTL_QUIT_ARCH_MS for at most a period), nor while a compaction runs: their bases go into as few files as
+// they can. No cap by count: a period handed over at 512 makes a file of the top compacted tier, and a cold start's 8,600 bases in 16 of them would make the next start compact them
+static int g_warm_flush_ms = -1; static _Atomic int g_warm_flushes;
+static int arch_warm_flush_due(void) {
+    if (g_warm_flush_ms < 0) { const char *e = getenv("DM_PSO_ARCH_WARM_FLUSH_MS"); g_warm_flush_ms = e && *e ? MAX(atoi(e), 0) : 60000; }
+    if (!g_warm_flush_ms || g_compact_enabled || !atomic_load(&g_warm_bg)) return 0;
+    uint64_t wait_ns = ((uint64_t)g_warm_flush_ms << MIN(atomic_load(&g_warm_flushes), 4)) * NSEC_PER_MSEC;
+    return bp_now() - atomic_load(&g_ep_t0) >= wait_ns;
+}
 static void arch_hand_over(ArchEpoch *only, int any_time) {
-    if (!g_arch_cap || (!only && !any_time && atomic_load(&g_warm_running))) return;
+    int warm_due = 0;
+    if (!g_arch_cap || (!only && !any_time && atomic_load(&g_warm_running) && !(warm_due = arch_warm_flush_due()))) return;
     os_unfair_lock_lock(&g_ep_lock); int any = (!only || g_ep == only) && (atomic_load(&g_ep->n) || atomic_load(&g_ep->active)); os_unfair_lock_unlock(&g_ep_lock);
     // nothing captured or under way: the period goes on. A compaction due to close (the prewarm over, no recapture queued) closes all the same: its recaptures are all in periods
     // handed over, and the last of them to be written finishes it, or this does when they all are (before, it stayed open for the run and the next start compacted again)
@@ -9636,7 +9657,8 @@ static void arch_hand_over(ArchEpoch *only, int any_time) {
     os_unfair_lock_lock(&g_ep_lock);
     ArchEpoch *old = g_ep; any = (!only || old == only) && (atomic_load(&old->n) || atomic_load(&old->active));   // again: another flush may just have handed it over
     if (any) {
-        g_ep = ne;
+        g_ep = ne; atomic_store(&g_ep_t0, bp_now());
+        if (warm_due) atomic_fetch_add(&g_warm_flushes, 1);
         // Every period from the first recaptured base on may hold some (see arch_compact_allowed); the first one handed over after the prewarm is the compaction's last
         if (g_compact_enabled && atomic_load(&g_compacted) && !atomic_load(&g_compact_closed)) {
             old->compacting = 1; atomic_fetch_add(&g_compact_periods, 1);
@@ -9655,8 +9677,7 @@ static void arch_flush(void) { arch_flush_from(nil); }
 // on behind (a file is written as .tmp and renamed, so a process killed meanwhile leaves none half-written). Quitting (atexit for ⌘Q, closing the window and exit(); dm_gfx_quit
 // in the graceful exit): ending, waiting up to wait_ms for the compiles under way in the period and the writes (a file of 900 bases took 1.8-4 s on Macs, so a full period some
 // 4-9 s). A write the exit then cuts short is not a compaction that crashed Metal: its marker goes, and none is written from here on (arch_mark). A wait (wait_ms > 0) first lets the
-// harvest queue capture what it holds (arch_harvest_wait), within the same time
-enum { ARCH_QUIT_WAIT_MS = 10000 };
+// harvest queue capture what it holds (arch_harvest_wait), within the same time. Every end the host controls stops the prewarm first (mtl_warm_stop) and waits MTL_QUIT_ARCH_MS
 void mtl_arch_save(int wait_ms, int ending) {
     if (!g_arch_cap) return;
     uint64_t t0 = bp_now(); dispatch_time_t until = dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC);
@@ -9664,17 +9685,20 @@ void mtl_arch_save(int wait_ms, int ending) {
     int n = atomic_load(&g_arch_new);
     arch_hand_over(nil, 1);
     if (!wait_ms && !ending) return;
+    if (n && wait_ms > 0) MLOG("pipeline archive at exit: writing %d pipelines (up to %d ms)", n, wait_ms);
     late = (wait_ms > 0 && dispatch_group_wait(g_arch_pending, until)) || late;
     if (ending) arch_mark(-1);
-    if (n || late) MLOG("pipeline archive at exit: %d pipelines not written yet, %s (%.0f ms)", n,
-                        late ? "not all written in time: those left are built again at the next start" : !wait_ms ? "not waited for" : "written", (bp_now() - t0) / 1e6);
+    if (n || late) MLOG("pipeline archive at exit: %d pipelines not written yet, %s (%d left, %.0f ms)", n,
+                        late ? "not all written in time: those left are built again at the next start" : !wait_ms ? "not waited for" : "written", atomic_load(&g_arch_new), (bp_now() - t0) / 1e6);
 }
-static void arch_at_exit(void) { mtl_arch_save(ARCH_QUIT_WAIT_MS, 1); }
+static void arch_at_exit(void) { mtl_warm_stop(); mtl_arch_save(MTL_QUIT_ARCH_MS, 1); }
 // What the harvest queue holds captured, then a flush, then every period handed over is written (not on g_arch_q, which writes them, nor on the harvest queue)
 static void arch_flush_wait(void) { arch_harvest_wait(DISPATCH_TIME_FOREVER); arch_flush(); if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER); }
 static void arch_note_new(void) {   // a base was compiled: flush 10 s later (one flush for a burst of them)
     if (!g_arch_q || atomic_exchange(&g_arch_sched, 1)) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ atomic_store(&g_arch_sched, 0); arch_flush(); });
+    // during a prewarm the game plays through, the flush waits for the period's age (arch_warm_flush_due): look again 10 s later while captures wait, new ones or not
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ atomic_store(&g_arch_sched, 0); arch_flush();
+        if (atomic_load(&g_warm_running) && atomic_load(&g_warm_bg) && atomic_load(&g_arch_new) > 0) arch_note_new(); });
 }
 static void arch_compact_finish(void) {   // after every period that may hold recaptured bases is written (arch_write): the old files go once their bases are in the new ones
     if (!g_compact_files || !g_compacted) return;
@@ -10209,6 +10233,7 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
             int i = atomic_fetch_add(&g_pre_next, 1);
             // the first worker to find no pair left hands the period over: it is written once the compiles still under way in it return, not after the slowest of all
             if (i >= n) { if (i == n) arch_flush(); break; }
+            if (atomic_load(&g_warm_stop)) break;   // the process is ending: the pairs left are built at the next start
             pre_pair(pairs[(NSUInteger)i][0], pairs[(NSUInteger)i][1], zero);
             int d = ++g_pre_done;
             if (d % 1000 == 0) {
@@ -10488,6 +10513,7 @@ static void warm_task(WarmTask *t) {
             g_warm_done++; return;
         }
         for (NSData *row in t->rs) {
+            if (atomic_load(&g_warm_stop)) break;
             [row getBytes:&sk length:sizeof sk];
             if (!vs || (t->fkey.length && !fs)) { g_warm_done++; continue; }
             id<MTLFunction> fsfn = nil;
@@ -10524,6 +10550,13 @@ static void warm_finish(void) {
     arch_flush();   // the period of the recaptured bases (compaction finishes once it is written), after the prewarm stops recapturing them; recaptures still queued close it (arch_harvest)
     @autoreleasepool { pso_prebuild_bg(); }   // then, once, the bases every shader pair's hybrid draws need
 }
+// The process is ending (dm_gfx_quit_begin, atexit): the prewarm and the pairs' prebuild take nothing more, so the archive's write does not share the compiler with them and no
+// capture joins a period after the exit handed it over; what they had not built is built at the next start. The compiles under way finish (the period's write waits for them)
+void mtl_warm_stop(void) {
+    if (atomic_exchange(&g_warm_stop, 1)) return;
+    if (atomic_load(&g_warm_running)) MLOG("pipeline prewarm stopped: the process is ending (%llu lines done)", (unsigned long long)g_warm_done);
+    if (atomic_load(&g_pre_running)) MLOG("pipeline prebuild stopped: the process is ending (%d pairs handed out)", (int)atomic_load(&g_pre_next));
+}
 // Wait for the background warm-up to finish (at most timeout_ms): returns how many milliseconds were actually waited, 0 if it is not running. On first install the system shader cache is fully cold; if warm-up is slower than the player entering a run,
 // pipelines not yet warmed are compiled on the spot on the submit thread = in-run stutter; the loading screen on entering a run blocks the player anyway, so let it load a little longer (called where hle_nvn.c presents).
 int mtl_warm_wait(int timeout_ms) {
@@ -10559,7 +10592,7 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
     __block _Atomic long next = 0;
     dispatch_group_t g = dispatch_group_create();
     for (int w = 0; w < workers; w++) dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        for (;;) { long i = atomic_fetch_add(&next, 1); if (i >= n) break; warm_task(tasks[(NSUInteger)i]); }
+        for (;;) { long i = atomic_fetch_add(&next, 1); if (i >= n || atomic_load(&g_warm_stop)) break; warm_task(tasks[(NSUInteger)i]); }
     });
     int shown = 0;
     while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
@@ -10709,13 +10742,18 @@ static void warm_start(void) {
         long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines);
         if (lines) warm_prepare(tasks, lines);
         else MLOG("pipeline prepare: the prewarm lists hold nothing to build");
+        if (atomic_load(&g_warm_stop)) return;   // the process is ending: what is left is built at the next start
         warm_finish();
         @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
         return;
     }
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
-    dispatch_async(q, ^{ @autoreleasepool { long lines = 0; for (WarmTask *t in warm_parse(paths, &lines)) warm_task(t); warm_finish(); } });
+    atomic_store(&g_warm_bg, 1);
+    dispatch_async(q, ^{ @autoreleasepool {
+        long lines = 0; for (WarmTask *t in warm_parse(paths, &lines)) { if (atomic_load(&g_warm_stop)) return; warm_task(t); }
+        if (!atomic_load(&g_warm_stop)) warm_finish();   // the process is ending: what is left is built at the next start
+    } });
 }
 static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
