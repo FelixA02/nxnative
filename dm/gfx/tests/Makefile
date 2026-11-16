@@ -332,6 +332,9 @@ t_ubp_running: t_ubp_running.m $(MTL_T_DEP)
 .PHONY: check_t_ubp_running
 check_t_ubp_running: t_ubp_running
 	./t_ubp_running
+# CPU only (no Metal device), with AddressSanitizer and UBSan: lookups fill g_ubp_idx up to the bound pend_room keeps (CI runs it). Globals are not instrumented: hle_nvn.c walks its entry table across neighbouring globals
+t_pend_index: t_pend_index.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -mllvm -asan-globals=0 -o $@ t_pend_index.m $(MTL_T_SRC) $(FW)
 t_direct_upload: t_direct_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_direct_upload.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_direct_upload
@@ -504,6 +507,9 @@ check_t_depth16_clear: RUN_ENV = MTL_DEBUG_LAYER=1
 t_clear_ds: t_clear_ds.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_clear_ds.m $(MTL_T_SRC) $(FW)
 check_t_clear_ds: RUN_ENV = MTL_DEBUG_LAYER=1
+t_lazy_clear_order: t_lazy_clear_order.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_lazy_clear_order.m $(MTL_T_SRC) $(FW)
+check_t_lazy_clear_order: RUN_ENV = MTL_DEBUG_LAYER=1
 t_zero_depth: t_zero_depth.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_zero_depth.m $(MTL_T_SRC) $(FW)
 check_t_zero_depth: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -561,6 +567,14 @@ check_t_rt_recycle: t_rt_recycle
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
+t_storage_pair: t_storage_pair.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_storage_pair.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_storage_pair
+check_t_storage_pair: t_storage_pair
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_storage_pair
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_storage_pair
+	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_storage_pair
+	DM_NVN_STORAGE_ALIAS=0 MTL_DEBUG_LAYER=1 ./t_storage_pair
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
 t_upscaler_mfx: t_upscaler_mfx.m t_mfx_passes.h $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)
@@ -615,7 +629,7 @@ t_vk_fan: t_vk_fan.m ../vk/hle_vk.m $(MTL_T_DEP)
 check_t_vk_fan: RUN_ENV = MTL_DEBUG_LAYER=1
 t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
-t_gl_imports: t_gl_imports.m ../gl/hle_gl.m ../../host/hle.c ../../host/hle.h $(MTL_T_DEP)
+t_gl_imports: t_gl_imports.m ../gl/hle_gl.m ../gl/gl_aliases.h ../../host/hle.c ../../host/hle.h $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gl_imports.m ../../host/hle.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 .PHONY: check_t_gl_imports gl-imports
 check_t_gl_imports: t_gl_imports
@@ -657,6 +671,11 @@ t_rop_round: t_rop_round.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rop_round.m $(MTL_T_SRC) $(FW)
 check_t_rop_round: t_rop_round
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_blend_zero.py --fixture-rop "$$work"; MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"; DM_NVN_ROP_ROUND=0 MTL_DEBUG_LAYER=1 ./t_rop_round "$$work"
+# Typed outputs through the pipeline path (t_typed_outputs.m), with its libraries from test_dmsh_typed.py, on the Metal 4 path and the MTLDevice's
+t_typed_outputs: t_typed_outputs.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_typed_outputs.m $(MTL_T_SRC) $(FW)
+check_t_typed_outputs: t_typed_outputs
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_typed.py --fixture "$$work"; for m in 1 0; do DM_PSO_MTL4=$$m MTL_DEBUG_LAYER=1 ./t_typed_outputs "$$work"; done
 # Logic operations through the replay (t_logic.m), with its shaders from test_dmsh_logic.py
 t_logic: t_logic.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_logic.m $(MTL_T_SRC) $(FW)
@@ -701,6 +720,13 @@ t_render_enable_queue: t_render_enable_queue.m $(MTL_T_DEP)
 check_t_render_enable_queue: t_render_enable_queue
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
+
+t_vis_need: t_vis_need.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_vis_need.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_vis_need
+check_t_vis_need: t_vis_need
+	MTL_DEBUG_LAYER=1 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_VIS_NEED=0 ./$<
 
 t_render_counter_overlap: t_render_counter_overlap.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_render_counter_overlap.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
