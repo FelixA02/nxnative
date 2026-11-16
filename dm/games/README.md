@@ -69,6 +69,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Blasphemous](0100698009C6E000/README.md) | `0100698009C6E000` | 1.0.8 | 8.3.1 | Unity 2017.4.28f1 IL2CPP, FMOD | NVN |
 | [Blasphemous 2](010040801A4C8000/README.md) | `010040801A4C8000` | 1.0.8 | 15.3.2 | Unity 2021.3.20f1 IL2CPP, FMOD | NVN |
 | [Brain Memory Training Academy](0100F5D01DA3A000/README.md) | `0100F5D01DA3A000` | 1.0.0 (base) | 16.2.4 | Unity 2022.3.5f1 IL2CPP | NVN |
+| [Burnout Paradise Remastered](0100DBF01000A000/README.md) | `0100DBF01000A000` | 1.0.0 (base) | 9.3.0 | Criterion's engine | NVN |
 | [Captain Toad: Treasure Tracker](01009BF0072D4000/README.md) | `01009BF0072D4000` | 1.4.2 | 8.2.0 | Nintendo EPD Tokyo (`al` over sead / agl) | NVN |
 | [Castlevania: Belmont's Curse](0100BA4026E94000/README.md) | `0100BA4026E94000` | 1.1.0 | 19.3.16 | Unity 2022.3.62f2 IL2CPP, FMOD | NVN |
 | [Catherine: Full Body](0100BF00112C0000/README.md) | `0100BF00112C0000` | 1.0.1a | 8.2.1 | Atlus GFD (CRI middleware) | NVN |
@@ -165,6 +166,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [PRAGMATA](0400C76024710000/README.md) | `0400C76024710000` | v196608 (Switch 2) | 20.5.15 (Ounce) | RE Engine, Havok, Wwise | NVN2 |
 | [Princess Peach: Showtime!](01007A3009184000/README.md) | `01007A3009184000` | 1.0.0 | 15.3.2 | Unreal Engine 4.27 (Good-Feel), Wwise | NVN |
 | [Raging Loop](010020400E1C2000/README.md) | `010020400E1C2000` | 1.0.0 (base) | 7.3.2 | Unity 2018.3.10f1 IL2CPP | NVN |
+| [Rayman Legends: Definitive Edition](01005FF002E2A000/README.md) | `01005FF002E2A000` | 1.2 | 1.3.1 | Ubisoft's UbiArt Framework | NVN |
 | [Red Dead Redemption](01007820196A6000/README.md) | `01007820196A6000` | 1.0.7 | 15.3.2 | Rockstar's RAGE (Double Eleven port) | NVN |
 | [Resident Evil 4](0400569027BF4000/README.md) | `0400569027BF4000` | v131072 (Switch 2) | 21.4.3 (Ounce) | RE Engine, Havok, Wwise | NVN2 |
 | [Return of the Obra Dinn](010032E00E6E2000/README.md) | `010032E00E6E2000` | 1.0.1 | 8.2.0 | Unity 2017.4.28f1 IL2CPP | NVN |
@@ -173,6 +175,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [ROMANCE OF THE THREE KINGDOMS XIV: Diplomacy and Strategy Expansion Pack](0100ED7012DB2000/README.md) | `0100ED7012DB2000` | 1.0.10 | 10.4.1 | Koei Tecmo's KTGL | NVN |
 | [Sea of Stars](01008C0016544000/README.md) | `01008C0016544000` | 2.0.59001 | 16.2.0 | Unity 2021.3.25f1 IL2CPP | NVN |
 | [SHIN MEGAMI TENSEI V: Vengeance](010069C01AB82000/README.md) | `010069C01AB82000` | 1.0.3 | 15.3.2 | Unreal Engine 4.27 | NVN |
+| [Sid Meier's Civilization VI](010044500C182000/README.md) | `010044500C182000` | 1.2.19 | 8.2.1 | Firaxis, Havok, Wwise | NVN |
 | [Sid Meier's Civilization VII](0100C3601518C000/README.md) | `0100C3601518C000` | 1.5.0.1 (Mac; iOS address space open) | 19.3.11 | Firaxis, Coherent Gameface / V8, Wwise | NVN |
 | [Silver Pines](0100D5B026844000/README.md) | `0100D5B026844000` | 1.0.0 (base) | 21.4.7 | Unity 6000.3.15f1 IL2CPP | NVN |
 | [Sonic Frontiers Definitive Edition](0400921025B32000/README.md) | `0400921025B32000` | v65536 (Switch 2) | 21.4.1 (Ounce) | Hedgehog Engine 2, CRIWARE | NVN2 |

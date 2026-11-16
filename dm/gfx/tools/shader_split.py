@@ -41,13 +41,14 @@
 #   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its
 #       .pak archives and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
-#   · bnd2 (Criterion's Bundle 2, Need for Speed: Hot Pursuit Remastered): whole GLSLC outputs in the zlib resources of SHADERS.BNDL, see bnd2_resources and bnd2_shaders
+#   · bnd2 (Criterion's Bundle 2: Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): whole GLSLC outputs in its zlib resources, see bnd2_resources and bnd2_shaders
 #   · Heaps (Dead Cells): whole GLSLC outputs in base64 after the GLSL of the engine's shader cache (shaders.cache.nx), inside its PAK archive, see heaps_pak_files and heaps_shaders
 #   · Frostbite (EA SPORTS FC 27): the CompiledBytecode resources of the bundles its superbundle tables (.toc) list, in its cas files (Oodle Leviathan, decoded by the game's own decoder in the
 #       Mac host), each a VNVN record with one code area and control section (frostbite.py), see frostbite_jobs and frostbite_shaders
 #   · PDAT (the engine with the namespace phx, Kirby Air Riders): flatbuffer records tagged PMAP, zstd frames in the .dat archives, each holding a program's control sections and code areas, see pdat_jobs and pdat_shaders
 #   · Unreal Engine 3 (Batman: Arkham Knight): shader records in its global shader cache (BMSG) and in the packages (the combined shader cache), whose compressed chunks are Oodle blocks decoded by the game's own decoder in the Mac host, see ue3_body and ue3_shaders
-#   · CIVBSF (Firaxis, Civilization VII): indexed single-stage NVN programs, each with its code and control lengths, see civbsf_shaders
+#   · CIVBSF (Firaxis, Civilization VI / VII): indexed NVBC / GLSLC or code/control payloads, see civbsf_shaders
+#   · IPK (Ubisoft's UbiArt, Rayman Legends: Definitive Edition): whole GLSLC outputs in the .fxb effect files of bundle_nn.ipk (zlib entries), see ipk_shaders
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
 #   +0x700 = start of the c1 constant segment within the code area; for compute +0x748 thread group xyz (u32 ×3), +0x754 shared memory bytes (checked one by one against PC reflection on D2R's 22 compute shaders).
 # Stage: BNSH uses the stage slot; BAHS uses bits 10..13 of SPH word 0 (1 vertex 2 hull 3 domain 4 geometry 5 pixel), and a compute header means compute.
@@ -962,6 +963,40 @@ def d11_pack_shaders(path, label, out):
         if not found: found = glslc_shaders(m, lb, need=False)
         out.extend(found)
 
+UBIART_IPK = bytes.fromhex('50ec12ba')
+def ipk_shaders(path, rel, out):
+    """A UbiArt IPK archive (Rayman Legends: Definitive Edition, bundle_nn.ipk, version 7, 26,878 files). Big-endian: magic 0x50EC12BA, version, platform, +0xc base offset (the data start),
+    +0x10 file count; entries from +0x38: u32 offset count, u32 size, u32 compressed size (0: stored), u64 time, u64 offset × count (from the base), u32 + directory, u32 + name, u32 CRC, u32 0.
+    Compressed entries are zlib. The shaders are whole GLSLC outputs in the engine's .fxb effect files (enginedata/shaders/compiled/nx: renderpct, afterfx, font, movie; 5,893 programs);
+    shaders_dev/ holds a development build of the same effects with other keys, which the game does not ask for. Only the .fxb entries are read: the 2.6 GB of .ckd cooked assets hold none"""
+    label = f'/{rel}'
+    with open(path, 'rb') as f:
+        h = f.read(0x38)
+        if len(h) < 0x38: red(f'{label}: {len(h)} bytes, shorter than a UbiArt IPK header (0x38)')
+        ver, _plat, base, n = struct.unpack_from('>IIII', h, 4)
+        if ver != 7: red(f'{label}: UbiArt IPK version {ver} (only version 7 is read)')
+        t = f.read(max(base - 0x38, 0))
+        if base < 0x38 or len(t) != base - 0x38: red(f'{label}: the IPK header puts its data at {base:#x}, outside the file')
+        p = 0
+        for i in range(n):
+            try:
+                noff, size, csize = struct.unpack_from('>III', t, p); p += 20
+                off = struct.unpack_from('>Q', t, p)[0] if noff else 0; p += 8 * noff
+                pl = struct.unpack_from('>I', t, p)[0]; d = t[p + 4:p + 4 + pl].decode('latin1'); p += 4 + pl
+                nl = struct.unpack_from('>I', t, p)[0]; name = d + t[p + 4:p + 4 + nl].decode('latin1'); p += 4 + nl + 8
+            except struct.error: red(f'{label}: entry {i} of {n} runs past the IPK table ({len(t) + 0x38:#x} bytes): not the layout of a version 7 archive')
+            if not name.endswith('.fxb') or '/shaders_dev/' in '/' + name: continue
+            f.seek(base + off); b = f.read(csize or size)
+            if len(b) != (csize or size): red(f'{label}/{name}: the entry at {base + off:#x} runs past the end of the archive')
+            if csize:
+                try: b = zlib.decompress(b)
+                except zlib.error as e: red(f'{label}/{name}: invalid zlib stream ({e})')
+            if len(b) != size: red(f'{label}/{name}: {len(b)} bytes decoded, the entry says {size}')
+            found = []
+            scan_blob(b, f'{label}/{name}', found)
+            if not found: found = glslc_shaders(b, f'{label}/{name}', need=False)
+            out += found
+
 CPK = b'CPK '
 def cpk_jobs(files, parts=64):
     """Every entry of every CRI CPK archive in ranges of about equal length (Bayonetta 2: six in the RomFS root, 9.5 GB, 6,091 files, 12 GB of them CRILAYLA-compressed; its shaders are BNSH
@@ -1277,22 +1312,43 @@ def viper_shader(d, label):
 CIVBSF = b'CIVBSF\0\0'
 
 def civbsf_shaders(d, label):
-    """Firaxis's shader library: +0x20 the shader table, +0x68 its count, 0x50-byte entries. Each entry's +8 points to {u64 data offset, u64 size}; +0 may instead point to
-    platform metadata (Sony pragmas), not the shader. The data is {u32 0xff00ff00, code length, control length, flags}, then code and control. Civilization VII 1.5.0.1's
+    """Firaxis's shader library: +0x20 the shader table, +0x68 its count. Revision 0x1118 (Civilization VI 1.2.19) has 0x48-byte entries; +8 points to four
+    {u64 offset, u32 size, u32 platform} descriptors, platform 3 holding NVBC: an 0x28-byte header, GLSLC output and reflection. Its header's +8 / +0x10 are their lengths;
+    the two saved pointers are unrelated runtime addresses. All 539 records decode as one stage each (488 distinct keys). Revision 0x1218 has 0x50-byte entries;
+    each entry's +8 points to {u64 data offset, u64 size}; +0 may instead point to platform metadata (Sony pragmas), not the shader.
+    The data is {u32 0xff00ff00, code length, control length, flags}, then code and control. Civilization VII 1.5.0.1's
     ShaderAutoGen_Linux_NVN_FinalRelease.bs has 801 records (481 keys): 357 vertex, 343 pixel, 101 compute. Fifteen controls carry bytes beyond their own +0x20 length,
     so the enclosing record's lengths delimit them. Other sections describe effects and resources; their stage-pair relation is not established, so these remain single stages."""
     where = f'{label} CIVBSF'
     span(d, 0, 0x90, where)
+    version, = field(d, '<I', 8, where)
+    stride = {0x1118: 0x48, 0x1218: 0x50}.get(version)
+    if stride is None: red(f'{where}: unknown revision {version:#x}')
     size, = field(d, '<I', 0xc, where)
     if size != len(d): red(f'{where}: file size {size:#x} does not match {len(d):#x} bytes')
     table, = field(d, '<Q', 0x20, where)
     count, = field(d, '<I', 0x68, where)
     if table < 0x90: red(f'{where}: shader table overlaps the header')
-    span(d, table, count * 0x50, f'{where} shader table')
+    span(d, table, count * stride, f'{where} shader table')
     out = []
     for i in range(count):
-        entry = table + i * 0x50; source = f'{where} shader {i}'
+        entry = table + i * stride; source = f'{where} shader {i}'
         descriptor, = field(d, '<Q', entry + 8, source)
+        if version == 0x1118:
+            span(d, descriptor, 0x40, f'{source} platform descriptors')
+            for platform in range(4):
+                offset, length, kind = field(d, '<QII', descriptor + platform * 16, source)
+                if kind != platform: red(f'{source}: platform descriptor {platform} has kind {kind}')
+                payload = span(d, offset, length, f'{source} platform {platform} data')
+                if platform != 3: continue
+                span(payload, 0, 0x28, f'{source} NVBC')
+                if payload[:8] != b'NVBC\0\0\0\0': red(f'{source}: unknown NVBC tag')
+                nout, nrefl = field(payload, '<QQ', 8, source)
+                if 0x28 + nout + nrefl != length: red(f'{source}: NVBC output and reflection lengths do not match the data size')
+                output = payload[0x28:0x28 + nout]
+                if output[:4] != b'\x91\x68\x86\x19' or glslc_layout(output, 0)[0] != nout: red(f'{source}: invalid NVBC GLSLC output length or tag')
+                out.extend(glslc_shaders(output, f'{label}#CIVBSF@{entry:#x}'))
+            continue
         offset, length = field(d, '<QQ', descriptor, f'{source} descriptor')
         payload = span(d, offset, length, f'{source} data')
         tag, ncode, nctl, _ = field(payload, '<4I', 0, source)
@@ -2335,8 +2391,32 @@ def sumo_shaders(d, label):
         out.append(sumo_program(d, h, size, co, ko, cn, kn, f'{label}#NVNSH@{h:#x}', STAGES[stage]))
     return out
 
+KIT = b'kit!'   # kit.MAGIC: KIT index files, and the tag of their jobs
+
+def kit_jobs(files, parts=64):
+    """Unravel TWO's KIT archives (kit.py): read only through their index, in ranges of members, the parts left out of the loose-file scan. Members are named only by hash, so every
+    one is decoded and scanned (scan_blob: Phyre effects)"""
+    import kit
+    kits = []
+    for p, r in files:
+        if not p.lower().endswith('.kit'): continue
+        with open(p, 'rb') as f: head = f.read(4)
+        if head != KIT: continue
+        try: kits.append((p, r, kit.entries(p)))
+        except ValueError as e: red(str(e))
+    jobs, paths = [], set()
+    step = sum(e[3] for _, _, es in kits for e in es) / parts
+    for p, r, es in kits:
+        paths.add(p); paths.update(f'{p}.{e[1]}' for e in es)
+        cur, size = [], 0
+        for e in es:
+            cur.append(e); size += e[3]
+            if size >= step: jobs.append((p, r, (KIT, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (KIT, tuple(cur))))
+    return jobs, paths
+
 def phyre_shaders(d, label):
-    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2)."""
+    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2). Unravel TWO also has headerless compute code."""
     out = []
     for m in re.finditer(re.escape(CTL_MAGIC), d):
         c = m.start()
@@ -2344,9 +2424,10 @@ def phyre_shaders(d, label):
         cn = struct.unpack_from('<I', d, c + 0x20)[0]
         kn = struct.unpack_from('<I', d, c + 0x704)[0]
         k = c - kn
-        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d) or d[k:k + 4] != GFX_MAGIC: continue
+        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d): continue
         ctl, code = d[c:c + cn], d[k:c]
-        st = sph_stage(code)
+        st = glslc_stage(ctl, code)
+        if st == 'cs' and code[:4] != CS_MAGIC and (d[:4] != b'RYHP' or CTL_MAGIC in code): continue
         if st and not check(label, st, ctl, code): out.append((f'{label}#PHYRE@{k:#x}', st, ctl, code))
     return out
 
@@ -3248,6 +3329,8 @@ def scan_blob(d, label, out, depth=0, left=None):
     if d[:4] in PG_STAGES and len(d) >= 0x18 and d[(o := struct.unpack_from('<I', d, 0xc)[0]):o + 4] == CTL_MAGIC: out.extend(pg_shader(d, label)); return
     if shaders := pg_sized_shader(d, label): out.extend(shaders); return
     if (shaders := viper_shader(d, label)) is not None: out.extend(shaders); return   # Star Fox's shader binaries
+    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
+        if shaders := phyre_shaders(d, label): out.extend(shaders); return
     if d[:4] == b'VIPR':   # Star Fox's resource containers: two of them wrap the engine's NDSR upscaler networks (ounce-nvn2-upper_left_ndsr.bin), 40 shaders each, as a file inside
         for m in re.finditer(b'NDSR', d):
             if m.start() + 0x20 <= len(d) and d[m.start() + 4:m.start() + 6] == b'\x00\x01': out.extend(ndsr_shaders(d[m.start():], f'{label}#NDSR@{m.start():#x}'))
@@ -3314,23 +3397,26 @@ def separable_pairs(keys):
 
 SMASH_ARC = struct.pack('<Q', 0xABCDEF9876543210)   # smash_arc.MAGIC (scan_file reads only the first bytes, without importing the reader)
 BND2 = b'bnd2'
+BND2_LAYOUTS = {2: (3, 0x40), 3: (4, 0x50)}   # version → (blocks per resource, entry size): 2 in Burnout Paradise Remastered, 3 in Need for Speed: Hot Pursuit Remastered
 
 def bnd2_resources(d, label):
-    """The resources of a Criterion Bundle 2 ('bnd2', Burnout Paradise's format; version 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
-    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 four block data offsets (u32), +0x28 flags (bit 0: resources zlib-compressed).
-    An entry is 0x50 bytes: +0x00 resource ID u64, +0x08 import hash u64, +0x10 four uncompressed sizes, +0x20 four sizes on disk (each with the alignment in the top
-    nibble), +0x30 four offsets (from that block's data offset), +0x40 import offset, +0x44 type ID, +0x48 import count u16, flags u8, stream index u8.
-    A resource has up to four blocks (0: main memory, 1: graphics memory). Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
-    ver, _, _, cnt, eoff, *datoff, flags = field(d, '<10I', 4, f'{label}: bnd2 header')
-    table_end = eoff + cnt * 0x50
-    if ver not in (2, 3) or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
+    """The resources of a Criterion Bundle 2 ('bnd2'; version 2 in Burnout Paradise Remastered, 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
+    The version sets the number of blocks a resource has, B (BND2_LAYOUTS: 3 or 4), and every offset after the first array follows from it.
+    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 B block data offsets (u32), then the flags (bit 0: resources zlib-compressed).
+    An entry (0x40 bytes in v2, 0x50 in v3): +0x00 resource ID u64, +0x08 import hash u64, +0x10 B uncompressed sizes, then B sizes on disk (each with the alignment in the top
+    nibble), then B offsets (from that block's data offset), then import offset, type ID, import count u16, flags u8, stream index u8.
+    Block 0 is main memory, block 1 graphics memory. Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
+    ver, _, _, cnt, eoff = field(d, '<5I', 4, f'{label}: bnd2 header')
+    blocks, entry = BND2_LAYOUTS.get(ver, (0, 0))
+    table_end = eoff + cnt * entry
+    if not blocks or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
+    *datoff, flags = field(d, f'<{blocks + 1}I', 0x18, f'{label}: bnd2 header')
     out = []
     for i in range(cnt):
-        e = eoff + i * 0x50
-        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x44)
-        unpacked = struct.unpack_from('<4I', d, e + 0x10)
-        sizes = struct.unpack_from('<4I', d, e + 0x20); offs = struct.unpack_from('<4I', d, e + 0x30)
-        for k in range(4):
+        e = eoff + i * entry
+        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x14 + 12 * blocks)
+        unpacked, sizes, offs = (struct.unpack_from(f'<{blocks}I', d, e + 0x10 + 4 * blocks * a) for a in range(3))
+        for k in range(blocks):
             n = sizes[k] & 0x0FFFFFFF; expected = unpacked[k] & 0x0FFFFFFF
             where = f'{label}: bnd2 resource {rid:016x} block {k}'
             if not n:
@@ -3464,6 +3550,13 @@ def scan_file_in(args):
         if args[2][1] is None: red(args[2][2])
         lspk_shaders(args[2][1], rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == KIT:   # a range of a KIT archive's members (kit_jobs)
+        import kit
+        for e in args[2][1]:
+            try: d = kit.read(path, e)
+            except ValueError as err: red(str(err))
+            scan_blob(d, f'/{rel}#{e[0]}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == b'ARH':
         arh_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3472,6 +3565,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if path.endswith('.pkdswitch') and os.path.exists(path[:-len('.pkdswitch')] + '.pkiswitch'):   # Double Eleven's resource pack, read through its index (d11_pack_shaders)
         d11_pack_shaders(path, '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == UBIART_IPK:   # a UbiArt IPK archive (ipk_shaders): its .fxb effect files, without reading the rest
+        ipk_shaders(path, rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] in (IDRK, PDRK):
         idrk_shaders(path, '/' + rel, found)
@@ -3524,7 +3620,7 @@ def scan_file_in(args):
     if len(args) > 2:   # a range of LINKDATA entries (linkdata_jobs)
         linkdata_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
-    if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL): GLSLC outputs in its zlib resources (bnd2_shaders)
+    if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): GLSLC outputs in its zlib resources (bnd2_shaders)
         found += bnd2_shaders(open(path, 'rb').read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:3] == b'PAK':   # a Heaps PAK archive (Dead Cells): only its shader cache is read, not its 2 GB of other files (heaps_pak_files, heaps_shaders)
@@ -3575,14 +3671,10 @@ def scan_file_in(args):
     if d[:3] == b'\x1f\x8b\x08':   # standard gzip: Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs
         d = ungzip(d, '/' + rel); head = d[:16]   # later format probes inspect decoded bytes, not the gzip timestamp
     if head[4:5] == b'\x78' and path.endswith('.gz') and (z := gust_gz(d)) is not None: d = z   # Gust's chunked zlib (gust_gz)
-    # Monolith also ships these containers loose, without an ARH/ARD archive
-    # (Xenoblade DE). The generic prefilter below otherwise drops even HCPS.
-    # DRSM model streams contain several embedded XBC1 resources.
-    if d[:4] in (b'HCPS', b'xbc1', b'DRSM') or d[:8] == b'cmp\0zlib':
+    # Containers the generic prefilter below would drop, read whole by scan_blob: Monolith's, which it also ships loose, without an ARH/ARD archive (Xenoblade DE;
+    # DRSM model streams contain several embedded XBC1 resources), and Phyre's effects and FFX/X-2's loose programs, their two lengths before the code (phyre_shaders)
+    if d[:4] in (b'HCPS', b'xbc1', b'DRSM', b'RYHP') or d[:8] == b'cmp\0zlib' or d[8:12] == GFX_MAGIC:
         scan_blob(d, '/' + rel, found)
-        return rel, uniq_keys(found), var_pairs(found), trees
-    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
-        found += phyre_shaders(d, '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC): d = unsized(d, '/' + rel)   # HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames). Read raw, the split found 121 shaders and the game asked for 900 it did not have ("[RED] shader ... is not in the shader map")
     if d[:4] == b'Yaz0': d = yaz0(d, '/' + rel)
@@ -3700,8 +3792,9 @@ def main():
     pd_jobs, pdats = pdat_jobs(files)   # Kirby Air Riders' PDAT archives: the PMAP records in byte ranges
     rp_jobs, rpfs = rpf_jobs(files, main_v)   # Red Dead Redemption's RPF6 archives, their tables decrypted with the key in main (rpf6.py)
     ls_jobs, lsps = lspk_jobs(files)   # Larian's packages: indexed BSHD programs, without reading unrelated assets
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + d3_jobs + ca_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + rp_jobs + ls_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in d3s and p not in cascs and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in rpfs and p not in lsps]
+    kt_jobs, kits = kit_jobs(files)   # Unravel TWO's KIT shards: chained LZ4 resources and Phyre effects
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + d3_jobs + ca_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + rp_jobs + ls_jobs + kt_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in d3s and p not in cascs and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in rpfs and p not in lsps and p not in kits]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         n = len(big) + len(files)
         results += pooled(ex, big, n) + pooled(ex, files, n, len(big), chunk=16)
