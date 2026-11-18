@@ -9,6 +9,14 @@
 - **Fix:** copy a recorded seed list when present and report its absence otherwise. Required shader tables and a failed copy of an existing seed list still stop the build. No seed records are invented, and shader cache inputs are unchanged. This does not change shader rebuild or resume decisions.
 - **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md), [NX2Apple issue #922](https://github.com/LNPANDY/NX2Apple/issues/922). The separate report of repeated shader compilation remains open.
 
+### PFS0 files extend beyond a truncated package
+
+- **Symptom:** `nx_extract --aoc` aborts with an unhandled `ResultFsOutOfRange (2002-3005)` when a package's file table declares bytes that are not present.
+- **Cause:** the PFS0 header and name table were checked, but each payload-relative file offset and size was trusted. LibHac later tried to read the missing bytes, before the extractor could issue its normal damaged-package diagnostic.
+- **Fix:** `PackageStorage` validates every file range against the original payload before mounting or adding a virtual final name terminator. The size check uses subtraction to avoid 64-bit overflow, and accepts an empty file at EOF. `OpenNsp` probes the XCI header only when enough bytes exist, then routes malformed PFS0 headers and payload ranges to a named `[RED] the NSP is damaged` message and exit code 3. `--allow-damaged` cannot supply missing container bytes, so it does not bypass this check. The source is never changed.
+- **Found on:** [Diablo II: Resurrected](../../dm/games/0100726014352000/README.md), whose separate licence-only DLC package was truncated ([issue #2013](https://github.com/seedds/nxnative/issues/2013)). Main now has the shared [CASC/SHAD reader](shaders.md#blizzards-casc-storage-and-shad-containers); that separate shader-discovery fix does not repair missing package bytes. The reported base game alone (v0) remains unchecked, as the game note records.
+- **Check:** `dm/tools/tests/test_pfs0_storage.py` exercises synthetic payload truncation, out-of-range and overflowing spans, an empty file at EOF, and the CLI's damaged-input exit with and without `--allow-damaged`, with both normal and missing-final-NUL name tables.
+
 ### PFS0 file-name table missing its final NUL
 
 - **Symptom:** package identification stops with `ValueError: subsection not found` in `pfs0_names`, or LibHac reports `ResultFsPathNotFound` opening the last file of an NSP.
@@ -642,6 +650,16 @@
 - **Fix:** one key for every output of nx_extract (`extraction_key` in `scripts/build_ipa_from_nsp.py`): nx_extract's source sha (the one `find_nx_extract` checks the executable carries), each package's name, size and time (a good copy has the same name and size), and the options (`extract_flags`: the application, the program, `--allow-damaged`). It is written beside the output after the output is in place (`extract/<version>/extract.key`, `html.key`, `aoc.key`), and the output is reused only while it matches; a folder with no key, from a build before it, is extracted again once. A new program extraction replaces the version's folder whole, so its pages are read again with it. A NUP or a dump folder's packer removes `extract.key`, since what it writes is not nx_extract's. Cost: each change to nx_extract's source extracts every version again on the next build (minutes for a large game; the shader split of a profiled game keys on the RomFS's names and sizes, so its shaders are kept), the pages 4.5 s for Smash. `pack_app.py` already takes the pages as an input of the app, so a Mac app follows.
 - **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md#found-on-this-game) 13.0.5 (`v2031616`), a Mac app built at 7249ee9f ([PR #1545](https://github.com/seedds/nxnative/pull/1545)): its `html0` held 1,157 of 2,798 files. Read again with the current nx_extract: 2,798 files, none damaged, the 1,157 the app had byte-identical. With the 1,641 added to the app, the page loads with no red line, takes buttons and ends (`web: the page ended: exit reason 3`), and the game goes on to its stage selection.
 - **Check:** `dm/tools/tests/test_nsp_extraction_key.py`.
+
+## Build ID lookup
+
+### An unreadable unused base stops discovery after a readable update
+
+- **Symptom:** for a title ID with no profile, the newest update extracts successfully during `build ID lookup`, but the subsequent base-only probe fails its ExeFS hash check and stops the survey, even though the update supplies the code.
+- **Cause:** `same_build` tries the newest update's main build ID, then the base game's as a second guess. Both used the same fatal extraction call, making the optional base-only probe a required input. This lookup error is independent of why that base cannot be read; the reported base hash failure has not been diagnosed as damage or a sparse NCA.
+- **Fix:** `scripts/build_ipa_from_nsp.py` `same_build` catches `BuildError` only on the base-only probe after the newest update's extraction succeeded. It logs `[RED] the base game alone could not be read for the build ID lookup; the update supplies the code, so the survey goes on`, deletes the partial output and continues without an alias match. A failed update extraction, a failed base-only extraction when there is no update, and other exceptions still propagate. The extractor requires a matching update Program NCA and reads its complete ExeFS with integrity checks; its accepted sparse-base exit code 4 cannot occur with an update Program NCA. The survey and build's actual extractions remain strict. This is a general lookup rule, separate from [recognizing a sparse base](#the-surveys-build-id-lookup-stops-on-the-base-game-alone-with-a-hash-error); it does not disable integrity checks or repair the unreadable base.
+- **Found on:** [Pokémon Violet](../../dm/games/01008F6008C5E000/README.md#files-and-shaders) ([PR #2701](https://github.com/seedds/nxnative/pull/2701)).
+- **Check:** `dm/tools/tests/test_nsp_alias.py` covers continuation after an unreadable optional base and preservation of the required base-only failure.
 
 ## Sparse base games
 
