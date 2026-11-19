@@ -919,7 +919,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     # What it means for a port
     G = pg.guess(F)   # the provisional profile's keys (write_profile writes the same)
     keep = G['modules'][0].split()   # how the build will get the shaders (decided again from the extraction at build time; the survey has only a RomFS manifest, so Unreal paks are guessed from main's markers)
-    nros = {p.name: p for p in sorted((ex / 'romfs_nro').rglob('*.nro')) if p.is_file()}   # files only: a RomFS folder may end in .nro (The Binding of Isaac: Afterbirth+). The manifest pass writes the NROs (their imports decide the API and the modules: Portal 2's main is SDL with EGL, its Source engine NROs draw with NVN)
+    nros = {p.name: p for p in sorted((ex / 'romfs_nro').rglob('*.nro')) if not p.name.startswith('._') and p.is_file()}   # skip AppleDouble sidecars and .nro folders (The Binding of Isaac: Afterbirth+). The manifest pass writes the NROs (their imports decide the API and the modules: Portal 2's main is SDL with EGL, its Source engine NROs draw with NVN)
     nro_add = pg.nro_modules(ex / 'ExeFS', nros, keep) if nros else {}
     S = pg.shader_sources(mods['main']['imports'], F['glsl_src'], [m for m in sorted({*keep, *nro_add}, key=pg.load_order) if 'glslcCompile' in mods[m]['exports']], rom['mags']['SPIR-V'],
                           rom['exts'].get('.pak', 0) if 'Unreal' in F.get('main_markers', set()) else 0, rom['mags']['Trinity pack'], gl_names=F.get('gl_names', 0),
@@ -3101,7 +3101,7 @@ def parse_args(argv):
     ap.add_argument('--mac-sign', help='--platform mac-app: the codesign identity for the app, e.g. "Developer ID Application: <name> (<team>)" (default: the MAC_SIGN setting, else ad-hoc)')
     ap.add_argument('--team-id', help='Apple developer team ID (default: TEAM_ID setting, DM_TEAM_ID environment, or saved Xcode selection)')
     ap.add_argument('--xcode-workspace', help='workspace collecting prepared games (default: NxNative.xcworkspace beside the NSP folder; use with --prepare-xcode)')
-    ap.add_argument('-l', '--language', help='game language, a code or a name: ja, fr, de, es, it, nl, pt, ru, ko, zh-Hans, zh-Hant, en-GB, fr-CA, es-419, pt-BR, Japanese, ... (default: the LANGUAGE setting, else English); '
+    ap.add_argument('-l', '--language', help='game language, a code or a name: ja, fr, de, es, it, nl, pt, ru, ko, zh-Hans, zh-Hant, en-GB, fr-CA, es-419, pt-BR, pl, th, Japanese, ... (default: the LANGUAGE setting, else English); '
                     'it must be one the game supports, which the console lists')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
     ap.add_argument('--work-dir', help='the game\'s build folder, used as it is (default: the WORK_DIR setting, else <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA or Mac app defaults to the folder holding it')

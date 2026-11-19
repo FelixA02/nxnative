@@ -41,6 +41,7 @@
 #   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its
 #       .pak archives and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
+#   · REDengine 3 (The Witcher 3): GLSLC outputs in RDHS material caches and FZLC static caches, see rdhs_shaders and fzlc_shaders
 #   · bnd2 (Criterion's Bundle 2: Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): whole GLSLC outputs in its zlib resources, see bnd2_resources and bnd2_shaders
 #   · Heaps (Dead Cells): whole GLSLC outputs in base64 after the GLSL of the engine's shader cache (shaders.cache.nx), inside its PAK archive, see heaps_pak_files and heaps_shaders
 #   · Frostbite (EA SPORTS FC 27): the CompiledBytecode resources of the bundles its superbundle tables (.toc) list, in its cas files (Oodle Leviathan, decoded by the game's own decoder in the
@@ -48,7 +49,7 @@
 #   · PDAT (the engine with the namespace phx, Kirby Air Riders): flatbuffer records tagged PMAP, zstd frames in the .dat archives, each holding a program's control sections and code areas, see pdat_jobs and pdat_shaders
 #   · Unreal Engine 3 (Batman: Arkham Knight): shader records in its global shader cache (BMSG) and in the packages (the combined shader cache), whose compressed chunks are Oodle blocks decoded by the game's own decoder in the Mac host, see ue3_body and ue3_shaders
 #   · CIVBSF (Firaxis, Civilization VI / VII): indexed NVBC / GLSLC or code/control payloads, see civbsf_shaders
-#   · IPK (Ubisoft's UbiArt, Rayman Legends: Definitive Edition): whole GLSLC outputs in the .fxb effect files of bundle_nn.ipk (zlib entries), see ipk_shaders
+#   · IPK (Ubisoft's UbiArt, Rayman Legends: Definitive Edition v7, Just Dance 2022 v5): whole GLSLC outputs in the .fxb effect files of bundle_*.ipk (zlib entries), see ipk_shaders
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
 #   +0x700 = start of the c1 constant segment within the code area; for compute +0x748 thread group xyz (u32 ×3), +0x754 shared memory bytes (checked one by one against PC reflection on D2R's 22 compute shaders).
 # Stage: BNSH uses the stage slot; BAHS uses bits 10..13 of SPH word 0 (1 vertex 2 hull 3 domain 4 geometry 5 pixel), and a compute header means compute.
@@ -1011,26 +1012,38 @@ def d11_pack_shaders(path, label, out):
 
 UBIART_IPK = bytes.fromhex('50ec12ba')
 def ipk_shaders(path, rel, out):
-    """A UbiArt IPK archive (Rayman Legends: Definitive Edition, bundle_nn.ipk, version 7, 26,878 files). Big-endian: magic 0x50EC12BA, version, platform, +0xc base offset (the data start),
-    +0x10 file count; entries from +0x38: u32 offset count, u32 size, u32 compressed size (0: stored), u64 time, u64 offset × count (from the base), u32 + directory, u32 + name, u32 CRC, u32 0.
-    Compressed entries are zlib. The shaders are whole GLSLC outputs in the engine's .fxb effect files (enginedata/shaders/compiled/nx: renderpct, afterfx, font, movie; 5,893 programs);
-    shaders_dev/ holds a development build of the same effects with other keys, which the game does not ask for. Only the .fxb entries are read: the 2.6 GB of .ckd cooked assets hold none"""
+    """A UbiArt IPK archive (Rayman Legends: Definitive Edition, version 7, 0x38-byte header, directory then name; Just Dance 2022, version 5, 0x30-byte header, name then directory).
+    Big-endian: magic 0x50EC12BA, version, platform, +0xc base offset (the data start), +0x10 file count; entries from the header end: u32 offset count, u32 size, u32 compressed size
+    (0: stored), u64 time, u64 offset × count (from the base), two u32+string fields, u32 CRC/path_id, u32 flags/0. Compressed entries are zlib. The shaders are whole GLSLC outputs in the
+    engine's .fxb effect files (enginedata/shaders/compiled/nx: renderpct, afterfx, font, movie, …); shaders_dev/ holds a development build of the same effects with other keys, which
+    the game does not ask for. Only the .fxb entries are read: the .ckd cooked assets hold none"""
     label = f'/{rel}'
     with open(path, 'rb') as f:
-        h = f.read(0x38)
-        if len(h) < 0x38: red(f'{label}: {len(h)} bytes, shorter than a UbiArt IPK header (0x38)')
+        h = f.read(0x30)
+        if len(h) < 0x30: red(f'{label}: {len(h)} bytes, shorter than a UbiArt IPK header (0x30)')
         ver, _plat, base, n = struct.unpack_from('>IIII', h, 4)
-        if ver != 7: red(f'{label}: UbiArt IPK version {ver} (only version 7 is read)')
-        t = f.read(max(base - 0x38, 0))
-        if base < 0x38 or len(t) != base - 0x38: red(f'{label}: the IPK header puts its data at {base:#x}, outside the file')
+        if ver not in (5, 7): red(f'{label}: UbiArt IPK version {ver} (only versions 5 and 7 are read)')
+        hdr_len = 0x30 if ver == 5 else 0x38
+        if hdr_len > 0x30:
+            h += f.read(hdr_len - 0x30)
+            if len(h) < hdr_len: red(f'{label}: {len(h)} bytes, shorter than a UbiArt IPK header ({hdr_len:#x})')
+        t = f.read(max(base - hdr_len, 0))
+        if base < hdr_len or len(t) != base - hdr_len: red(f'{label}: the IPK header puts its data at {base:#x}, outside the file')
         p = 0
         for i in range(n):
             try:
                 noff, size, csize = struct.unpack_from('>III', t, p); p += 20
+                if p + 8 * noff > len(t): raise struct.error('offset list truncated')
                 off = struct.unpack_from('>Q', t, p)[0] if noff else 0; p += 8 * noff
-                pl = struct.unpack_from('>I', t, p)[0]; d = t[p + 4:p + 4 + pl].decode('latin1'); p += 4 + pl
-                nl = struct.unpack_from('>I', t, p)[0]; name = d + t[p + 4:p + 4 + nl].decode('latin1'); p += 4 + nl + 8
-            except struct.error: red(f'{label}: entry {i} of {n} runs past the IPK table ({len(t) + 0x38:#x} bytes): not the layout of a version 7 archive')
+                l1 = struct.unpack_from('>I', t, p)[0]
+                if p + 4 + l1 > len(t): raise struct.error('entry string 1 truncated')
+                s1 = t[p + 4:p + 4 + l1].decode('latin1'); p += 4 + l1
+                l2 = struct.unpack_from('>I', t, p)[0]
+                if p + 4 + l2 + 8 > len(t): raise struct.error('entry string 2 or trailer truncated')
+                s2 = t[p + 4:p + 4 + l2].decode('latin1'); p += 4 + l2 + 8
+                d, fname = (s2, s1) if ver == 5 else (s1, s2)
+                name = f'{d}/{fname}' if d and not d.endswith('/') else d + fname
+            except struct.error: red(f'{label}: entry {i} of {n} runs past the IPK table ({len(t) + hdr_len:#x} bytes): not the layout of a version {ver} archive')
             if not name.endswith('.fxb') or '/shaders_dev/' in '/' + name: continue
             f.seek(base + off); b = f.read(csize or size)
             if len(b) != (csize or size): red(f'{label}/{name}: the entry at {base + off:#x} runs past the end of the archive')
@@ -3588,6 +3601,60 @@ def scan_file(args):
         print(f'[RED] {why} (its shaders are left out)', flush=True)
         return args[1], {}, set(), ('unreadable', why, 1)
 
+RDHS, FZLC = b'RDHS', b'FZLC'
+
+def rdhs_shaders(path, label):
+    """REDengine 3's shader caches (The Witcher 3: Wild Hunt — Complete Edition, shadernx.cache in content/content0, content/patch0 and each DLC's content/: 28,491 material shaders).
+    From +0, records {u64 hash, u8 1, u32 raw length, u32 stored length, then one zstd frame of the stored length}; each frame is one whole GLSLC output. The records end where the index
+    (material and technique names with their record hashes) begins: the 16-byte footer is {u64 index offset, 'RDHS', u32 version 3}. The records must end exactly at the index"""
+    zstd = zstd_mod(); out = []
+    with open(path, 'rb') as f:
+        size = f.seek(0, 2); f.seek(size - 16); idx, magic, ver = struct.unpack('<Q4sI', f.read(16))
+        if magic != RDHS or ver != 3 or not 0 <= idx <= size - 16: red(f'{label}: footer {magic!r} version {ver}, index {idx:#x}: not a version 3 RDHS shader cache')
+        f.seek(0); d = f.read(idx)
+    pos = n = 0
+    while pos < idx:
+        where = f'{label}: record {n} at {pos:#x}'
+        if pos + 17 > idx: red(f'{where}: header runs past the index at {idx:#x}')
+        flag, raw, stored = struct.unpack_from('<BII', d, pos + 8)
+        start, end = pos + 17, pos + 17 + stored
+        if flag != 1 or stored < 4 or end > idx or d[start:start + 4] != ZSTD_MAGIC:
+            red(f'{where}: flag {flag}, stored {stored}, not a zstd frame inside the records')
+        try: blob = zstd.decompress(d[start:end])
+        except zstd.ZstdError as e: red(f'{where}: invalid zstd frame ({e})')
+        if len(blob) != raw: red(f'{where} decompresses to {len(blob)} bytes, its header says {raw}')
+        got = glslc_shaders(blob, f'{label}@{pos:#x}', need=False)
+        if not got: red(f'{where} holds no whole GLSLC output')
+        out += got; pos = end; n += 1
+    return out
+
+def fzlc_shaders(path, label):
+    """REDengine 3's static shader cache (staticshadernx.cache in content/content0: the 619 engine shaders, lighting, post-processing and all 46 compute shaders; the DLC copies are empty 804-byte
+    stubs). Header {'FZLC', u32 chunk count, u32 first chunk's offset}, then per chunk {u32 stored length, u32 raw length, u32 next chunk's offset}; each chunk is one zstd frame of at most 1 MiB.
+    The GLSLC outputs run across chunk boundaries, so the chunks are joined before the outputs are read"""
+    zstd = zstd_mod()
+    with open(path, 'rb') as f: d = f.read()
+    count, at = field(d, '<II', 4, label)
+    if 12 + 12 * count > at or at > len(d): red(f'{label}: {count} chunks with data at {at:#x} in {len(d)} bytes')
+    parts = []
+    for i in range(count):
+        stored, raw, nxt = struct.unpack_from('<3I', d, 12 + 12 * i)
+        where = f'{label}: chunk {i} at {at:#x}'
+        if not stored:
+            if raw: red(f'{where}: {raw} decoded bytes but no stored data')
+            continue
+        # a chunk whose stored length equals its raw length is kept uncompressed (the DLC stubs: one 28-byte chunk, next offset 0)
+        end = at + stored
+        if end > len(d) or i + 1 < count and nxt != end: red(f'{where}: stored {stored}, next {nxt:#x}: inconsistent')
+        p = d[at:end]
+        if stored != raw:
+            if not p.startswith(ZSTD_MAGIC): red(f'{where}: compressed data has no zstd frame header')
+            try: p = zstd.decompress(p)
+            except zstd.ZstdError as e: red(f'{where}: invalid zstd frame ({e})')
+        if len(p) != raw: red(f'{where} decompresses to {len(p)} bytes, its entry says {raw}')
+        parts.append(p); at = end
+    return glslc_shaders(b''.join(parts), label, need=False)
+
 def scan_file_in(args):
     path, rel = args[:2]
     stem, ext = os.path.splitext(path)
@@ -3710,6 +3777,17 @@ def scan_file_in(args):
                 if '.fx' in entry[0] or '/shaders/' in entry[0] or entry[0].endswith(('.vs.bin', '.ps.bin', '.fs.bin')):
                     found += phyre_shaders(vbf.read(f, entry), f'/{rel}/{entry[0]}')
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == FZLC:   # REDengine 3's static shader cache (fzlc_shaders)
+        found += fzlc_shaders(path, '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[8:9] == b'\x01' or os.path.basename(rel) == 'shadernx.cache':   # require the footer even under the engine's filename, which also lets us diagnose a damaged first flag
+        with open(path, 'rb') as f:
+            size = f.seek(0, 2)
+            if size >= 16: f.seek(size - 8)
+            tail = f.read(4) if size >= 16 else b''
+        if tail == RDHS:
+            found += rdhs_shaders(path, '/' + rel)
+            return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == ZSTD_MAGIC: d = unzs(path)   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
     else:
         with open(path, 'rb') as f: d = f.read()
