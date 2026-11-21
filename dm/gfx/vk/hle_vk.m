@@ -190,22 +190,74 @@ static id<MTLSamplerState> ab_sampler_fail(void) {
 // p is the push-constant block; U / B / T / S are members of a set's argument buffer at buffer slot `slot`, with a separate Metal ID (+ element);
 // o is a dynamic offset's index in q, and q is the slot of that offset buffer
 typedef struct { char kind; uint8_t set, slot; uint16_t count, binding, arg_id; } shres;
-typedef struct { char key[17]; int frag, comp, nres, bone_index, geom_vp; uint16_t wg[3]; shres res[24]; } shinfo;   // geom_vp: location + 1, zero for shaders without viewport lowering
+typedef struct { char key[17]; int frag, comp, nres, geom_vp; uint16_t wg[3]; shres *res; } shinfo;   // res: owned for the loaded table's lifetime; geom_vp: location + 1
 enum { ST_VERT, ST_FRAG, ST_COMP };
 static int is_arg(char k) { return k && strchr("UBTS", k); }
 static shinfo *g_sh; static int g_nsh;
 static id<MTLLibrary> g_lib;
 static int sh_cmp(const void *a, const void *b) { return memcmp(((const shinfo *)a)->key, ((const shinfo *)b)->key, 16); }
-static void sh_read_resources(shinfo *s, char *res) {
-    for (char *t = res ? strtok(res, " ") : NULL; t; t = strtok(NULL, " ")) {
-        char k; unsigned st, b, sl, n = 1;
-        int got = sscanf(t, "%c:%u.%u=%u*%u", &k, &st, &b, &sl, &n), ab = got >= 1 && k && strchr("UBTSoq", k);
-        unsigned id = got >= 3 ? b : 0;   // older argument-buffer tables used a binding as the ID
-        const char *at = strchr(t, '@');
-        int id_ok = !at || (got >= 4 && is_arg(k) && sscanf(at + 1, "%u", &id) == 1 && id <= UINT16_MAX);
-        if (got < 4 || !id_ok || !n || n > 4096 || (!ab && sl + n > 31) || s->nres == 24) { LOG("[vk] [RED] cannot parse a resource entry of shader table %s: %s", s->key, t); continue; }
-        s->res[s->nres++] = (shres){k, (uint8_t)st, (uint8_t)sl, (uint16_t)n, (uint16_t)b, (uint16_t)id};
+static int sh_number(const char **p, unsigned *out) {
+    if (**p < '0' || **p > '9') return 0;
+    char *end; unsigned long value = strtoul(*p, &end, 10);
+    if (value > UINT16_MAX) return 0;   // every numeric table field fits in the metadata's uint16_t
+    *p = end; *out = (unsigned)value; return 1;
+}
+static int sh_read_resources(shinfo *s, char *res) {
+    size_t count = 0;
+    for (const char *p = res ? res : ""; *p;) {
+        p += strspn(p, " \r"); if (!*p) break;
+        count++; p += strcspn(p, " \r");
     }
+    if (count > INT32_MAX) die("[vk] shader resource table is too large");
+    s->nres = 0; s->res = NULL;
+    if (!count) return 1;
+    shres *entries = calloc(count, sizeof *entries);
+    if (!entries) die("[vk] out of memory for shader resources");
+    char *save = NULL;
+    for (char *t = res ? strtok_r(res, " \r", &save) : NULL; t; t = strtok_r(NULL, " \r", &save)) {
+        char k = t[0]; const char *p = t + 1; unsigned st, b, sl, n = 1, id;
+        if (!strchr("ubtscpUBTSoq", k) || *p++ != ':' || !sh_number(&p, &st) || *p++ != '.' || !sh_number(&p, &b) ||
+            *p++ != '=' || !sh_number(&p, &sl)) goto invalid;
+        id = b;   // older argument-buffer tables used a binding as the ID
+        if (*p == '*') { p++; if (!sh_number(&p, &n)) goto invalid; }
+        if (*p == '@') { p++; if (!is_arg(k) || !sh_number(&p, &id)) goto invalid; }
+        unsigned limit = k == 'o' ? 32 : k == 's' || k == 'c' ? 16 : 31;
+        if (*p || st >= 8 || b >= 128 || !n || n > 4096 || sl >= limit || (size_t)s->nres >= count ||
+            (!is_arg(k) && n > limit - sl) || (strchr("poq", k) && n != 1)) goto invalid;
+        entries[s->nres++] = (shres){k, (uint8_t)st, (uint8_t)sl, (uint16_t)n, (uint16_t)b, (uint16_t)id};
+        continue;
+    invalid:
+        LOG("[vk] [RED] shader table %s: invalid resource %s; shader refused", s->key, t);
+        free(entries); s->nres = 0; return 0;
+    }
+    s->res = entries; return 1;
+}
+static void sh_read_table(FILE *f) {
+    char *line = NULL; size_t length = 0; int cap = 0;
+    while (getline(&line, &length, f) >= 0) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\n");   // strsep keeps the empty resource field of a shader without resources
+        if (!key || !stage || !res || strlen(key) != 16) { LOG("[vk] [RED] malformed shader table row; shader refused"); continue; }
+        shinfo s = {0}; memcpy(s.key, key, 16); s.frag = !strcmp(stage, "frag");
+        if (!strncmp(stage, "comp:", 5)) {
+            const char *p = stage + 5; unsigned x, y, z;
+            if (!sh_number(&p, &x) || *p++ != ',' || !sh_number(&p, &y) || *p++ != ',' || !sh_number(&p, &z) || *p || !x || !y || !z) goto invalid_stage;
+            s.comp = 1; s.wg[0] = (uint16_t)x; s.wg[1] = (uint16_t)y; s.wg[2] = (uint16_t)z;
+        } else if (!strncmp(stage, "geomvp:", 7)) {
+            const char *p = stage + 7; unsigned loc;
+            if (!sh_number(&p, &loc) || *p || loc >= 32) goto invalid_stage;
+            s.geom_vp = (int)loc + 1;
+        } else if (strcmp(stage, "vert") && !s.frag) goto invalid_stage;
+        if (!sh_read_resources(&s, res)) continue;
+        if (g_nsh == cap) { cap = cap ? cap * 2 : 128; shinfo *q = realloc(g_sh, cap * sizeof *g_sh); if (!q) die("[vk] out of memory for the shader table"); g_sh = q; }
+        g_sh[g_nsh++] = s;
+        continue;
+    invalid_stage:
+        LOG("[vk] [RED] shader table %s: invalid stage %s; shader refused", key, stage);
+    }
+    free(line);
+    if (ferror(f)) die("[vk] cannot read the shader table");
+    qsort(g_sh, g_nsh, sizeof *g_sh, sh_cmp);   // looked up by key (Super Mario Galaxy creates over 3,000 modules at boot)
 }
 static void sh_load(void) {
     const char *d = getenv("DM_MSL_DIR"); char p[1024];
@@ -213,31 +265,7 @@ static void sh_load(void) {
     snprintf(p, sizeof p, "%s/vk/vk_shaders.tsv", d);
     FILE *f = fopen(p, "r");
     if (!f) { LOG("[vk] [RED] cannot open %s (run dm/gfx/tools/vk_shaders.py first)", p); return; }
-    char line[4096]; int cap = 0;
-    while (fgets(line, sizeof line, f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\n");   // strsep keeps the empty resource field of a shader without resources
-        if (!key || !stage || strlen(key) != 16) continue;
-        if (g_nsh == cap) { cap = cap ? cap * 2 : 128; shinfo *q = realloc(g_sh, cap * sizeof *g_sh); if (!q) die("[vk] out of memory for the shader table"); g_sh = q; }
-        shinfo *s = &g_sh[g_nsh++]; memset(s, 0, sizeof *s);
-        memcpy(s->key, key, 16); s->frag = !strcmp(stage, "frag");
-        if (!strncmp(stage, "comp", 4)) {
-            s->comp = 1;
-            if (sscanf(stage + 4, ":%hu,%hu,%hu", &s->wg[0], &s->wg[1], &s->wg[2]) != 3 || !s->wg[0] || !s->wg[1] || !s->wg[2]) {
-                LOG("[vk] [RED] shader table %s: compute stage without a local size (%s)", s->key, stage); s->comp = 0;
-            }
-        }
-        s->bone_index = -1;
-        char *extra = rest ? strchr(rest, '\t') : NULL;
-        if (!strcmp(stage, "vert") && extra) sscanf(extra + 1, "%d", &s->bone_index);
-        if (!strncmp(stage, "geomvp:", 7)) {
-            unsigned loc;
-            if (sscanf(stage + 7, "%u", &loc) == 1 && loc < 32) s->geom_vp = (int)loc + 1;
-        }
-        sh_read_resources(s, res);
-    }
-    fclose(f);
-    qsort(g_sh, g_nsh, sizeof *g_sh, sh_cmp);   // looked up by key (Super Mario Galaxy creates over 3,000 modules at boot)
+    sh_read_table(f); fclose(f);
     snprintf(p, sizeof p, "%s/vk/vk_shaders.metallib", d);
     NSError *err = nil;
     g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
@@ -283,7 +311,7 @@ struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; Vk
                   int swap; };   // one of a swap chain's images: the swap chain owns it
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; __strong VkSamplerMetal *ref; };
-struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d, fn_u; char key[17]; int tried_d; };   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
+struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d; char key[17]; int tried_d; };   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
 struct VkPipelineCache_T { int unused; };
 // A result is valid once the Metal command buffer that wrote it has completed (g_done >= ticket).
 // Timestamps use that command buffer's completion time in ns (timestampPeriod 1).
@@ -1098,14 +1126,13 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     @autoreleasepool {
         if (m->si && !m->si->geom_vp && g_lib) {
             m->fn = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s", m->key]];
-            if (m->si->bone_index >= 0) m->fn_u = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_u", m->key]];
         }
     }
     if (!m->fn && !(m->si && m->si->geom_vp)) LOG("[vk] [RED] shader %s (%zu bytes of SPIR-V) is not in the library", m->key, ci->codeSize);
     else OLOG("CreateShaderModule %s", m->key);
     *out = m; return VK_SUCCESS;
 }
-VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = m->fn_u = nil; free(m); } }
+VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = nil; free(m); } }
 // Pipeline caches hold nothing: the game's initial data is NVIDIA's binary cache (Super Mario Galaxy's data/database/vulkan/*.cache), and Metal keeps its own
 VK(vkCreatePipelineCache, VkResult, VkDevice d, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
@@ -1165,15 +1192,6 @@ static void pipe_layout_hold(VkPipeline p, VkPipelineLayout layout) {
     p->pc_size = layout->pc_size; p->nset = layout->nset;
     for (uint32_t i = 0; i < p->nset; i++) if ((p->set[i] = layout->set[i])) atomic_fetch_add(&p->set[i]->refs, 1);
 }
-static id<MTLFunction> vertex_function(VkShaderModule m, const VkPipelineVertexInputStateCreateInfo *vi) {
-    if (m->fn_u && vi) {
-        for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++) {
-            const VkVertexInputAttributeDescription *a = &vi->pVertexAttributeDescriptions[i];
-            if (a->location == (uint32_t)m->si->bone_index && a->format == VK_FORMAT_R16_UINT) return m->fn_u;
-        }
-    }
-    return m->fn;
-}
 static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
     VkPipeline p = zalloc(sizeof *p);
     pipe_layout_hold(p, ci->layout);
@@ -1189,11 +1207,10 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
         for (uint32_t s = 0; s < ci->stageCount; s++) {
             const VkPipelineShaderStageCreateInfo *st = &ci->pStages[s]; VkShaderModule m = st->module;
             if (st->stage == VK_SHADER_STAGE_VERTEX_BIT) {
-                id<MTLFunction> fn = vertex_function(m, ci->pVertexInputState);
+                id<MTLFunction> fn = m->fn;
                 if (geom_vp) {
-                    const char *suffix = fn && fn == m->fn_u ? "_u" : "";
                     fn = fn && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && max_viewports() > 1
-                        ? [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s%s_vp%d", m->key, suffix, geom_vp - 1]] : nil;
+                        ? [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_vp%d", m->key, geom_vp - 1]] : nil;
                     if (!fn) LOG("[vk] [RED] geometry viewport lowering unavailable for vertex shader %s at location %d (topology %d)", m->key, geom_vp - 1, topology);
                 }
                 pd.vertexFunction = spec_fn(fn, st->pSpecializationInfo); p->vs = m->si;
@@ -1622,7 +1639,7 @@ typedef struct {
     id<MTLCommandBuffer> cb; id<MTLRenderCommandEncoder> re; id<MTLBlitCommandEncoder> be; id<MTLComputeCommandEncoder> ce;
     const chdr *cmd; const uint8_t *cmd_end;   // the command being replayed and the end of its command buffer (fan_prepare scans ahead)
     id<MTLBuffer> fan_out; fan_job *fj; uint32_t nfj, fjcap, fji; const void *fan_from, *fan_to;   // the indexed fans of the current stretch of the pass, and the commands its scan covered
-    VkPipeline pipe, applied, cpipe; uint32_t rt_w, rt_h;   // cpipe: the compute pipeline bound
+    VkPipeline pipe, applied, cpipe; uint32_t rt_w, rt_h, rt_layers;   // cpipe: the compute pipeline bound
     struct { VkDescriptorSet s; uint32_t dyn[16]; } set[8], cset[8];   // graphics and compute bind points have separate sets
     VkBuffer vb[14]; VkDeviceSize vbo[14];
     VkBuffer ib; VkDeviceSize ibo; MTLIndexType it; uint32_t isz;
@@ -1728,10 +1745,13 @@ static void begin_rp(rs_t *s, const c_brp *c) {
         }
     }
     if (!rp->ncol && rp->depth < 0) { d.renderTargetWidth = fb->w; d.renderTargetHeight = fb->h; d.defaultRasterSampleCount = 1; }
-    if (s->sq->vis) d.visibilityResultBuffer = s->sq->vis;
+    if (s->sq->vis) {
+        d.visibilityResultBuffer = s->sq->vis;
+        d.visibilityResultType = MTLVisibilityResultTypeAccumulate;   // Reset clears earlier encoders' slots too; the submit initialized this buffer to zero
+    }
     fan_prepare(s, (const chdr *)((const uint8_t *)s->cmd + s->cmd->size));
     s->rpd = d; s->re = [s->cb renderCommandEncoderWithDescriptor:d]; s->enc_id = ++g_enc_id;
-    s->applied = NULL; s->rt_w = w; s->rt_h = h;
+    s->applied = NULL; s->rt_w = w; s->rt_h = h; s->rt_layers = fb->layers;
     // Dynamic viewport and scissor persist across render passes within a command buffer, as in Vulkan; the render target's size stands in only until the game sets them.
     // Resetting them at every pass drew Super Mario Galaxy's handheld UI 1.5x too big: it sets a 1280x720 viewport once and then draws through several passes into its 1920x1080 swapchain
     s->vp_dirty = s->sc_dirty = 1;
@@ -1839,7 +1859,9 @@ static int bind_args(rs_t *s, VkPipeline p, const shinfo *si, int st) {   // a s
     for (int k = 0; k < p->nab[st]; k++) {
         abuf_t *a = &p->ab[st][k]; VkDescriptorSet ds = a->set < 8 ? sets[a->set].s : NULL;
         if (!ds) { RED1("shader %s: set %u (an argument buffer) is not bound", si->key, a->set); return 0; }
-        uint64_t gen = ds->gen;   // capture before encoding: a concurrent update must not bless old contents with its new generation
+        // Use the same generation for the cache lookup and re-encoding. A new generation invalidates the cached
+        // argument buffer when descriptors change or an allocation reuses a set address.
+        uint64_t gen = ds->gen;
         if ((a->s != ds || a->gen != gen || !a->buf) && !ab_encode(a, ds, si, gen)) return 0;
         put_buf(s, st, a->buf, 0, a->slot);
         if (a->enc_id == s->enc_id) continue;
@@ -2303,34 +2325,121 @@ static void resolve_image(rs_t *s, const c_resolve *x) {
         }
     }
 }
-static int clear_covers_texture(id<MTLTexture> texture, const VkClearRect *r) {
-    return texture && r->baseArrayLayer == 0 && r->layerCount == 1 && r->rect.offset.x == 0 && r->rect.offset.y == 0 &&
-        r->rect.extent.width == texture.width && r->rect.extent.height == texture.height;
+static int clear_covers_attachment(MTLRenderPassAttachmentDescriptor *a, const VkClearRect *rects, uint32_t n) {
+    if (!a.texture) return 1;   // VK_ATTACHMENT_UNUSED and an absent depth / stencil aspect have no effect
+    for (uint32_t i = 0; i < n; i++) {
+        const VkClearRect *r = &rects[i];
+        if (!r->baseArrayLayer && r->layerCount == 1 && !r->rect.offset.x && !r->rect.offset.y &&
+            r->rect.extent.width == MAX(a.texture.width >> a.level, 1u) && r->rect.extent.height == MAX(a.texture.height >> a.level, 1u)) return 1;
+    }
+    return 0;
+}
+// vkCmdClearAttachments is independent of all game graphics state. A load action handles whole attachments; otherwise use the host's precompiled clear triangle in a
+// separate load/store pass for each selected view layer. The game's encoder resumes through reopen_rp, restoring its bindings and allocating a new occlusion-query slot.
+// Helper passes have no visibility buffer: Vulkan permits clears to contribute to occlusion queries, but does not require them to do so.
+typedef struct { uint32_t color, depth, stencil, samples, kind; } attachment_clear_key;
+static id<MTLRenderPipelineState> attachment_clear_pso(MTLRenderPassDescriptor *d, const fmt_t *f) {
+    id<MTLTexture> color = d.colorAttachments[0].texture, depth = d.depthAttachment.texture, stencil = d.stencilAttachment.texture;
+    id<MTLTexture> t = color ?: depth ?: stencil;
+    attachment_clear_key k = {(uint32_t)color.pixelFormat, (uint32_t)depth.pixelFormat, (uint32_t)stencil.pixelFormat, (uint32_t)t.sampleCount,
+        f && f->kind == K_INT ? (fmt_is_signed_int(f) ? 2u : 1u) : 0u};
+    static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *cache;
+    NSData *key = [NSData dataWithBytes:&k length:sizeof k]; id<MTLRenderPipelineState> pso = cache[key]; if (pso) return pso;
+    static id<MTLLibrary> lib; static int failed;
+    if (failed) return nil;
+    NSError *e = nil;
+    if (!lib) lib = host_msl_lib(g_dev, nil, "clear", &e);
+    if (!lib) { failed = 1; LOG("[vk] [RED] attachment clear shaders: %s", e.localizedDescription.UTF8String); return nil; }
+    MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+    p.vertexFunction = [lib newFunctionWithName:@"clr_vs"];
+    if (color) {
+        static const char *types[] = {"float", "uint", "int"};
+        p.fragmentFunction = [lib newFunctionWithName:[NSString stringWithFormat:@"clr_fs_0_%s", types[k.kind]]];
+        p.colorAttachments[0].pixelFormat = color.pixelFormat;
+    }
+    p.depthAttachmentPixelFormat = depth.pixelFormat; p.stencilAttachmentPixelFormat = stencil.pixelFormat; p.rasterSampleCount = t.sampleCount;
+    pso = [g_dev newRenderPipelineStateWithDescriptor:p error:&e];
+    if (!pso) { LOG("[vk] [RED] attachment clear pipeline (%u/%u/%u, %u samples): %s", k.color, k.depth, k.stencil, k.samples, e.localizedDescription.UTF8String); return nil; }
+    if (!cache) cache = [NSMutableDictionary new]; cache[key] = pso; return pso;
+}
+static id<MTLDepthStencilState> attachment_clear_dss(int depth, int stencil) {
+    static id<MTLDepthStencilState> cache[2][2];
+    if (cache[depth][stencil]) return cache[depth][stencil];
+    MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new]; d.depthCompareFunction = MTLCompareFunctionAlways; d.depthWriteEnabled = depth;
+    if (stencil) {
+        MTLStencilDescriptor *st = [MTLStencilDescriptor new]; st.stencilCompareFunction = MTLCompareFunctionAlways; st.depthStencilPassOperation = MTLStencilOperationReplace;
+        st.writeMask = 0xff; d.frontFaceStencil = d.backFaceStencil = st;
+    }
+    return cache[depth][stencil] = [g_dev newDepthStencilStateWithDescriptor:d];
+}
+static void attachment_clear_layer(MTLRenderPassAttachmentDescriptor *dst, MTLRenderPassAttachmentDescriptor *src, uint32_t layer) {
+    dst.texture = src.texture; dst.level = src.level;
+    if (src.texture.textureType == MTLTextureType3D) dst.depthPlane = src.depthPlane + layer;
+    else dst.slice = src.slice + layer;   // src.texture is already the Vulkan view, including its base mip and array layer
+    dst.loadAction = MTLLoadActionLoad; dst.storeAction = MTLStoreActionStore;
+}
+static void clear_attachment_rects(rs_t *s, const VkClearAttachment *a, const VkClearRect *rects, uint32_t n) {
+    MTLRenderPassDescriptor *source = s->rpd;
+    BOOL color = a->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+    BOOL depth = (a->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && source.depthAttachment.texture;
+    BOOL stencil = (a->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && source.stencilAttachment.texture;
+    MTLRenderPassAttachmentDescriptor *at = color ? source.colorAttachments[a->colorAttachment] : depth ? source.depthAttachment : source.stencilAttachment;
+    if (!at.texture || (!color && !depth && !stencil)) return;
+    const fmt_t *f = color ? s->rt_color[a->colorAttachment] : NULL;
+    float z = depth ? a->clearValue.depthStencil.depth : 0;
+    for (uint32_t layer = 0; layer < s->rt_layers; layer++) {
+        BOOL selected = NO;
+        for (uint32_t j = 0; j < n; j++) if (layer >= rects[j].baseArrayLayer && layer - rects[j].baseArrayLayer < rects[j].layerCount) { selected = YES; break; }
+        if (!selected) continue;
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (color) attachment_clear_layer(d.colorAttachments[0], at, layer);
+        else {
+            // Bind both planes when present, preserving the plane this clear does not write.
+            if (source.depthAttachment.texture) attachment_clear_layer(d.depthAttachment, source.depthAttachment, layer);
+            if (source.stencilAttachment.texture) attachment_clear_layer(d.stencilAttachment, source.stencilAttachment, layer);
+        }
+        id<MTLRenderPipelineState> pso = attachment_clear_pso(d, f); if (!pso) return;
+        id<MTLRenderCommandEncoder> en = [s->cb renderCommandEncoderWithDescriptor:d];
+        [en setRenderPipelineState:pso]; [en setDepthStencilState:attachment_clear_dss(depth, stencil)];
+        [en setVertexBytes:&z length:sizeof z atIndex:0];
+        if (color) [en setFragmentBytes:&a->clearValue.color length:sizeof a->clearValue.color atIndex:0];   // retain integer bits, including values above INT32_MAX
+        if (stencil) [en setStencilReferenceValue:a->clearValue.depthStencil.stencil];
+        [en setViewport:(MTLViewport){0, 0, MAX(at.texture.width >> at.level, 1u), MAX(at.texture.height >> at.level, 1u), 0, 1}];
+        [en setCullMode:MTLCullModeNone];
+        for (uint32_t j = 0; j < n; j++) {
+            const VkClearRect *r = &rects[j];
+            if (layer < r->baseArrayLayer || layer - r->baseArrayLayer >= r->layerCount) continue;
+            [en setScissorRect:(MTLScissorRect){r->rect.offset.x, r->rect.offset.y, r->rect.extent.width, r->rect.extent.height}];
+            [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [en endEncoding];
+    }
 }
 static void clear_attachments(rs_t *s, const c_cleara *x) {
     MTLRenderPassDescriptor *d = s->rpd;
     if ((!s->re && !s->cut) || !d) { RED1("vkCmdClearAttachments outside a render pass"); return; }
+    if (!x->n || !x->rects) return;
     const VkClearRect *rects = (const void *)(x->attachments + x->n);
+    BOOL whole = s->rt_layers == 1 && d.renderTargetArrayLength <= 1;
     for (uint32_t i = 0; i < x->n; i++) {
         const VkClearAttachment *a = &x->attachments[i];
         NSUInteger color = a->colorAttachment;
-        BOOL whole = NO;
-        for (uint32_t j = 0; j < x->rects; j++) {
-            const VkClearRect *r = &rects[j];
-            if ((a->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && color < 8 && clear_covers_texture(d.colorAttachments[color].texture, r)) ||
-                (a->aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && clear_covers_texture(d.depthAttachment.texture, r)) ||
-                (a->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT && clear_covers_texture(d.stencilAttachment.texture, r)) ||
-                (a->aspectMask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) &&
-                 clear_covers_texture(d.depthAttachment.texture, r) && clear_covers_texture(d.stencilAttachment.texture, r))) { whole = YES; break; }
-        }
-        if (!whole || d.renderTargetArrayLength > 1) { RED1("vkCmdClearAttachments region requires a partial attachment clear"); return; }
+        if (a->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && color >= 8) { RED1("vkCmdClearAttachments color attachment exceeds the host limit"); return; }
+        if (a->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && !clear_covers_attachment(d.colorAttachments[color], rects, x->rects)) whole = NO;
+        if ((a->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && !clear_covers_attachment(d.depthAttachment, rects, x->rects)) whole = NO;
+        if ((a->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && !clear_covers_attachment(d.stencilAttachment, rects, x->rects)) whole = NO;
     }
     if (s->re) end_rp(s, 0);
     load_rp(s);
+    if (!whole) {
+        for (uint32_t i = 0; i < x->n; i++) clear_attachment_rects(s, &x->attachments[i], rects, x->rects);
+        reopen_rp(s); return;
+    }
     for (uint32_t i = 0; i < x->n; i++) {
         const VkClearAttachment *a = &x->attachments[i];
         if (a->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
             MTLRenderPassColorAttachmentDescriptor *color = d.colorAttachments[a->colorAttachment];
+            if (!color.texture) continue;
             color.loadAction = MTLLoadActionClear;
             color.clearColor = fmt_clear_color(s->rt_color[a->colorAttachment], &a->clearValue.color);
         }

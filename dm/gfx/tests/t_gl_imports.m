@@ -1,6 +1,7 @@
 // Direct GL imports and eglGetProcAddress must reach the same implementations (issue #228), including big-stack entries.
 #include "../gl/hle_gl.m"
 #include <assert.h>
+#include <unistd.h>
 
 uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
@@ -593,6 +594,54 @@ static void test_program_validation(void) {
     h_glUseProgram(was); h_glDeleteProgram(pr); h_glDeleteShader(vs); h_glDeleteShader(fs); assert(h_glGetError() == GL_NO_ERROR);
 }
 
+static void test_fixed_function_caps(void) {
+    static const GLenum unimplemented[] = {
+        0x4000, 0x4001, 0x4002, 0x4003, 0x4004, 0x4005, 0x4006, 0x4007,  // LIGHT0..7
+        0x0c60, 0x0c61, 0x0c62, 0x0c63,  // TEXTURE_GEN_S / T / R / Q
+        0x0b57 /* COLOR_MATERIAL */, 0x0ba1 /* NORMALIZE */,
+    };
+    const uint8_t blend = S.blend, atest = F.atest;
+    const uint8_t depth = S.depth, cull = S.cull, scissor = S.scissor, stencil = S.stencil;
+    const uint8_t poffset = S.poffset, poffset_line = S.poffset_line;
+    h_glEnable(GL_BLEND);
+    h_glEnable(GL_ALPHA_TEST);
+    assert(S.blend && F.atest);
+
+    // Disabling an unsupported cap is silent and leaves its first enable free to warn.
+    FILE *log = tmpfile();
+    int saved_stderr = dup(STDERR_FILENO);
+    assert(log && saved_stderr >= 0);
+    assert(fflush(stderr) == 0);
+    assert(dup2(fileno(log), STDERR_FILENO) == STDERR_FILENO);
+    for (size_t i = 0; i < sizeof unimplemented / sizeof *unimplemented; i++) h_glDisable(unimplemented[i]);
+    assert(fflush(stderr) == 0);
+    off_t disable_bytes = lseek(fileno(log), 0, SEEK_CUR);
+    for (size_t i = 0; i < sizeof unimplemented / sizeof *unimplemented; i++) h_glEnable(unimplemented[i]);
+    assert(fflush(stderr) == 0);
+    assert(dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+    close(saved_stderr);
+
+    assert(disable_bytes == 0 && "disabling unsupported fixed-function caps should be silent");
+    assert(fseek(log, 0, SEEK_SET) == 0);
+    for (size_t i = 0; i < sizeof unimplemented / sizeof *unimplemented; i++) {
+        char line[80], expected[80];
+        snprintf(expected, sizeof expected, "[dm] [gl] [RED] glEnable(%#x) not implemented\n", unimplemented[i]);
+        assert(fgets(line, sizeof line, log) && "enabling an unsupported fixed-function cap should warn");
+        assert(!strcmp(line, expected));
+    }
+    assert(fgetc(log) == EOF && !ferror(log));
+    fclose(log);
+
+    assert(S.blend && F.atest && S.depth == depth && S.cull == cull && S.scissor == scissor && S.stencil == stencil);
+    assert(S.poffset == poffset && S.poffset_line == poffset_line);
+    assert(h_glGetError() == GL_NO_ERROR);
+    h_glDisable(GL_BLEND);
+    h_glDisable(GL_ALPHA_TEST);
+    assert(!S.blend && !F.atest);
+    S.blend = blend;
+    F.atest = atest;
+}
+
 static void test_active_attributes(void) {
     void (*active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *) = import("glGetActiveAttrib");
     assert(active && h_eglGetProcAddress("glGetActiveAttrib") == (void *)active);
@@ -872,34 +921,63 @@ static void test_fixed_function(int gpu) {
     puts("GL fixed-function context, texture environment and draw: OK");
 }
 
-static void test_capture_uniforms(void) {
-    GLuint vs = h_glCreateShader(GL_VERTEX_SHADER), pr = h_glCreateProgram();
-    const GLchar *source = "#version 120\n/* uniform vec4 hidden; */ uniform highp float vpFlip; uniform vec4 rows[2];\n"
-                           "void main() { gl_Position = vec4(vpFlip); }";
-    h_glShaderSource(vs, 1, &source, NULL); h_glCompileShader(vs); h_glAttachShader(pr, vs);
+static int test_capture_shaders(void) {
+    dev_init();
+    assert(g_capture_dir && g_capture_compiler && !g_lib);
+    const GLchar *vert = "#version 120\nattribute vec2 position; uniform float vpFlip;\n"
+                         "void main() { gl_Position = vec4(position.x, position.y * vpFlip, 0.0, 1.0); }";
+    const GLchar *frag = "#version 120\nuniform vec4 color;\nvoid main() { gl_FragColor = color; }";
+    const GLchar *invalid = "#version 120\nuniform float guess;\nvoid main() { invalid; }";
+    GLuint vs = h_glCreateShader(GL_VERTEX_SHADER), fs = h_glCreateShader(GL_FRAGMENT_SHADER), pr = h_glCreateProgram();
+    GLint status;
+    h_glShaderSource(vs, 1, &invalid, NULL); h_glCompileShader(vs); h_glAttachShader(pr, vs); h_glLinkProgram(pr);
+    h_glGetShaderiv(vs, GL_COMPILE_STATUS, &status); assert(!status);
+    h_glGetProgramiv(pr, GL_LINK_STATUS, &status); assert(!status);
+    assert(h_glGetUniformLocation(pr, "guess") == -1);
+
+    h_glShaderSource(vs, 1, &vert, NULL); h_glCompileShader(vs);
+    const shinfo *info = shader_of(vs)->si;
+    h_glGetShaderiv(vs, GL_COMPILE_STATUS, &status); assert(status && info);
+    h_glCompileShader(vs); assert(shader_of(vs)->si == info);
+    h_glShaderSource(fs, 1, &frag, NULL); h_glCompileShader(fs); h_glAttachShader(pr, fs);
     h_glLinkProgram(pr);
-    assert(h_glGetUniformLocation(pr, "vpFlip") == -1);
-    g_capture_dir = ".";
-    h_glLinkProgram(pr);
-    assert(!prog_of(pr)->linked);
-    assert(h_glGetUniformLocation(pr, "vpFlip") > 0);
-    assert(h_glGetUniformLocation(pr, "rows[1]") > 0);
-    assert(h_glGetUniformLocation(pr, "rows[2]") == -1);
-    assert(h_glGetUniformLocation(pr, "hidden") == -1);
-    g_capture_dir = NULL;
-    h_glDeleteProgram(pr); h_glDeleteShader(vs);
+    h_glGetProgramiv(pr, GL_LINK_STATUS, &status); assert(status);
+    GLint flip = h_glGetUniformLocation(pr, "vpFlip"), color = h_glGetUniformLocation(pr, "color");
+    assert(flip > 0 && color > 0);
+    h_glDetachShader(pr, vs); h_glDetachShader(pr, fs); h_glDeleteShader(vs); h_glDeleteShader(fs);
+    h_glUseProgram(pr); h_glUniform1f(flip, 1); h_glUniform4f(color, 0, 1, 0, 1);
+    GLuint vao, vb, fb, target;
+    h_glGenVertexArrays(1, &vao); h_glBindVertexArray(vao); h_glGenBuffers(1, &vb); h_glBindBuffer(GL_ARRAY_BUFFER, vb);
+    const float vertices[] = {-1, -1, 3, -1, -1, 3};
+    GLuint pos = h_glGetAttribLocation(pr, "position"); assert(pos < 16);
+    h_glBufferData(GL_ARRAY_BUFFER, sizeof vertices, vertices, 0);
+    h_glVertexAttribPointer(pos, 2, GL_FLOAT, 0, 0, NULL); h_glEnableVertexAttribArray(pos);
+    h_glGenTextures(1, &target); h_glBindTexture(GL_TEXTURE_2D, target);
+    h_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    h_glGenFramebuffers(1, &fb); h_glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    h_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+    h_glViewport(0, 0, 1, 1); h_glDrawArrays(GL_TRIANGLES, 0, 3);
+    uint8_t pixel[4], green[] = {0, 255, 0, 255};
+    h_glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    assert(!memcmp(pixel, green, sizeof green) && h_glGetError() == GL_NO_ERROR);
+    h_glUseProgram(0); h_glDeleteProgram(pr);
+    h_glDeleteFramebuffers(1, &fb); h_glDeleteTextures(1, &target); h_glDeleteBuffers(1, &vb); h_glDeleteVertexArrays(1, &vao);
+    puts("GL fresh capture: compile failure, legacy link, cache reuse, uniform writes and GPU readback: OK");
+    return 0;
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--capture")) return test_capture_shaders();
     int stubs = 0, cpu = 0; const char *fixture = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--stubs")) stubs = 1;
         else if (!strcmp(argv[i], "--cpu")) cpu = 1;
         else if (!strcmp(argv[i], "--fixture") && i + 1 < argc) fixture = argv[++i];
-        else { fprintf(stderr, "usage: %s [--cpu] [--stubs] [--fixture DIR]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--cpu] [--stubs] [--fixture DIR] or %s --capture\n", argv[0], argv[0]); return 2; }
     }
     if (fixture) setenv("DM_MSL_DIR", fixture, 1);
     setenv("DM_GL_STUBS", stubs ? "1" : "0", 1);
+    test_fixed_function_caps();
     test_rg_texture_uploads();
     // The calls from the issue must bind without using a GL loader first.
     GLuint (*create)(GLenum) = import("glCreateShader");
@@ -1010,7 +1088,6 @@ int main(int argc, char **argv) {
     test_program_validation();
     test_active_attributes();
     test_fate_calls();
-    test_capture_uniforms();
     test_fixed_function(!cpu);
     if (fixture) test_argument_buffers(fixture);
 
@@ -1032,7 +1109,7 @@ int main(int argc, char **argv) {
     assert((h_eglGetProcAddress(missing) != NULL) == stubs);
     assert(resolve_import(NULL, missing) == (uint64_t)&unimpl_stubs[0]);
     assert(!strcmp(wrap_kind, "STUB"));
-    printf("GL imports: %u shared entries, shader handle/source, shader and program lifetimes, the error flag, a depth texture's data, vertex formats and bindings, the uniform buffer target, compressed 2D arrays, DOOM 3's calls (ARB names, extensions, named blocks, two-sided stencil, frame copies, compressed and byte-swapped images, vertex-only programs), sampler objects and uniform locations, extension names and EGL's current binding, Fate's program validation, line width and texture clears, wrappers and missing names (DM_GL_STUBS=%d): OK\n", count, stubs);
+    printf("GL imports: %u shared entries, shader handle/source, shader and program lifetimes, the error flag, a depth texture's data, vertex formats and bindings, the uniform buffer target, compressed 2D arrays, DOOM 3's calls (ARB names, extensions, named blocks, two-sided stencil, frame copies, compressed and byte-swapped images, vertex-only programs), sampler objects and uniform locations, extension names and EGL's current binding, Fate's program validation, line width and texture clears, fixed-function capability diagnostics, wrappers and missing names (DM_GL_STUBS=%d): OK\n", count, stubs);
     printf("GL rendering (stride 0, texture LOD bias, sampler objects): %s\n", cpu ? "not run (--cpu)" : "OK");
     return 0;
 }
