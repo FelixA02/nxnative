@@ -75,6 +75,7 @@ One row per profile; the notes are each profile's `README.md`. Entries marked pr
 | [Bloodstained: Ritual of the Night](0100BF500207C000/README.md) | `0100BF500207C000` | 1.60 | 7.6.0 | Unreal Engine 4, CRIWARE | NVN | 60 fps target |
 | [Borderlands: Game of the Year Edition](010064800F66A000/README.md) | `010064800F66A000` | 1.0.2 | 9.3.0 | Unreal Engine 3 (package version 595), FMOD | NVN | 60 fps target |
 | [Brain Memory Training Academy](0100F5D01DA3A000/README.md) | `0100F5D01DA3A000` | 1.0.0 (base) | 16.2.4 | Unity 2022.3.5f1 IL2CPP | NVN | — |
+| [BRAVELY DEFAULT Ⅱ](01006DC010326000/README.md) | `01006DC010326000` | 1.0.0 (base) | 10.4.0 | Unreal Engine 4.23, CRIWARE | NVN | — |
 | [Burnout Paradise Remastered](0100DBF01000A000/README.md) | `0100DBF01000A000` | 1.0.0 (base) | 9.3.0 | Criterion's engine | NVN | — |
 | [Captain Toad: Treasure Tracker](01009BF0072D4000/README.md) | `01009BF0072D4000` | 1.4.2 | 8.2.0 | Nintendo EPD Tokyo (`al` over sead / agl) | NVN | — |
 | [Castlevania: Belmont's Curse](0100BA4026E94000/README.md) | `0100BA4026E94000` | 1.1.0 | 19.3.16 | Unity 2022.3.62f2 IL2CPP, FMOD | NVN | — |
@@ -90,6 +91,7 @@ One row per profile; the notes are each profile's `README.md`. Entries marked pr
 | [Diablo II: Resurrected](0100726014352000/README.md) | `0100726014352000` | 1.0.34.0 | 11.4.3 | Blizzard's D2R engine, FMOD | NVN | [60 fps mode](0100726014352000/README.md#what-it-needs) |
 | [Diablo III: Eternal Collection](01001B300B9BE000/README.md) | `01001B300B9BE000` | 2.7.7.92380 | 8.2.0 | Blizzard's engine, FMOD | NVN | — |
 | [Digimon Story Cyber Sleuth: Complete Edition](010014E00DB56000/README.md) | `010014E00DB56000` | 1.0.3 | 6.4.0 | Media.Vision MVGL | OpenGL | — |
+| [Digimon Story Time Stranger](010062E01FE0C000/README.md) | `010062E01FE0C000` | 1.2.2 | 20.5.21 | Media.Vision MVGL | NVN | — |
 | [Divinity: Original Sin 2 - Definitive Edition](010027400CDC6000/README.md) | `010027400CDC6000` | 1.0.12 | 9.3.0 | Larian's engine, Wwise | NVN | 60 fps target |
 | [Donkey Kong Bananza](040074A01BF12000/README.md) | `040074A01BF12000` | v458752 (Switch 2) | 20.5.19 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 | — |
 | [Splatoon Raiders](0400380020056000/README.md) | `0400380020056000` | v65536 (Switch 2) | 21.4.4 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 | — |
@@ -247,6 +249,7 @@ One row per profile; the notes are each profile's `README.md`. Entries marked pr
 | [TSUKIHIME A piece of blue glass moon](010057A01E4D4000/README.md) | `010057A01E4D4000` | 1.0.2 | 17.5.4 | its own (not named) | NVN | — |
 | [TUNIC](0100DA801624E000/README.md) | `0100DA801624E000` | 1.0.3 | 14.3.0 | Unity 2020.3.36f1 IL2CPP, FMOD | NVN | 60 fps target |
 | [Twelve Minutes](0100CD701434C000/README.md) | `0100CD701434C000` | 1.0.1 (base) | 12.3.7 | Unity 2019.4.31f1 IL2CPP, FMOD | NVN | — |
+| [ULTRA STREET FIGHTER II: The Final Challengers](01007330027EE000/README.md) | `01007330027EE000` | 1.1.1 | 1.3.1 | Capcom's MT Framework | NVN | — |
 | [Unicorn Overlord](010069401ADB8000/README.md) | `010069401ADB8000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN | — |
 | [Unicorn Overlord, Asian release](010054B01AD92000/README.md) | `010054B01AD92000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN | — |
 | [UnMetal](01008F4014A74000/README.md) | `01008F4014A74000` | 1.2.0 | 14.3.0 | Unepic Fran's own engine (`arcadix`) | OpenGL | — |

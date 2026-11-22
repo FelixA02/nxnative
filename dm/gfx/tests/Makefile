@@ -178,6 +178,13 @@ t_link_latch_cb: t_link_latch_cb.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_latch_cb.m $(MTL_T_SRC) $(FW)
 t_link_latch: t_link_latch.c ../nvn/nvn_link_latch.h
 	clang -O1 -Wall -o $@ t_link_latch.c
+t_present_history: t_present_history.c ../nvn/nvn_present_history.h
+	clang -O2 -Wall -Wextra -Werror -o $@ t_present_history.c
+t_present_history_tsan: t_present_history.c ../nvn/nvn_present_history.h
+	clang -O1 -g -fsanitize=thread -Wall -Wextra -Werror -o $@ t_present_history.c
+.PHONY: present-history-tsan
+present-history-tsan: t_present_history_tsan
+	./t_present_history_tsan
 t_thermal: t_thermal.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_thermal.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
 t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
@@ -265,7 +272,11 @@ t_tex_fit_root: t_tex_fit_root.m $(MTL_T_DEP)
 check_t_tex_fit_root: t_tex_fit_root
 	MTL_DEBUG_LAYER=1 ./t_tex_fit_root
 t_addr_known: t_addr_known.m $(MTL_T_DEP)
-	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(MTL_T_SRC) $(FW)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+t_file_wire: t_file_wire.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_file_wire.m $(MTL_T_SRC) $(FW)
+t_gpu_only_addr: t_gpu_only_addr.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gpu_only_addr.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 t_pool_chunks: t_pool_chunks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_chunks.m $(MTL_T_SRC) $(FW)
 t_pool_retire: t_pool_retire.m $(MTL_T_DEP)
@@ -708,6 +719,10 @@ check_t_rt_recycle: t_rt_recycle
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
+t_pkg_spare: t_pkg_spare.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pkg_spare.m $(MTL_T_SRC) $(FW)
+t_pkg_evict: t_pkg_evict.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pkg_evict.m $(MTL_T_SRC) $(FW)
 t_storage_pair: t_storage_pair.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_storage_pair.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_storage_pair
