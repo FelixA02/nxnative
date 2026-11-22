@@ -52,6 +52,9 @@ static void build_symhash(module_t *m);
 static void parse_dynamic(module_t *m) {
     uint32_t mod0 = *(uint32_t *)(m->base + 4);
     if (memcmp(m->base + mod0, "MOD0", 4)) die("%s: no MOD0", m->name);
+    int64_t bss_end = mod0 + (int64_t)*(const int32_t *)(m->base + mod0 + 12);
+    if (bss_end > 0 && (uint64_t)bss_end <= m->key_page_off)
+        m->guest_size = ((uint64_t)bss_end + 0xfff) & ~0xfffull;
     m->dyn = (const Elf64_Dyn *)(m->base + mod0 + *(int32_t *)(m->base + mod0 + 4));
     for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
         case DT_SYMTAB: m->symtab = (const Elf64_Sym *)(m->base + d->d_un.d_ptr); break;
@@ -108,6 +111,16 @@ static void *loaded_sym(const char *name) {   // caller holds g_modules_mu, or i
 void *guest_sym(const char *name) {
     pthread_rwlock_rdlock(&g_modules_mu); void *p = loaded_sym(name); pthread_rwlock_unlock(&g_modules_mu);
     return p;
+}
+void *guest_module_sym(uintptr_t base, const char *name) {
+    void *symbol = NULL;
+    pthread_rwlock_rdlock(&g_modules_mu);
+    for (int i = 0; i < g_nloaded; ++i) {
+        module_t *m = g_loaded[i];
+        if ((uintptr_t)m->base == base) { symbol = module_sym(m, name); break; }
+    }
+    pthread_rwlock_unlock(&g_modules_mu);
+    return symbol;
 }
 // For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
 module_t *module_of(const void *p) {
@@ -350,6 +363,10 @@ static void read_layout(module_t *m, const char *dir) {
     if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
                                          || m->back_off + m->back_len != m->image_size))
         die("%s: back patch area, but BACK_OFF / BACK_LEN missing or wrong", path);
+    // map_image seals [0, text_end rounded up to 16 KB) read + execute (and gen_embed.py puts it in __TEXT on iOS): data below that would be read-only and SIGBUS in relocate()
+    // (FINAL FANTASY VIII Remastered's Math.nro and Platform.nro). patch_nso.py moves ro and data up (mod_layout.py); stop here on a copy rewritten before that
+    if (m->data_off < ((m->text_end + 0x3FFF) & ~0x3FFFull))
+        die("%s: data at %#llx shares a 16 KB page with code (text ends at %#llx): rewrite the module again with dm/tools/patch_nso.py", m->name, (unsigned long long)m->data_off, (unsigned long long)m->text_end);
 }
 
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this

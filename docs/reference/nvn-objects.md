@@ -380,6 +380,14 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Fix:** a registry entry carries `gone` (`cap_treg`), and a gone entry keeps neither its pool nor its storage address and is not read back. `nvn_replay` registers it and then marks it gone (`mtl_reg_tex_gone`), as the live run left it. Captures made before keep working (the byte was padding, 0). `check_t_capture_live` registers a texture on a pool of its own and finalizes that pool, then fills the pool object with such bytes. Without the fix the capture is incomplete.
 - **Found on:** [Pokemon Scarlet](../../dm/games/0100A3D008C5C000/README.md) (texture IDs 1726 to 1786 in the bedroom, each texture with a pool of its own).
 
+### A sparse mapping scan reads a finalized pool object
+
+- **Symptom:** `CRASH sig=10` at `nvn_sparse_pool+0x4` from `mtl_sub_begin` on the submission worker during a level change. The instruction reads `pool->vp`, 24 bytes into the freed pool object.
+- **Cause:** a registered descriptor keeps a copy of `tex_t.pool` after its memory pool is finalized. `nvnMemoryPoolFinalize` already marks the descriptor `gone` under `g_rmu` before tearing the pool down, but `treg_sparse_notes` did not check that state before calling `nvn_sparse_pool` on the copied pointer. A later mapping in another pool sends it through that scan even when no draw reads the old descriptor.
+- **Fix:** the sparse mapping scan removes gone descriptors before reading their pool pointers, under the same registry lock that finalization holds. A registration that revives a removed descriptor restores its sparse tracking even when the descriptor data is identical.
+- **Check:** `make -C dm/gfx/tests GAME=<id> check_t_sparse_pool_cache` with `MTL_DEBUG_LAYER=1`. The fixture finalizes a texture and its pool while leaving the descriptor registered, makes the pool object's page inaccessible, then maps another pool. The next submission must retire the gone entry without reading that page. The fixture faults on the unmodified scan. It also checks that a descriptor revived by an identical registration receives a mapping note and that the GPU reads the newly mapped page.
+- **Found on:** Tony Hawk's Pro Skater 1 + 2 1.0.3 with DLC, title `0100CC00102B4000` ([issue #496](https://github.com/seedds/nxnative/issues/496)), on an M3 MacBook Air, 16 GB, macOS 27.2.1. The original host crashed while loading the tutorial. With only the host swapped for the crash fix, the tutorial loaded and eight levels ran at a steady 30 fps without the crash. The separately reported black surfaces did not recur in those runs and remain unexplained. [PR #3091](https://github.com/seedds/nxnative/pull/3091)
+
 ### A texture read after its memory pool object was freed
 
 - **Symptom:** `CRASH sig=11 … pc=nvn_sparse_protect+0x40`, an address that looks like data, `x8` 8 below it, after a long session; the backtrace `tex_by_id` ← `tex_mtl` ← `pkg_upload`. The pool need not be sparse.
@@ -416,7 +424,7 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Symptom:** `[RED] NVN unimplemented function called: nvnCommandBufferGetControlMemoryFree` (or `…GetControlMemorySize`) once, after the game gives a command buffer control memory.
 - **Cause:** `AddControlMemory` was a no-op, and the size and free getters reached the unimplemented stub, which returns 0, so a game that checks the free space sees none left.
 - **Fix:** `cmd_t` records the last `AddControlMemory` block; `GetControlMemorySize` returns its size, `GetControlMemoryUsed` the bytes of control entries the host wrote into it ([A recording's end and links are in control memory](#a-recordings-end-and-links-are-in-control-memory); 0 until then, when the host used none), and `GetControlMemoryFree` the rest. `t_nvn` checks the values before any block, after one, after a recording and after a smaller block replaces it.
-- **Found on:** South Park: The Fractured But Whole 1.05, whose port is [PR #662](https://github.com/seedds/nxnative/pull/662) (not yet in the games table). With the getters implemented it reached the title, menu, a save and character customization on the Mac; with them returning 0 it also progressed, but submitted commands at a different rate.
+- **Found on:** [South Park: The Fractured But Whole](../../dm/games/01008F2005154000/README.md) 1.05. With the getters implemented it reached the title, menu, a save and character customization on the Mac. With them returning 0 it also progressed and submitted commands at a different rate. [PR #662](https://github.com/seedds/nxnative/pull/662).
 
 ### Queue builder size getters
 
@@ -720,6 +728,13 @@ Games read this count as a position in their own command memory and size their h
   - reading the resolved host texture instead uploads it on the reading thread after the CPU write, and `up_owner_check` stops the test.
   Copying the rows at the pixel pitch fails 5 of 6 rows. Axiom Verge's opening logs `linear texture ser=28 8x8 format 0x25 flags 0x10: offset 0x3f8000 / row pitch 32 not aligned to 64 bytes` and `CPU-written texture ser=28 …`, the same on the Mac with the switch and on both iOS devices without it. On the Mac its picture matches a run without the switch.
 - **Found on:** [Hades II](../../dm/games/0100A00019DE0000/README.md) v0 on an iPhone 15 Pro Max (GitHub issue #1956): the title screen's movie background grey and flickering, green and magenta blocks behind the options menu; 736x480 `IMAGE | LINEAR` R8 planes in a `CPU_UNCACHED` pool, rows of 736 bytes (the Mac asks for 16). Checked by `t_linear_readback`; not yet on the iPhone. Axiom Verge 1.0.3 (`0100052004384000`, SDK 4.4.0, MonoGame; its profile is a separate change) on an iPhone 16 Pro Max, iOS 26.0: the opening's sky and mountains are magenta. Its 8×8 RGBA8 linear textures sit in a `CPU_UNCACHED` pool. An iPad Pro with an M4 asks for 64 bytes on iPadOS 26.0 as well, while macOS 27.0 on an M4 Pro asks for 16. With the fix, both iOS devices log the four textures as uploaded, and the iPhone's opening is right.
+
+### A linear texture past Metal's 2D limit
+
+- **Symptom:** `-[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]` aborts on a Metal descriptor assertion before the host can log a red line.
+- **Cause:** a linear texture may become a view on its memory pool's buffer. This path bypassed `tex_desc`'s dimension check.
+- **Fix:** `linear_fit` and `tex_desc` share the 2D size check (16,384 on older supported GPUs, 32,768 from Apple10). An oversized linear texture falls through to the descriptor check and its red line. `t_linear_readback` checks that a buffer view at the device limit succeeds and that one pixel past either dimension is refused.
+- **Found on:** Nintendo Switch Sports 1.5.0 has a 1024×32768 R8 linear glyph cache ([PR #2908](https://github.com/seedds/nxnative/pull/2908)). An M4 Pro on macOS 27.2.1 reproduced the Metal assertion with a buffer view 16,385 rows high.
 
 ### Textures written with `nvnTextureWriteTexels`
 
@@ -1026,6 +1041,13 @@ Games read this count as a position in their own command memory and size their h
 - **Found on:** code review of the shared tracker, from a fork's compatibility commit `587d5206` ported through [PR #686](https://github.com/seedds/nxnative/pull/686). No game is known to hit it: a game normally finalizes a pool only after the GPU is done with it.
 - **Check:** `t_dirty_retire_race` retires the pool between protect's lookup and its first page-state exchange, then reads 16 bytes into the pool with `read()`. Without the fix, retirement completes first and the read fails with `EFAULT`; with it, retirement waits for protection, unregisters the pool and the read returns 16. `t_dirty_race` and `t_dirty_slots` cover page-state publication and shared / reused pool slots.
 
+### CPU staging recycled before a texture upload
+
+- **Symptom:** a scene's first load draws overbright effects or damaged UI textures, particularly while its pipelines are being built.
+- **Cause:** the game returns CPU staging blocks to its resource thread immediately after recording the uploads. The host queues the address and reads it later, when encoding or running the blit. A trace of Catherine's 512×512 BC1 effects texture found the correct bytes at recording and submission, and replacement bytes at encoding about a second later. Starting a new segment after a copy could only help after replay reached the copy.
+- **Fix:** for a verified CPU upload call site, the recording owns the source bytes, along with its strides and texture description. The queued command uses them to fill the Metal staging arena before running the ordered blit. The build ID and return address identify the CPU upload routine because NVN also supports buffer-to-texture copies whose source is written by the GPU.
+- **Found on:** [Catherine: Full Body](../../dm/games/0100BF00112C0000/README.md#rendering).
+
 ## NVN entry points
 
 ### Sampler builder queries leave renderer state unread
@@ -1219,6 +1241,15 @@ Games read this count as a position in their own command memory and size their h
 - **Cause:** a packaged texture belongs to its serial, and the engine registers the same storage under many texture objects.
 - **Fix:** general (`nvn_mtl.m` `g_pkg_share`, `tex_alias_key`, `pkg_shared`). Packaged textures are shared by storage, layout and format through a weak table, so a new serial of the same storage takes the existing one. A pool's removal evicts its keys (`mtl_alias_drop_pool`), and the walk's budget does not count a texture that is already shared.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### Packaged-texture and CPU-written tables walked by every memory pool Finalize
+
+- **Symptom:** area loads take longer and longer over a long session in one process: Ocarina of Time loading saves from the pause menu grew from 80 ms (>30 ms frames per load) in loads 1–20 to 584–640 ms in loads 121–200 (1.2–1.5 s for some areas), all in `submit+present` with the GPU idle; a `sample` shows `mtl_alias_drop_pool` as the hottest function, with the replay thread and game threads waiting on `g_smu` and `g_cpu_tex_mu`. Upstream [issue #2507](https://github.com/seedds/nxnative/issues/2507) reports the same after 4–9.5 hours of play.
+- **Cause:** two global hash tables accumulated entries in long-lived pools (Ocarina of Time's permanent texture heaps) and were walked across their whole capacity on every `nvnMemoryPoolFinalize`: (1) `g_pkg_share` ([above](#texture-ids-of-one-storage-share-one-packaged-texture)) held `NvPkg` weakly (`NvPkgRef`), so dead entries outlived their packages and stayed until their own pool finalized (357,392 entries, 99% dead, in 524,288 slots after 200 loads, walked under `g_smu`); (2) `g_cpu_tex_retired` kept finalized textures' CPU-written classifications until their pool finalized (63,726 entries after ~15 loads, 2.3 million in 4.19M slots after 160), and `cpu_tex_drop_pool` walked `g_cpu_tex`, `g_cpu_tex_retired` and `g_cpu_unc` under `g_cpu_tex_mu` (stalling `tex_from_storage`, and stalling `g_smu` waiters via `mtl_tex_release` / `mtl_tex_cpu_written` locking `g_smu` → `g_cpu_tex_mu`).
+- **Fix:** general, in the host (`nvn_mtl.m`). Both tables are partitioned by memory pool. `g_pkg_share` maps `pool → nvn_hmap` (`alias_key → NvPkgRef`): `pkg_share_put` compacts a pool's map before growing (`pkg_share_compact`), dropping dead `NvPkgRef` entries and resizing capacity to fit the live ones (shrinking after a temporary spike), `pkg_shared` drops dead entries on hit and skips pools with no packaged textures, and `mtl_alias_drop_pool` removes and frees only the finalized pool's map (`O(1)` for unrelated pools). `g_cpu_pools` maps `pool → {live, retired, unc}` under `g_cpu_tex_mu` (`g_cpu_tex_n` holds the live total for `mtl_cpu_tex_count`): `cpu_tex_drop_pool` drops and frees only the finalized pool's tables in `O(1)` for unrelated pools, and `tex_cpu_written` skips pools with no CPU-written textures. **Open:** retired classifications in a permanent pool still grow with loads (~0.4 MB/load) because command-buffer snapshot lifetimes are not tracked.
+- **Check:** `t_pkg_share` (3,000 dead entries beside 40 live ones stay bounded to 128 slots with no pool Finalize; capacity shrinks from ≥2,048 to 128 after a 1,000-live spike dies; dead lookup drops the entry; 1,000 unrelated pool Finalizes beside 5,000 live packages take <1 ms; finalizing a pool drops its map and ghost serials naming its packages while keeping other pools' entries); `t_cpu_tex` (`pool_index`: 1,000 small-pool Finalizes beside 200,000 retired entries take ~0.5 ms vs 144 ms before, and finalizing the big pool frees its live, retired and `unc` tables).
+- **Measured:** diagnosis and load-series A/B in PR #3133 and PR #3134 (Ocarina of Time v131072, Mac Studio M4 Max, 2560×1440, 140 pause-menu save loads, median time >30 ms per load in blocks of 20): 80, 95, 122, 196, 288, 406, 584 ms without the fixes; 86, 61, 62, 76, 67, 75, 76 ms with both tables fixed. Long-session confirmation on the reporter's setup (#2507) remains open.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [issue #2507](https://github.com/seedds/nxnative/issues/2507).
 
 ### A texture shared by its packaged texture's serials left the residency set with one of them
 
