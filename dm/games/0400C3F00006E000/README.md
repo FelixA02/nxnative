@@ -16,7 +16,7 @@ Render conditions, which the host evaluates for every game ([Conditional renderi
 ## Files
 
 - Packed from a dump folder (`base/` only) with [`scripts/pack_dump.py`](../../../scripts/pack_dump.py): 205,902 RomFS entries, 21.7 GB.
-- [`shader_map.tsv`](shader_map.tsv) lists 11,558 shaders (726 compute, 18 mesh, 7,261 pixel, 7 task, 3,546 vertex) from `Shader/` (bfsha, `Drive.Nin_Ounce_NVN2.release.sarc.zs`), `Lib/` (agl, gsys), `Effect/`, `Layout/` and `main` (40 shaders).
+- `shader_map.tsv` lists 11,558 shaders (726 compute, 18 mesh, 7,261 pixel, 7 task, 3,546 vertex) from `Shader/` (bfsha, `Drive.Nin_Ounce_NVN2.release.sarc.zs`), `Lib/` (agl, gsys), `Effect/`, `Layout/` and `main` (40 shaders).
 - The rewriter (`dm/tools/patch_nso.py`) rewrites the three modules with no cut. The SDK-wide address region rules of `dm/tools/sdk_patches.py` match no function of this `sdk`.
 
 ## Shaders
@@ -60,6 +60,21 @@ To the race:
 After a race:
 
 5. `game called nn::diag abort` with Result 0x1c286f (nn::codec 3604) on `VideoDecoderThread`, about 1 time in 5 before the post-race picture: registered decoder buffers were pre-signalled at generation 0 instead of waiting for a decoded picture ([Registered decoder buffers signalled before a picture was decoded](../../../docs/reference/movies.md#registered-decoder-buffers-signalled-before-a-picture-was-decoded)).
+
+## HDR
+
+Current: Game's HDR (`DM_HDR=2`) shows the game's own HDR picture, and BT.2446 (`DM_HDR=1`) the inverse tone map of its SDR picture ([HDR output](../../../docs/reference/rendering.md#hdr-output), [vi HDR status](../../../docs/reference/services.md#vi-hdr-status)).
+
+- The game calls `nn::vi::QueryDisplayHdrStatus` and `QueryDisplayHdrPaperWhite` (on 1.8.0 its patched frame-interval function `main+0x69cbb0` calls the status query) and sets the layer HDR metadata.
+- Run on the Mac (Mac17,6, M5 Max, macOS 27.2.1, the built-in XDR screen, local v0 build) in all three modes, switched from Window › HDR, with a host from before the per-frame vi answer and the dropped drawable. With Game's HDR, vi reports HDR, the game recreates its window as `0x3D` (RGB10A2) and the present takes the PQ route. The game sets the standard content luminance range to 0..222 nits and the extended one above the peak vi reports: 0..3,129 nits at a reported peak of 1,737 (headroom taken as 8.56). This build set no Bezier curve. BT.2446 ran at L_HDR 1,737 nits.
+- Measured from macOS HDR window captures (a window capture, not a panel measurement) at the start of the first race, linear luminance relative to SDR white:
+
+  | Mode | Peak | 99.9 % | 99 % | Capture headroom |
+  |---|---|---|---|---|
+  | Game's HDR | 1.77 | 1.76 | 1.67 | |
+  | BT.2446 | 8.64 | | 8.00 | 8.86 |
+
+  Game's HDR stays within about 1.8 x SDR white in that frame, while vi reported peaks up to 1,737 nits (8.56 x SDR white) in that run.
 
 ## Frame rate
 
@@ -149,6 +164,7 @@ Mac regression on the M4 Pro with macOS 27.2.1 and Xcode 27.2, 2026-11-19. Both 
 - `649e36162cad9e79`, a foliage shader with an 8x8 local size, keeps a first-invocation race: its setup loops over a uniform's count, so [the host cannot make it as stores](../../../docs/reference/shaders.md#a-store-only-a-dispatchs-first-invocation-makes). Its list's count read 0 in every one of 7,350 traced title frames, so the race had nothing to act on there; whether that list should be empty is not known.
 - The engine class screen offers 50, 100 and 150cc in this build.
 - **iPhone freeze on 1.8.0:** the app froze twice during scene loads on the reported build, and one freeze ended in a phone restart. See [A residency commit stays blocked in the iPhone kernel](../../../docs/reference/rendering.md#a-residency-commit-stays-blocked-in-the-iphone-kernel).
+- **HDR:** the Bezier curve (1.8.0 sets it every frame) and the HDR-to-SDR metadata are logged, not applied ([HDR](#hdr)). Not run with HDR on an iPhone.
 
 ## Audio route regression check
 
@@ -166,11 +182,13 @@ Mac regression on the M4 Pro with macOS 27.2.1 and Xcode 27.2, 2026-11-19. Both 
 
 ## Found on this game
 
+- [A game that changes its present interval every frame filled the log](../../../docs/reference/frame-rate.md#a-game-that-changes-its-present-interval-every-frame-filled-the-log): 11,614 interval changes in a 7-minute 1.8.0 iPhone race before the host frame step covered 1.8.0.
 - [A lone acquire thread kept its time-constraint policy through a long CPU burst](../../../docs/reference/frame-rate.md#a-lone-acquire-thread-kept-its-time-constraint-policy-through-a-long-cpu-burst): the freezes of up to about a minute at the end of a race ([GitHub issue #1859](https://github.com/seedds/nxnative/issues/1859)). Fixed from its logs and a synthetic measurement, not run on the game; the 12 to 16 s burst itself stays open.
 - [A residency commit stays blocked in the iPhone kernel](../../../docs/reference/rendering.md#a-residency-commit-stays-blocked-in-the-iphone-kernel) (open).
 - [A timed archive write stalls active presentation](../../../docs/reference/rendering.md#a-timed-archive-write-stalls-active-presentation).
 - [An unregistered NUP build loses its numeric version label](../../../docs/reference/packing.md#an-unregistered-nup-build-loses-its-numeric-version-label).
 - [A registered update with its own shader tables is reported red or packed with another version's shaders](../../../docs/reference/packing.md#a-registered-update-with-its-own-shader-tables-is-reported-red-or-packed-with-another-versions-shaders).
+- [An update's prewarm capture reports missing shaders](../../../docs/reference/packing.md#an-updates-prewarm-capture-reports-missing-shaders).
 - [CPU deswizzle copies use slice and row offsets](../../../docs/reference/nvn-objects.md#cpu-deswizzle-copies-use-slice-and-row-offsets): three sparse terrain textures decoded 12,392 tiles on the replay thread before the grid. With a warm pipeline archive on an M3 Max, the matching load frame took 432–468 ms on `087faba9` and 281–283 ms with the shared row copier (two launches each, reversed order, handheld at 60 fps). It compiled no new pipelines in any of the four launches. Pipeline first-use and other loading stalls remain open.
 - [The split shader tables differ from a game profile's](../../../docs/reference/packing.md#the-split-shader-tables-differ-from-a-game-profiles).
 - [Relative thread waits can hold back the replay clock](../../../docs/reference/threads.md#relative-thread-waits-can-hold-back-the-replay-clock): v0 stalled at frame 2 in `SleepThread` ([PR #2027](https://github.com/seedds/nxnative/pull/2027)). On 1.8.0 the main thread at `main+0x8ec38` waited indefinitely in `WaitForAddress` while a BaseProcExecutor worker was in `SleepThread` waiting for the replay clock. In the 60 s Mac smoke (Apple M6, macOS 27.2, Xcode 27.2, `DM_DETCLOCK=16666667 DM_DETCLOCK_PACE=1`), main `4b92e232` stalled at frame 20 and the fix reached frame 875. The candidate's frame median over seconds 55–60 was 17.55 ms. The clock-off main control reached the same texture CPU-fallback warning, and resident memory at frame 600 was 7,918 MB on that control and 7,735 MB on the candidate.
@@ -198,6 +216,7 @@ Mac regression on the M4 Pro with macOS 27.2.1 and Xcode 27.2, 2026-11-19. Both 
 - [Comparisons with .FTZ](../../../docs/reference/shaders.md#comparisons-with-ftz)
 - [Variable rate shading ignored](../../../docs/reference/rendering.md#variable-rate-shading-ignored)
 - [Image views of the type a shader declares](../../../docs/reference/rendering.md#image-views-of-the-type-a-shader-declares) (the dark box around each kart's shadow, issue #1648)
+- [Uncompressed alias bookkeeping walked every writer on each registration change](../../../docs/reference/rendering.md#uncompressed-alias-bookkeeping-walked-every-writer-on-each-registration-change) (submit CPU after PR #3318: the game registers its render targets anew each frame, with IDs past 65,536)
 - [A haptic engine that stops under a call raises, and ended the app](../../../docs/reference/services.md#a-haptic-engine-that-stops-under-a-call-raises-and-ended-the-app) (the iPhone crash after about 85 s of a race)
 - [A DualShock 4 that connects after the first stays on Core Haptics](../../../docs/reference/services.md#a-dualshock-4-that-connects-after-the-first-stays-on-core-haptics)
 - [Identical controllers that GameController lists as one](../../../docs/reference/services.md#identical-controllers-that-gamecontroller-lists-as-one) (two Pro Controllers over USB, split-screen races)

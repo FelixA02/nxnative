@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -103,9 +104,16 @@ class XcodePipelineTests(unittest.TestCase):
             self.assertEqual(environment['DM_TEAM_ID'], 'ABCDEFGHIJ')
             self.assertEqual(Path(environment['DM_XCODE_PROJECT_DIR']), root / f'{registered.id}_build/xcode')
             register.assert_called_once()
-            self.assertEqual(mocks['derive_profile'].call_count, int(derived))
+            derive_profile = mocks['derive_profile']
+            if derived or graphics == 'nvn':
+                derive_profile.assert_called_once()
+                self.assertEqual(derive_profile.call_args.kwargs.get('shader_only', False), not derived)
+            else:
+                derive_profile.assert_not_called()
             if graphics == 'nvn':
-                self.assertEqual(mocks['split_shaders'].call_args.args[8], derived)
+                split_shaders = mocks['split_shaders'].call_args
+                self.assertEqual(split_shaders.args[8], derived)
+                self.assertTrue(split_shaders.kwargs['write_tables'])
             else:
                 builder = mocks['build_vk_shaders' if graphics == 'vulkan' else 'build_gl_shaders']
                 self.assertTrue(builder.call_args.kwargs.get('reuse', True))   # reused (the default): a damaged copy is keyed by its files' times, not refused
@@ -322,6 +330,63 @@ class ImageStaging(unittest.TestCase):
             self.assertEqual(staged_shaders.read_bytes(), b'newer')
             stage(folder); self.assertEqual([p.name for p in (app / 'msl').iterdir()], ['b-abc']); self.assertEqual((app / 'msl/b-abc/k_b.metallib').read_text(), 'loose')
             stage(packed); self.assertEqual([p.name for p in (app / 'msl').iterdir()], ['b-abc.img'])
+
+
+class BuildStampTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('plutil'), 'needs macOS plutil')
+    def test_build_stamps_insert_and_overwrite_existing_entries(self):
+        script = (REPO / 'dm/ios/tools/build_ipa.sh').read_text()
+        stamp = script[script.index('# DMCommit / DMChain:'):script.index('\nRP=;')]
+        preamble = 'set -u\nt() { echo "$*"; }; die() { echo "FAIL: $*" >&2; exit 1; }\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / 'repo'
+            dm = repo / 'dm'
+            dm.mkdir(parents=True)
+            tracked = dm / 'marker.txt'
+            tracked.write_text('clean\n')
+            for args in (['init', '-q'], ['config', 'user.name', 'Test'], ['config', 'user.email', 'test@example.com'],
+                         ['add', '.'], ['commit', '-q', '-m', 'init']):
+                subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True)
+            commit = subprocess.run(['git', 'rev-parse', '--short=12', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            work = root / 'work'
+            (work / 'Gen').mkdir(parents=True)
+            plist = work / 'Gen/Info.plist'
+
+            def run_stamp(initial, msldir='b-fixture123456', metal_capture=None):
+                plist.write_bytes(plistlib.dumps(initial))
+                env = {k: v for k, v in os.environ.items() if not k.startswith('DM_')}
+                env.update(DM=str(dm), MSLDIR=msldir)
+                if metal_capture is not None:
+                    env['DM_METAL_CAPTURE'] = metal_capture
+                return subprocess.run(['/bin/bash', '-c', preamble + stamp], cwd=work, env=env, capture_output=True, text=True)
+
+            cases = [
+                ('absent', {}),
+                ('existing_same_type', {'DMCommit': 'oldcommit000', 'DMChain': 'oldchain0000', 'MetalCaptureEnabled': False}),
+                ('existing_wrong_type', {'DMCommit': 123456789012, 'DMChain': 987654321098, 'MetalCaptureEnabled': 'no'}),
+            ]
+            for name, initial in cases:
+                with self.subTest(case=name):
+                    result = run_stamp(initial, metal_capture='1')
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, '')
+                    stamped = plistlib.loads(plist.read_bytes())
+                    self.assertEqual(stamped['DMCommit'], commit)
+                    self.assertIsInstance(stamped['DMCommit'], str)
+                    self.assertEqual(stamped['DMChain'], 'fixture123456')
+                    self.assertIsInstance(stamped['DMChain'], str)
+                    self.assertIs(stamped['MetalCaptureEnabled'], True)
+
+            # Dirty tracked checkout appends +dirty; non-NVN shaders and unset DM_METAL_CAPTURE leave those keys untouched.
+            tracked.write_text('dirty\n')
+            result = run_stamp({'CFBundleName': 'DmIOS'}, msldir='vk', metal_capture='0')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stderr, '')
+            stamped = plistlib.loads(plist.read_bytes())
+            self.assertEqual(stamped['DMCommit'], f'{commit}+dirty')
+            self.assertNotIn('DMChain', stamped)
+            self.assertNotIn('MetalCaptureEnabled', stamped)
 
 
 if __name__ == '__main__':

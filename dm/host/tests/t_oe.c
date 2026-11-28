@@ -9,7 +9,8 @@
 void dm_thread_native_wait(int entering) { (void)entering; } // queue-only test, without the guest scheduler
 uint64_t now_ns(void) { return 0; }
 void dm_audio_suspend(int on) { (void)on; }   // stubs for the bg item of DM_OE_SCRIPT (hle_audio.c / hle_os.c / hle_nvn.c)
-void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
+static int applet_suspended;
+void guest_clock_freeze_for(int reason, int on) { if (reason == DM_CLOCK_APPLET) applet_suspended = on; }
 void dm_gfx_suspend(int on) { (void)on; }
 void dm_gfx_quit_begin(void) {}
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) { (void)why; (void)then; (void)arg; }   // oe_start, which never returns: this test checks its plan (oe_plan)
@@ -71,7 +72,7 @@ static int file_is(const char *path, const char *want, size_t n) { char b[64] = 
 static void plan_checks(void) {
     char dir[] = "/tmp/t_oe_plan.XXXXXX", old[4096], path[4200], self[4096], tsv[4200]; uint32_t ssz = sizeof self;
     if (!mkdtemp(dir) || !getcwd(old, sizeof old) || chdir(dir) || _NSGetExecutablePath(self, &ssz)) { CHECK(0, "plan: a scratch folder"); return; }
-    int cur = (int)(DM_GAME_PROGRAM_ID & 0xf); prog_plan P = {0};   // each oe_plan frees the plan before it
+    int cur = (int)(DM_GAME_PROGRAM_ID & 0xfff); prog_plan P = {0};   // each oe_plan frees the plan before it
     pushed_users = 0x5;
     unsetenv("DM_PROGRAMS"); setenv("DM_OPEN_USERS", "5", 1); setenv("DM_LAUNCH_PARAM", "/x/launch_param.bin", 1); setenv("DM_PREV_PROGRAM", "3", 1); setenv("DM_RELAUNCH", "1", 1); setenv("T_OE_KEEP", "yes", 1);
     // a program run by itself: the relaunch is this host again, same arguments and folder, DM_RELAUNCH=1 once, no parameter, previous program or open-user handoff
@@ -93,7 +94,7 @@ static void plan_checks(void) {
     // a table: the relaunch starts program 0's row with its keys, and drops the keys any row sets
     snprintf(tsv, sizeof tsv, "%s/programs.tsv", dir); FILE *f = fopen(tsv, "w");
     if (!f) { CHECK(0, "plan: a program table"); prog_plan_free(&P); return; }
-    fprintf(f, "# programs\n0\texe=/h/p0\targ=/d/p0\tcwd=%s\tT_OE_ROW=zero\n1\texe=/h/p1\targ=/d/p1\tcwd=%s\tT_OE_ROW=one\tT_OE_ONLY1=x\n", dir, dir); fclose(f);
+    fprintf(f, "# programs\n0\texe=/h/p0\targ=/d/p0\tcwd=%s\tT_OE_ROW=zero\n1\texe=/h/p1\targ=/d/p1\tcwd=%s\tT_OE_ROW=one\tT_OE_ONLY1=x\n16\texe=/h/p16\targ=/d/p16\tcwd=%s\tT_OE_ROW=sixteen\n", dir, dir, dir); fclose(f);
     setenv("DM_PROGRAMS", tsv, 1); unlink(path); setenv("T_OE_ONLY1", "old", 1); setenv("T_OE_ROW", "old", 1);
     CHECK(oe_plan(0, NULL, 0, 1, &P, "relaunch") && !strcmp(P.exe, "/h/p0") && P.argv[0] && !strcmp(P.argv[1], "/d/p0") && !P.argv[2] && P.cwd && !strcmp(P.cwd, dir),
           "relaunch, table: program 0's host, modules and folder");
@@ -106,6 +107,8 @@ static void plan_checks(void) {
     pushed_users = 0;
     CHECK(oe_plan(1, "xyz", 3, 0, &P, "exec 1 unpushed") && !strcmp(P.exe, "/h/p1") && !env_count(P.env, "DM_OPEN_USERS=", 1),
           "ExecuteProgram(1), table, unpushed: stale DM_OPEN_USERS not leaked across hops");
+    CHECK(oe_plan(16, "p16", 3, 0, &P, "exec 16") && !strcmp(P.exe, "/h/p16") && env_count(P.env, "T_OE_ROW=sixteen", 0) == 1
+          && (lp = env_get(P.env, "DM_LAUNCH_PARAM")) && file_is(lp, "p16", 3), "ExecuteProgram(16), table: index >= 16 routes to row 16");
     pushed_users = 0x3;
     CHECK(oe_plan(7, "xyz", 3, 0, &P, "exec 7") && !strcmp(P.exe, "/h/p0") && !env_count(P.env, "DM_OPEN_USERS=", 1) && (lp = env_get(P.env, "DM_LAUNCH_PARAM")) && file_is(lp, "", 0),
           "ExecuteProgram(7), no such row: program 0, no open users, no parameters");
@@ -267,8 +270,15 @@ int main(void) {
     dm_applet_enter("test"); dm_applet_leave(); CHECK(empty() && h_oe_GetFocus() == 2, "a nested applet: the outer one keeps the game out of focus");
     dm_applet_leave(); CHECK(pop_is(15) && empty() && h_oe_GetFocus() == 1, "the outer applet closes: 15, state 1");
     h_oe_SetFocusMode(3); dm_applet_enter("test");
-    CHECK(empty() && h_oe_GetFocus() == 2, "focus mode 3: an applet changes the state without a notification");
-    dm_applet_leave(); CHECK(empty() && h_oe_GetFocus() == 1, "focus mode 3: back to 1 without a notification");
+    CHECK(empty() && h_oe_GetFocus() == 2 && applet_suspended, "AlwaysSuspend parks the guest while the applet is open");
+    dm_applet_enter("nested"); dm_applet_leave();
+    CHECK(applet_suspended, "closing the inner applet keeps the guest suspended");
+    h_oe_SetFocusMode(0);
+    CHECK(!applet_suspended, "SuspendHomeSleep keeps the guest running during an applet");
+    h_oe_SetFocusMode(3);
+    CHECK(applet_suspended, "switching to AlwaysSuspend applies to the active applet");
+    dm_applet_leave();
+    CHECK(empty() && h_oe_GetFocus() == 1 && !applet_suspended, "closing the last applet resumes the guest without a notification");
     // the graphics scale does not follow the operation mode: tier 0 in both modes; DM_GFX_SCALE picks a reduced tier, nonsense keeps 0
     unsetenv("DM_GFX_SCALE"); dm_set_opmode(1); CHECK(h_oe_GfxScale() == 0, "graphics scale docked: tier 0 (the whole GPU)");
     dm_set_opmode(0); CHECK(h_oe_GfxScale() == 0, "graphics scale handheld: tier 0");

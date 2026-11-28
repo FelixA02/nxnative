@@ -3,7 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Texture filtering](#texture-filtering), [Game language](#game-language), [Picture](#picture), [Rotation](#rotation), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [HDR](#hdr), [Texture filtering](#texture-filtering), [Game language](#game-language), [Picture](#picture), [Rotation](#rotation), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
@@ -79,6 +79,17 @@ flowchart LR
 - **Cost:** none in GPU time (it saves 2.5-4 ms a frame in that case); the picture is Apple's scaler's rather than the game's. Frames where the game renders at its output size are not upscaled and keep the game's shader either way. Devices without MetalFX keep the game's upscaler.
 - **Not the same as [Upscaling](#upscaling):** that one scales the finished picture, HUD included, to the screen; this one replaces the game's own step inside the frame. Both can be on.
 
+### HDR
+
+For a screen that shows HDR (Apple calls it EDR: a MacBook Pro's or an iPad Pro's XDR screen, an iPhone's, an HDR monitor). **Off**, the default, is the usual picture.
+
+- **BT.2446:** every game is told the screen is SDR, renders its usual picture, and the app brightens it (the BT.2446 Method A inverse tone map). The whole picture gets brighter, not only the highlights: white goes as bright as the screen allows, and mid tones rise with it. On a MacBook Pro's XDR screen at a low brightness setting (room for about 15 times the usual white), a mid grey goes from 0.18 to about 0.8 to 0.9 of the usual white, and white menus and text are as bright as the brightest highlight. No grey gets darker than with Off.
+- **Game's HDR:** a Switch 2 game that renders HDR (Ocarina of Time) is told the screen has HDR and shows its own HDR picture: highlights brighter than white, while its menus and text stay at the screen's usual white. A game that cannot render HDR (it never asks whether the display has it) runs as BT.2446. For such a game the settings screen (iPhone and Mac) does not list Game's HDR, and a Game's HDR choice saved earlier goes back to Off. `DM_HDR=2` in `env.txt` still fixes the row, as any `env.txt` value does, and runs as BT.2446; the row then shows no value.
+- **Brightness** follows the screen's brightness setting. With BT.2446, white goes to the top of the room the screen has above its usual white at that setting and mid tones rise with it, so less room gives less, and with no room left the picture is the same as with Off. With Game's HDR, a game that renders HDR keeps its menus and text at the screen's usual white, and its highlights go as far above it as the screen has room for. At a low brightness setting there is more room above white than at full brightness.
+- **On a screen without HDR** nothing changes: the picture is the same as with Off. Moving the window to such a screen goes back to SDR within about a second, and back to the chosen mode on an HDR screen.
+- **While you play (Mac):** Window › HDR switches between Off, BT.2446 and Game's HDR at once, and **Next HDR Mode** (⌃⌘H) steps through them. The current mode is ticked. Game's HDR is greyed out for a game that cannot render HDR, and both HDR modes and Next HDR Mode while the window is on a screen without HDR (your choice stays and comes back on an HDR screen). The choice is kept for the next start, as the settings window keeps it.
+- **Cost:** bright pictures use more of the screen's power, which matters on a battery; the GPU time is a fraction of a millisecond.
+
 ### Texture filtering
 
 Mac (NVN games). Sets a minimum anisotropic filtering level (**2x** to **16x**) on mipmapped linear surface samplers while leaving lookup, pixel-art, shadow-comparison, reduction and single-LOD samplers unchanged. **Game default**, the default, keeps the game's own sampler settings.
@@ -127,6 +138,10 @@ A controller's vibration weaker than this stays off, and the rest is spread over
 ### Press a button to join
 
 Off by default: each controller is a player as soon as it connects, in the order the system lists them. On: a controller becomes a player only when you press one of its buttons, as the lowest player free, so the players choose their order and how many play. That press also reaches the game. When a game asks for more players than have joined, a prompt over the game waits for the others to press a button; B closes it.
+
+### Switch 2 controllers
+
+**Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it. On the Mac it pairs with this Mac, and after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)); macOS asks for Bluetooth access the first time, and again after the app is packed again. On iPhone and iPad it is used without pairing, so hold Sync again after each start of the game ([on iPhone and iPad](playing.md#switch-2-controllers-iphone-and-ipad)); iOS asks for Bluetooth access the first time. In an `env.txt`: `DM_SW2=1`.
 
 ## Performance
 
@@ -244,10 +259,6 @@ Turn off **Show this window at launch** to start the game at once with your choi
 
 **Window** or **Fullscreen**: how the game's window opens. ⌃⌘F or the green button changes it while you play. In an `env.txt`: `DM_FULLSCREEN=1` or `0`.
 
-### Switch 2 controllers
-
-**Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it with this Mac; after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)). macOS asks for Bluetooth access the first time, and again after the app is packed again. In an `env.txt`: `DM_SW2=1`.
-
 ### Cloud saves folder
 
 **Choose a folder…** picks the iCloud Drive folder the game's save is synced through, the one the iPhone app chose in its launcher's **Cloud saves**, or the game's own folder inside it, named after its title ID ([Cloud saves](#cloud-saves)); **Turn off** stops it. Off by default. macOS may ask once whether the app may open iCloud Drive; if the game log says `this app may not open iCloud Drive`, allow it in System Settings › Privacy & Security › Files and Folders. In an `env.txt`: `DM_SAVE_SYNC=<folder>`, or `DM_SAVE_SYNC=icloud` for iCloud Drive › nxnative Saves; the window then shows it fixed.
@@ -258,15 +269,23 @@ The Mac app and the iPhone app of one game can share a save through iCloud Drive
 
 When the game starts, it brings the save from iCloud Drive in if only that one changed since the last sync; a few seconds after the game saves, it sends its save if only this one changed. The iPhone app also sends when it goes to the background, and the Mac app once the game has quit. If you played on both without the save getting across in between, **Play** asks which save to keep: each with its date and size, since the newer one is not always the one with more progress (a new game saved a minute later is newer). The one you don't pick is kept, as below. Without the settings screen (the Mac's `DM_LAUNCHER=0`), the newer save wins.
 
-A save that is replaced, on the device or in iCloud Drive, is kept first, beside the save in a folder named after it with `-backups` (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`): `<date> local` holds this device's save, `<date> cloud` the one that was in iCloud Drive. The newest 10 of each kind stay, and older ones are removed; other folders you put there are left alone.
+A save that is replaced, on the device or in iCloud Drive, is kept first, beside the save in a folder named after it with `-backups` (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`): `<date> local` holds this device's save, `<date> cloud` the one that was in iCloud Drive. The newest 10 of each kind stay, and older ones are removed; other folders you put there are left alone. The same folder also holds the copies taken at each start ([Save backups](#save-backups)).
 
 iCloud Drive takes a moment to carry a file from one device to the other. Quit the game on one device and give it a few seconds before you start it on the other. **Play** waits for the save in iCloud Drive to download, with **Play Without It** to go on at once; without a connection, or when it has not come in a minute, it says so and offers this device's save or another try. The game then plays on with the save it has and sends it later. If the save in iCloud Drive changed meanwhile, the game sends nothing that session, and the next start decides between the two as above. The game log says what came in and what went out (lines starting with `save sync:`).
+
+## Save backups
+
+Each time the game starts, with or without cloud saves, the save it starts from is cloned to `<date> start` in the same `-backups` folder as above (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`), before the game can write to it. A save the game breaks or a mod then costs at most the session since that start: quit the game and copy the `save` folder (and `save_device`, when there is one) from the backup over the save. A copy is made only when the save changed since the newest one, so starting again without playing adds none, and a first start with no save makes none. Up to 10 start copies stay within a 256 MB total size budget (always keeping at least the newest 1), apart from the 10 `local` and 10 `cloud` backups cloud saves keep, so start copies never push those out. On the iPhone and iPad, `save-backups` is excluded from iCloud and Finder device backups so older copies do not use iCloud backup space (the live `save` folder stays backed up). Set `DM_SAVE_BACKUPS=0` in `env.txt` or the environment to turn start copies off. If a copy cannot be made, the log says so (a line starting with `[RED] save backup:`) and the game starts as usual.
 
 ## In-game menu
 
 On the iPhone and iPad the gear at the top centre of the touch controls opens a menu while the game runs; it stays when a controller hides the other controls. It holds **Console mode**, **Picture**, **Rotation** and the **Frame-rate counter**, then **Controller layout** (**2D**, **3D**, and **Tap**, no controls and every touch to the game, in handheld mode), **Touch feedback** and **Game rumble**: the settings that take effect at once. A choice opens to show its options, the current one ticked. The menu's text keeps one size whatever the system text size, so it stays short over the game. A change is remembered as on the settings screen, which shows it at the next start; a setting `Documents/env.txt` fixes is shown, not changed. The other settings need the game to start again, so they are only on the settings screen: close the app fully and open it again.
 
 Console mode changes as on a Switch put in or taken out of its dock. While a TV shows the game it stays **Docked**, and the mode you pick applies when the TV is disconnected. **Docked** removes the Tap layout, as a docked Switch reads no touch screen.
+
+## Prewarm contributions
+
+Apps packed with a contribution inbox show **Contribute prewarm lists automatically** in settings. It is on by default. Turn it off there or in the iPhone and iPad's in-game gear menu. When the game starts, and when the iPhone or iPad app becomes active again, the app checks the game's `pso_user.tsv` and sends a changed list with the game title ID and version to the nxnative inbox. The upload runs in the background, and maintainers review the lists before using them. [Prewarm lists](development.md#prewarm-lists)
 
 ## TV
 
@@ -284,6 +303,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
 | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
+| Start save backups | `DM_SAVE_BACKUPS` | `0`: off (on by default: keeps up to 10 / 256 MB in `<save>-backups/<date> start`) |
 | Picture | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen (or Mac window), cropped |
 | Picture shape | `DM_SCREEN_ASPECT` | On builds with screen-shape stubs, `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.6` MacBook (16:10, Mac only); `1.43` the iPhone Duo's shape, `0` 16:9 |
 | Rotation (iPhone and iPad) | `DM_ROTATION` | `auto` as the device turns, `landscape`, `portrait` |
@@ -295,6 +315,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Press a button to join | `DM_PAD_PRESS_TO_JOIN` | `1`, `0` |
 | Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
 | Game's upscaler | `DM_UPSCALER` | `game`, `metalfx` |
+| HDR | `DM_HDR` | `0` Off, `1` BT.2446, `2` Game's HDR |
 | Texture filtering (Mac, NVN) | `DM_NVN_ANISO` | `0` game default, or `2` to `16` |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |

@@ -127,13 +127,16 @@ int main(void) { @autoreleasepool {
     mtl_tex_init(&col3); mtl_tex_init(&dep3); mtl_tex_init(&mot3); mtl_tex_init(&out3);
     fill(tex_mtl(&col3), MTLClearColorMake(b[0], b[1], b[2], b[3]), 0); fill(tex_mtl(&dep3), MTLClearColorMake(0, 0, 0, 0), 1); fill(tex_mtl(&mot3), MTLClearColorMake(0, 0, 0, 0), 0);
     p_dlss c3 = c; c3.net = c.net = 2; c.reset = 1; c3.tex[DLSS_COLOR] = &col3; c3.tex[DLSS_DEPTH] = &dep3; c3.tex[DLSS_MOTION] = &mot3; c3.tex[DLSS_OUTPUT] = &out3; c3.iw = 960; c3.ih = 486; c3.ow = 1920; c3.oh = 972;
-    // A new network evaluated at 1920x1080, then at 1920x972 (Fast Fusion's second size) in the same submission: its first scaler is replaced before its first commit. The
-    // encoding thread has made the first evaluation's calls by then (rec_drain, as a game's frame of records hands them over in pieces), so the recording holds the scaler no longer
+    // A new network evaluated at 1920x1080, then at 1920x972 (Fast Fusion's second size) in the same submission: the first scaler is kept beside the second, then finalizing the
+    // network drops both from the cache before commit. The encoding thread has made the evaluations' calls by then (rec_drain, as a game's frame of records hands them over in pieces),
+    // so only deferred release keeps the dropped scalers alive until the submission completes (NSZombieEnabled turns an early release into a crash every time)
     mtl_sub_begin(); dlss_eval(&c);
     const void *first = (__bridge void *)g_dlss[1].sc;   // its address only: a reference here would keep it alive
     rec_drain(); dlss_eval(&c3);
-    CHECK(first && g_dlss[1].sc && (__bridge void *)g_dlss[1].sc != first, "new sizes replace the network's scaler");
-    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission that encoded the replaced scaler completes");
+    CHECK(first && g_dlss[1].sc && (__bridge void *)g_dlss[1].sc == first && g_dlss[2].sc && (__bridge void *)g_dlss[2].sc != first, "new sizes keep the network's earlier scaler beside the new one");
+    rec_drain(); mtl_dlss_forget(2); dlss_retire_drain();
+    CHECK(!g_dlss[1].sc && !g_dlss[2].sc, "finalizing the network drops its scalers from the cache before commit");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission that encoded the dropped scalers completes");
     CHECK(flat(tex_mtl(&out), a), "the first evaluation's output holds its own colour");
     CHECK(flat(tex_mtl(&out2), b), "the second evaluation through the same scaler holds its own");
     tex_t col4 = texture(100, 1024, 576, NVN_FORMAT_RGBA16F), dep4 = texture(101, 1024, 576, NVN_FORMAT_DEPTH32F), mot4 = texture(102, 1024, 576, NVN_FORMAT_RG16F), out4 = texture(103, 1536, 864, NVN_FORMAT_RGBA16F);
@@ -145,7 +148,7 @@ int main(void) { @autoreleasepool {
         CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the 1.5x submission completes");
         c4.reset = 0;
     }
-    dlss_scaler *s4 = NULL; for (int i = 0; i < 4; i++) if (g_dlss[i].net == 3) s4 = &g_dlss[i];
+    dlss_scaler *s4 = NULL; for (int i = 0; i < DLSS_KEEP; i++) if (g_dlss[i].net == 3) s4 = &g_dlss[i];
     CHECK(s4 && s4->sc != nil, "MetalFX made a temporal scaler for 1024x576 into 1536x864");
     CHECK(flat(tex_mtl(&out4), a), "the 1.5x evaluation fills its output");
     // The same network at 768x432 in the same textures, as a dynamic resolution renders: no new scaler, and the output is whole (MetalFX scales the content, not the textures)
@@ -172,6 +175,49 @@ int main(void) { @autoreleasepool {
     mtl_sub_begin(); dlss_eval(&c4);
     CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission with the original builder size completes");
     CHECK(alpha_flat(tex_mtl(&out4), b[3]), "alpha follows the scaler's output extent rather than the original builder size");
+    tex_t col5 = texture(105, 640, 360, NVN_FORMAT_RGBA16F), dep5 = texture(106, 640, 360, NVN_FORMAT_DEPTH32F),
+          mot5 = texture(107, 640, 360, NVN_FORMAT_RG16F);
+    mtl_tex_init(&col5); mtl_tex_init(&dep5); mtl_tex_init(&mot5);
+    fill_alpha_rect(tex_mtl(&col5), a, 11, 7, 512, 288);
+    fill(tex_mtl(&dep5), MTLClearColorMake(0, 0, 0, 0), 1);
+    fill(tex_mtl(&mot5), MTLClearColorMake(0, 0, 0, 0), 0);
+    p_dlss c5 = c4;
+    c5.tex[DLSS_COLOR] = &col5; c5.tex[DLSS_DEPTH] = &dep5; c5.tex[DLSS_MOTION] = &mot5;
+    c5.iw = 512; c5.ih = 288; c5.base[DLSS_COLOR][0] = 11; c5.base[DLSS_COLOR][1] = 7;
+    mtl_sub_begin(); dlss_eval(&c5);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the smaller backing textures scale after their content is copied");
+    dlss_scaler *staged_entry = NULL;
+    for (int i = 0; i < DLSS_KEEP; i++) if (g_dlss[i].net == c5.net && g_dlss[i].cur) staged_entry = &g_dlss[i];
+    id<MTL4FXTemporalScaler> staged = staged_entry ? staged_entry->sc : nil;
+    CHECK(staged && staged_entry->staged && staged.inputWidth == 1536 && staged.inputHeight == 864, "changing backing sizes gives the scaler fixed-size inputs");
+    CHECK(flat(tex_mtl(&out4), a) && alpha_flat(tex_mtl(&out4), a[3]), "the copy preserves the offset content, including alpha at its edges");
+    mtl_sub_begin(); dlss_eval(&c4);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the larger backing textures scale again");
+    CHECK(staged && staged_entry->cur && staged_entry->sc == staged, "a second backing size change keeps the same temporal scaler");
+    CHECK(flat(tex_mtl(&out4), b) && alpha_flat(tex_mtl(&out4), b[3]), "the larger input covers the output after switching back");
+    // The Nomad loading screen uses full-size textures. When the scene uses smaller ones,
+    // staging still presents exactly the same texture descriptors to MetalFX.
+    tex_t full_col = texture(108, 1536, 864, NVN_FORMAT_RGBA16F), full_dep = texture(109, 1536, 864, NVN_FORMAT_DEPTH32F),
+          full_mot = texture(110, 1536, 864, NVN_FORMAT_RG16F);
+    mtl_tex_init(&full_col); mtl_tex_init(&full_dep); mtl_tex_init(&full_mot);
+    fill(tex_mtl(&full_col), MTLClearColorMake(b[0], b[1], b[2], b[3]), 0);
+    fill(tex_mtl(&full_dep), MTLClearColorMake(0, 0, 0, 0), 1);
+    fill(tex_mtl(&full_mot), MTLClearColorMake(0, 0, 0, 0), 0);
+    p_dlss full = {.tex = {&full_col, &full_dep, &full_mot, &out4}, .net = 4, .iw = 1536, .ih = 864,
+                   .ow = 1536, .oh = 864, .mv = {1, 1}, .pre_exposure = 1, .flags = c5.flags, .reset = 1};
+    mtl_sub_begin(); dlss_eval(&full);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the full-size loading screen scales");
+    dlss_scaler *s_full = NULL;
+    for (int i = 0; i < DLSS_KEEP; i++) if (g_dlss[i].net == full.net && g_dlss[i].cur) s_full = &g_dlss[i];
+    id<MTL4FXTemporalScaler> full_scaler = s_full ? s_full->sc : nil;
+    CHECK(full_scaler && !s_full->staged, "full-size inputs initially bind directly");
+    full.tex[DLSS_COLOR] = &col5; full.tex[DLSS_DEPTH] = &dep5; full.tex[DLSS_MOTION] = &mot5;
+    full.iw = c5.iw; full.ih = c5.ih;
+    memcpy(full.base[DLSS_COLOR], c5.base[DLSS_COLOR], sizeof full.base[DLSS_COLOR]);
+    mtl_sub_begin(); dlss_eval(&full);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the smaller inputs scale after the loading screen");
+    CHECK(full_scaler && s_full->sc == full_scaler && s_full->staged, "staging reuses the scaler when its descriptor stays the same");
+    CHECK(flat(tex_mtl(&out4), a) && alpha_flat(tex_mtl(&out4), a[3]), "the smaller input preserves color and cropped alpha with the same scaler");
     // The scaler after the work before it, and the next pass after the scaler (mfx_order). Before: a slow pass writes the colour just before each evaluation and ends with no
     // barrier, as a scaler's own encoders end (the passes the host ends carry barriers of their own); behind an encoder of barriers alone the scaler read the colour before it in
     // most rounds. After: a draw pass copies the output right after the evaluation; with DM_NVN_BARRIER=game (a run of the Makefile's) it skipped its consumer barrier and read the

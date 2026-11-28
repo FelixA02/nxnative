@@ -773,6 +773,68 @@ static void t_motion_live(void) {
     CHECK(st[0].acc[2] == -1 && h_hid_SixRest(&h), "co-op: player 2's motion stays on its own sensor");
     dm_motion_clear(1); dm_pad_players(1); g_phone_mode = -1;
 }
+static void t_stick_motion(void) {
+    g_mode = 1; dm_pad_players(3); ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3);
+    hwm_clear(); guest_now = motion_now = 10000000000ull;
+    uint32_t h = 3; SixAxisState sensor; NpadState pad;
+    dm_pad_set(DM_BTN_A, 4000, 5000, DM_STICK_MAX, 0);
+    fill(&pad, NPAD_NO1, STYLE_FULLKEY);
+    CHECK(!dm_stick_motion_enabled() && pad.rx == DM_STICK_MAX, "stick motion: off by default");
+    dm_stick_motion_set(1);
+    fill(&pad, NPAD_NO1, STYLE_FULLKEY);
+    CHECK(pad.rx == 0 && pad.ry == 0 && !(pad.buttons & (1u << 22)), "stick motion: right stick and its direction bits are consumed");
+    CHECK(pad.lx == 4000 && pad.ly == 5000 && (pad.buttons & DM_BTN_A), "stick motion: other inputs still reach the game");
+    h_hid_SixStates(&sensor, 1, &h);
+    for (int i = 0; i < 40; i++) {
+        guest_now = motion_now += 25000000ull;
+        h_hid_SixStates(&sensor, 1, &h);
+    }
+    CHECK(sensor.acc[2] > .99f && sensor.dir[8] < -.99f && fabsf(sensor.gyro[1] - .5f) < .01f && !h_hid_SixRest(&h), "stick motion: full right can flip the sensor through 180 degrees");
+    dm_pad_set(0, 0, 0, DM_STICK_MAX / 10, 0);
+    guest_now = motion_now += 25000000ull;
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] > .99f && sensor.gyro[1] == 0 && h_hid_SixRest(&h), "stick motion: the dead zone holds the pose without turning");
+    // Focus loss releases the physical controller to zero; the pose holds without drifting.
+    dm_pad_set(0, 0, 0, 0, 0);
+    guest_now = motion_now += 25000000ull;
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] > .99f && sensor.gyro[1] == 0 && h_hid_SixRest(&h), "stick motion: focus release holds the pose at rest");
+    // Applet hold freezes turning even with a deflected stick; resuming after a long pause clamps dt to 50 ms.
+    dm_pad_set(0, 0, 0, DM_STICK_MAX, 0);
+    dm_input_hold(1);
+    guest_now = motion_now += 25000000ull;
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] > .99f && sensor.gyro[1] == 0 && h_hid_SixRest(&h), "stick motion: applet hold freezes turning");
+    dm_input_hold(0);
+    guest_now = motion_now += 1000000000ull;
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] > .95f && sensor.acc[0] < -.1f && sensor.acc[0] > -.25f && !h_hid_SixRest(&h), "stick motion: resuming after a pause clamps dt");
+    // Single-Joy-Con fallback folds the left stick into the right slot after right-stick motion consumes the physical right stick.
+    h_hid_SetStyles(STYLE_JOYRIGHT);
+    dm_pad_set(0, 12000, -8000, DM_STICK_MAX, 0);
+    fill(&pad, NPAD_NO1, STYLE_JOYRIGHT);
+    CHECK(pad.lx == 0 && pad.ly == 0 && pad.rx == 12000 && pad.ry == -8000, "stick motion: single Joy-Con keeps the folded left stick");
+    h_hid_SetStyles(0xffffffffu);
+    dm_pad_set_player(1, 0, 0, 0, 0, DM_STICK_MAX);
+    fill(&pad, 1, STYLE_FULLKEY);
+    CHECK(pad.ry == DM_STICK_MAX, "stick motion: a separate player keeps their right stick");
+    // Disabling while actively deflected restores the right stick and hands six-axis back to a live gyro or flat rest.
+    dm_motion_set(0, (float[]){0.5f, 0, -0.8660254f}, (float[]){0, 0, 0});
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] > .95f, "stick motion: stays ahead of hardware gyro while enabled");
+    dm_stick_motion_set(0);
+    fill(&pad, NPAD_NO1, STYLE_FULLKEY);
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(pad.rx == DM_STICK_MAX && (pad.buttons & (1u << 22)), "stick motion: disabling while deflected restores the right stick and direction bits");
+    CHECK(fabsf(sensor.acc[0] - 0.5f) < 1e-4f, "stick motion: disabling hands six-axis back to a live controller gyro");
+    dm_motion_clear(0);
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] == -1 && h_hid_SixRest(&h), "stick motion: without a hardware gyro, disabling returns to flat rest");
+    dm_stick_motion_set(1);
+    h_hid_SixStates(&sensor, 1, &h);
+    CHECK(sensor.acc[2] == -1, "stick motion: starts level when re-enabled");
+    dm_stick_motion_set(0); dm_pad_set(0, 0, 0, 0, 0); dm_pad_set_player(1, 0, 0, 0, 0, 0); dm_pad_players(1); hwm_clear();
+}
 static void t_motion_hid(void) {
     g_mode = 1; dm_pad_players(3); ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); g_phone_mode = 0;
     uint32_t h = 3; SixAxisState st;   // full key on No1: style index 3, as the SDK numbers six-axis and vibration handles
@@ -1696,6 +1758,18 @@ static void t_six_ic_info(void) {
     uint32_t bad = 9u << 8, dev3 = 3u << 16;   // as the SDK's VerifyValidSixAxisSensorHandle (sdk+0x6d8440)
     CHECK(h_hid_SixCalStore(&bad, cal) == 0x58aca && h_hid_SixCalLoad(back, &bad) == 0x58aca, "calibration: an id that is no npad is refused");
     CHECK(h_hid_SixCalStore(&dev3, cal) == 0xd6ca && back[0] == 0xAB, "calibration: a device index past 2 is refused");
+    // Unaltered passthrough (Nintendo Switch Sports 1.5.0 turns it on at boot, #3378): off until set, then as set, per sensor, device 2 the same sensor as device 0
+    CHECK(!h_hid_SixPassQ(&h), "passthrough: off before the game sets it");
+    CHECK(h_hid_SixPassOn(&h, 1) == 0 && h_hid_SixPassQ(&h), "passthrough: on as set");
+    CHECK(!h_hid_SixPassQ(&other), "passthrough: another device keeps its own");
+    CHECK(h_hid_SixPassOn(&h, 0) == 0 && !h_hid_SixPassQ(&h), "passthrough: off again");
+    {   uint32_t host0 = 0x103, sdk2 = 0x20103;   // No2's sensor, which nothing above set: device 2 is the same sensor as device 0
+        CHECK(h_hid_SixPassOn(&sdk2, 1) == 0 && h_hid_SixPassQ(&host0), "passthrough: on through device 2 reads on through device 0");
+        CHECK(h_hid_SixPassOn(&sdk2, 0) == 0 && !h_hid_SixPassQ(&host0), "passthrough: and off");
+        CHECK(h_hid_SixPassOn(&host0, 1) == 0 && h_hid_SixPassQ(&sdk2), "passthrough: on through device 0 reads on through device 2");
+        CHECK(h_hid_SixPassOn(&host0, 0) == 0 && !h_hid_SixPassQ(&sdk2), "passthrough: and off the other way"); }
+    CHECK(h_hid_SixPassOn(&bad, 1) == 0x58aca && !h_hid_SixPassQ(&bad), "passthrough: an id that is no npad is refused");
+    CHECK(h_hid_SixPassOn(&dev3, 1) == 0xd6ca && !h_hid_SixPassQ(&dev3), "passthrough: a device index past 2 is refused");
 }
 
 // Joy-Con icon decoration colour (Switch 2): no controller of the host is a decorated Joy-Con, so each npad answers 0x4b6ca, which the SDK's own wrapper returns to the game, and the
@@ -1860,6 +1934,7 @@ int main(void) {
     t_rumble_log();
     t_motion_threads();
     t_motion_live();
+    t_stick_motion();
     t_motion_hid();
     t_npad_imu_samples();
     t_imu_noise();
@@ -1879,6 +1954,13 @@ int main(void) {
     t_six_ic_info();
     t_touch_sampling();
     t_rec();
+    {   // Mouse history by handle, as polled by Cyberpunk 2077.
+        const uint32_t handle = 0;
+        uint64_t state[5] = {1, 2, 3, 4, 5};
+        h_hid_InitMouseHandle(&handle);
+        CHECK(h_hid_MouseStatesHandle(state, 1, &handle) == 0, "a disconnected mouse has no history by handle");
+        CHECK(!memcmp(state, (uint64_t[]){1, 2, 3, 4, 5}, sizeof state), "zero mouse samples leave the caller's history untouched");
+    }
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
         int w = 0, h = 0; uint64_t std = 7; uint32_t npad = 9;
         h_hid_NmouseInitT(NULL, 0, 1920, 1080, 1); h_hid_NmouseGetRange(&w, &h);

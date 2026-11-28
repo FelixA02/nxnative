@@ -17,6 +17,7 @@
 #import "CloudSaves.h"
 
 void dm_gamepad_active(void);
+void dm_gamepad_inactive(void);
 #import "DmLayout.h"
 #import "DmGameMenu.h"
 #import "DmRotation.h"
@@ -27,6 +28,7 @@ const char *front_ios_boot_message(void);   // main.m: why a build that keeps th
 const char *front_ios_device_check(void);   // main.m: why this device cannot run the games (its GPU has no BC textures; NULL = supported)
 bool front_ios_hud_enabled_from_saved_choice(void);   // main.m: the saved choice enabled Metal's HUD at launch
 bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
+void dm_prewarm_upload_schedule(void);
 
 static CAMetalLayer *g_layer;
 static void front_ios_notify_setup(void);
@@ -172,6 +174,7 @@ static void launcher_done(void) { [g_root startGame]; }
     self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
     self.view.window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategorySmall;   // UIKit draws the in-game menu (GameMenu.swift) in this window: it keeps one compact text size over the game, whatever the system's text size
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
+    dm_prewarm_upload_schedule();
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
@@ -424,15 +427,53 @@ int front_display_pixels(int *w, int *h) {   // the screen in pixels, landscape 
 // maximumFramesPerSecond says. Before the game view has a window: the app's own scene (UIScreen.mainScreen is deprecated in iOS 26). 0 until read
 static _Atomic int g_screen_hz;
 int front_screen_max_fps(void) { return atomic_load_explicit(&g_screen_hz, memory_order_relaxed); }
+static void hdr_screen_for(UIScreen *s);
 static void screen_refresh(void) {
     UIWindowScene *ws = (g_root.game ?: g_root.view).window.windowScene;
     if (!ws) for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
         if ([s isKindOfClass:UIWindowScene.class] && [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) { ws = (UIWindowScene *)s; break; }
+    if (ws) hdr_screen_for(ws.screen);
     int hz = ws ? (int)ws.screen.maximumFramesPerSecond : 0, lpm = dm_low_power_now();
     if (hz <= 0) return;   // no screen yet: keep what was read
     if (lpm && hz > 60) hz = 60;
     int was = atomic_exchange_explicit(&g_screen_hz, hz, memory_order_relaxed);
     if (was && was != hz) LOG("front end: screen %d Hz → %d Hz%s", was, hz, lpm ? " (Low Power Mode)" : "");
+}
+// HDR output (front.h front_layer_hdr, front_edr_poll; nvn_mtl.m, HDR output). The layer the present asks for, applied on the main thread: SDR is the layer as DmGameView makes it
+// (BGRA8Unorm, no colour space); HDR is RGBA16Float with extended range content and no EDR metadata, extended linear in the screen's gamut, for both HDR routes (the present
+// writes BT.709 values for a PQ window too). The headroom of the screen the game view is on (the phone's, or a TV's) goes to the present on screen refresh (including before boot,
+// so a game querying HDR once at startup sees EDR) and every 32 presents while HDR is on: UIScreen's potentialEDRHeadroom and currentEDRHeadroom (iOS 16), which UIKit reads on the main thread and posts no notification for
+void mtl_present_edr(float potential, float live);   // nvn_mtl.h
+static _Atomic int g_hdr_want;   // the mode the present asked for (front.h): 0 SDR, 1 HDR
+static int g_hdr_mode;   // main thread: the mode the layer has
+// The HDR layer's colour space: the gamut the SDR layer's bytes show in, so both HDR modes keep its look. sRGB for a game view on an sRGB screen (a TV), Display P3 otherwise
+static int hdr_srgb(void) { return (g_root.game ?: g_root.view).traitCollection.displayGamut == UIDisplayGamutSRGB; }
+static CGColorSpaceRef hdr_space(void) { return CGColorSpaceCreateWithName(hdr_srgb() ? kCGColorSpaceExtendedLinearSRGB : kCGColorSpaceExtendedLinearDisplayP3); }
+static void hdr_screen_for(UIScreen *s) {   // main thread: the screen's headroom to the present, and the HDR layer's colour space for that screen
+    if (s) mtl_present_edr((float)s.potentialEDRHeadroom, (float)s.currentEDRHeadroom);
+    if (!g_hdr_mode || !g_layer) return;
+    CGColorSpaceRef cs = hdr_space();
+    if (!g_layer.colorspace || !CFEqual(g_layer.colorspace, cs)) { g_layer.colorspace = cs; LOG("front end: HDR layer in %s extended linear", hdr_srgb() ? "sRGB" : "Display P3"); }
+    CGColorSpaceRelease(cs);
+}
+static void hdr_screen(void) { hdr_screen_for((g_root.game ?: g_root.view).window.windowScene.screen); }
+void front_layer_hdr(int mode) {
+    if (atomic_exchange(&g_hdr_want, mode) == mode) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        int m = g_hdr_want;
+        if (m == g_hdr_mode || !g_layer) return;
+        g_hdr_mode = m;
+        g_layer.wantsExtendedDynamicRangeContent = m != 0;
+        g_layer.pixelFormat = m ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+        CGColorSpaceRef cs = m ? hdr_space() : NULL;
+        g_layer.colorspace = cs; CGColorSpaceRelease(cs);   // SDR: none
+        LOG("front end: %s", m ? "HDR layer (RGBA16Float, extended linear)" : "SDR layer (BGRA8Unorm)");
+        hdr_screen();
+    });
+}
+void front_edr_poll(void) {
+    static _Atomic int pending; if (atomic_exchange(&pending, 1)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ atomic_store(&pending, 0); hdr_screen(); });
 }
 // Offline HTML pages (web_apple.m): the page's view goes over the game view and under the gamepad, which lets touches on no control through to it while the page is
 // shown (DmGamepad.m hitTest); the page takes them as a click on what they land on, and the gamepad and controllers drive it as on the Switch
@@ -675,7 +716,7 @@ static void save_sync_background(void) {
 void front_ios_focus_event(int ev) {
     if (!g_layer) return;
     switch (ev) {
-        case 0: dm_movie_active(0); dm_gamepad_reset(); dm_focus_set(2); break;
+        case 0: dm_movie_active(0); dm_gamepad_inactive(); dm_focus_set(2); break;
         case 1:
             UIApplication.sharedApplication.idleTimerDisabled = NO;
             dm_focus_set(3);
@@ -690,6 +731,8 @@ void front_ios_focus_event(int ev) {
             UIApplication.sharedApplication.idleTimerDisabled = YES;
             if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
             if (g_session_off) front_ios_audio_session();
-            front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(1); dm_movie_active(1); break;
+            front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(1); dm_movie_active(1);
+            dm_prewarm_upload_schedule();
+            break;
     }
 }

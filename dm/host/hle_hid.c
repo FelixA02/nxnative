@@ -40,6 +40,7 @@ _Static_assert(sizeof(NpadState) == 0x28, "NpadState");
 static _Atomic uint64_t g_btn, g_axes, g_latch, g_sc_btn, g_sc_axes, g_sc_latch, g_pad_btn[DM_PLAYERS], g_pad_axes[DM_PLAYERS], g_pad_latch[DM_PLAYERS];
 static _Atomic uint64_t g_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
 static _Atomic int g_hold;              // an applet holds the input (dm_input_hold)
+static _Atomic int g_stick_motion_on;
 static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     return (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48;
@@ -207,6 +208,8 @@ static char *keys_file(const char *path) {
 static void ctl_start(void);
 static void rec_start(void);
 void hid_keys_init(void) {
+    const char *stick_motion = getenv("DM_STICK_MOTION");
+    if (stick_motion && !strcmp(stick_motion, "1")) dm_stick_motion_set(1);
     ctl_start();
     rec_start();
     const char *e = getenv("DM_KEYS"); if (!e || !*e) return;
@@ -230,6 +233,7 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+__attribute__((weak)) void mtl_hdr_set_requested(int mode) { (void)mode; }   // nvn_mtl.m; host tests without graphics stay no-ops
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
     if (getenv("DM_PREV_PROGRAM") || getenv("DM_RELAUNCH")) {   // oe::ExecuteProgram or oe::RequestToRelaunchApplication started this program in the last one's place: that program acted on what the file holds
@@ -261,7 +265,9 @@ static void *ctl_main(void *arg) {
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
-                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
+                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0;
+                                                     if (!strcmp(line + 4, "DM_HDR")) { int m = !strcmp(eq + 1, "1") ? 1 : !strcmp(eq + 1, "2") ? 2 : 0; mtl_hdr_set_requested(m); LOG("DM_CTL: env DM_HDR=%d", m); continue; }
+                                                     setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
                                                      if (!strncmp(line + 4, "DM_IMU_", 7) || !strcmp(line + 4, "DM_SIX_DELAY")) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
@@ -660,6 +666,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
     }
     if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
+    if (!pl && dm_stick_motion_enabled()) a[2] = a[3] = 0;
     b &= 0xffffull;
     uint32_t halves = ATTR_LEFT_CONN | ATTR_RIGHT_CONN;
     if (single_joy_style(shown)) {
@@ -857,6 +864,59 @@ static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHRE
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_joy_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 ... 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}}};   // each Joy-Con's own sensor (dm_motion_set_joy)
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
+static live_motion g_stick_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
+int dm_stick_motion_enabled(void) { return atomic_load(&g_stick_motion_on); }
+void dm_stick_motion_set(int enabled) {
+    live_motion *m = &g_stick_motion;
+    pthread_mutex_lock(&m->mu);
+    motion_reset(&m->st);
+    m->last_ns = 0;
+    m->count = 0;
+    motion_lag_reset(&m->lag);
+    atomic_store(&g_stick_motion_on, !!enabled);
+    pthread_mutex_unlock(&m->mu);
+}
+// Called with the stream locked. Store the sample on the host clock; guest clock lag is applied when read.
+static void motion_store(live_motion *m, uint64_t t, uint64_t now) {
+    if (m->last_ns) motion_lag_add(&m->lag, now - m->last_ns);
+    m->last_ns = t; m->received_ns = now;
+    if (!m->count) m->head = 0;
+    motion_sample *r = &m->ring[(m->head + m->count) % LIVE_RING];
+    r->t = t; motion_fill(&m->st, r->acc, r->gyro, r->angle, r->dir);
+    if (m->count < LIVE_RING) m->count++; else m->head = (m->head + 1) % LIVE_RING;
+}
+static float stick_motion_rate(int32_t axis) {
+    const float deadzone = 0.15f;
+    float travel = fminf(1.f, fabsf((float)axis / DM_STICK_MAX));
+    float speed = fmaxf(0.f, (travel - deadzone) / (1.f - deadzone));
+    return copysignf((float)M_PI * speed * speed, (float)axis);
+}
+// A deflected stick turns the virtual controller; neutral stops it at its current pose. This lets a motion puzzle hold a tilt or turn all the way over.
+static live_motion *stick_motion_sample(motion_state *out) {
+    live_motion *m = &g_stick_motion;
+    pthread_mutex_lock(&m->mu);
+    if (!dm_stick_motion_enabled()) { pthread_mutex_unlock(&m->mu); return NULL; }
+    uint64_t now = now_ns();
+    if (!m->last_ns || now > m->last_ns) {
+        uint64_t keys = atomic_load(&g_axes), script = atomic_load(&g_sc_axes);
+        int32_t x = pick(ax(keys, 2), ax(script, 2)), y = pick(ax(keys, 3), ax(script, 3));
+        uint32_t players = pad_sources(0);
+        for (int p = 0; p < DM_PLAYERS; p++) if (players >> p & 1) {
+            uint64_t pad = atomic_load(&g_pad_axes[p]);
+            x = pick(x, ax(pad, 2)); y = pick(y, ax(pad, 3));
+        }
+        if (atomic_load(&g_hold)) x = y = 0;
+        const float rate[3] = {-stick_motion_rate(y), stick_motion_rate(x), 0};
+        const motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
+        float dt = m->last_ns ? fminf((float)(now - m->last_ns) / 1e9f, 0.05f) : 0;
+        motion_update(&m->st, &identity, m->st.acc, rate, dt, 0);
+        for (int i = 0; i < 3; i++) m->st.acc[i] = -m->st.R[2][i];
+        motion_store(m, now, now);
+    }
+    if (out) *out = m->st;
+    pthread_mutex_unlock(&m->mu);
+    return m;
+}
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
 static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
 static void motion_env(void) {
@@ -913,12 +973,7 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
         LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
-    if (m->last_ns) motion_lag_add(&m->lag, now - m->last_ns);   // how long after the last sample's time this one arrived: the delay the stream needs (six_source)
-    m->last_ns = t; m->received_ns = now;
-    if (!m->count) m->head = 0;   // a new stream (reset above) starts its history again
-    motion_sample *r = &m->ring[(m->head + m->count) % LIVE_RING];
-    r->t = t; motion_fill(&m->st, r->acc, r->gyro, r->angle, r->dir);   // host time: the guest clock's lag (a freeze, DM_DETCLOCK) is applied when read
-    if (m->count < LIVE_RING) m->count++; else m->head = (m->head + 1) % LIVE_RING;
+    motion_store(m, t, now);
     pthread_mutex_unlock(&m->mu);
 }
 void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
@@ -951,6 +1006,10 @@ static uint64_t motion_copy(live_motion *m, motion_state *out) {   // a source's
 // DM_PHONE_MOTION says), with a copy of its state when out is given; NULL while none is fresh
 static live_motion *motion_pick(int p, motion_state *out) {
     if (p < 0 || p >= DM_PLAYERS) return NULL;
+    if (!p && dm_stick_motion_enabled()) {
+        live_motion *m = stick_motion_sample(out);
+        if (m) return m;
+    }
     pthread_once(&g_motion_once, motion_env);
     if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) ? &g_phone_motion : NULL;
     // Match the button path: in a one-player game, a controller in another slot also drives player 1.
@@ -1682,6 +1741,13 @@ HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleE
 // Mouse / keyboard: not connected
 HLE_FORCE("_ZN2nn3hid15InitializeMouseEv", "mouse; not provided by the host", void, h_hid_InitMouse, void) {}
 HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", "mouse states: 0 entries", int, h_hid_MouseStates, void *out, int n) { (void)out; (void)n; return 0; }
+// SDK 20.5.3's MouseHandle overloads dispatch the ordinary mouse (GetMouseHandle returns 0) to the same operations.
+// The debug mouse has no samples on the host either. GetMouseHandle itself makes a value without HID IPC and runs in the SDK.
+HLE_FORCE("_ZN2nn3hid15InitializeMouseERKNS0_11MouseHandleE", "mouse initialization by handle", void, h_hid_InitMouseHandle, const uint32_t *handle) {
+    (void)handle; h_hid_InitMouse();
+}
+HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEiRKNS0_11MouseHandleE", "mouse states by handle", int, h_hid_MouseStatesHandle,
+          void *out, int n, const uint32_t *handle) { (void)handle; return h_hid_MouseStates(out, n); }
 // Single state (13 Sentinels calls it every frame; without the hook the sdk aborts on its uninitialized mouse resource): MouseState is 0x28 bytes {sampling number i64, x, y, dx, dy, wheel dx, dy, buttons, attributes}; attributes 0 = not connected
 HLE_FORCE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE", "mouse state: not connected (MouseState 0x28 bytes zeroed)", void, h_hid_MouseState, void *s) {
     memset(s, 0, 0x28); ((int64_t *)s)[0] = atomic_fetch_add(&g_sampling, 1) + 1;
@@ -1834,6 +1900,23 @@ HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad sta
 HLE_FORCE("_ZN2nn3hid20FinalizeSensorFusionEv", "end of sensor fusion (SDK 22): the host keeps no IMU state to disable", void, h_hid_FusionFin, void) {}
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
+// Unaltered six-axis passthrough (SDK 13 and later). The SDK asks the hid service (IHidServer EnableSixAxisSensorUnalteredPassthrough /
+// IsSixAxisSensorUnalteredPassthroughEnabled), which the host does not serve, and reads its null service object (Nintendo Switch Sports 1.5.0 at boot, #3378: CRASH sig=11
+// addr=0 in hid::detail::EnableSixAxisSensorPassthrough). By its name it hands the game the sensor's values without the user calibration; the host has no user calibration to
+// leave out (the rest offset it takes off a GameController's gyro stays), so its values do not change: the setting is kept per sensor (device 2's under device 0, one
+// sensor as for its calibration) and answered back
+static _Atomic unsigned char g_six_pass[SIX_NPADS][SIX_DEVICES];
+HLE_FORCE("_ZN2nn3hid30EnableSixAxisSensorPassthroughERKNS0_19SixAxisSensorHandleEb", "six-axis unaltered passthrough: kept; the host has no user calibration to leave out",
+          Result, h_hid_SixPassOn, const uint32_t *h, uint32_t on) {
+    int slot, dev; Result r = six_handle_slot("EnableSixAxisSensorPassthrough", *h, &slot, &dev);
+    if (r == RES_OK) atomic_store_explicit(&g_six_pass[slot][six_cal_dev(dev)], (unsigned char)(on & 1), memory_order_relaxed);
+    return r;
+}
+HLE_FORCE("_ZN2nn3hid33IsSixAxisSensorPassthroughEnabledERKNS0_19SixAxisSensorHandleE", "six-axis unaltered passthrough: as the game last set it",
+          unsigned, h_hid_SixPassQ, const uint32_t *h) {
+    int slot, dev; if (six_handle_slot("IsSixAxisSensorPassthroughEnabled", *h, &slot, &dev) != RES_OK) return 0;
+    return atomic_load_explicit(&g_six_pass[slot][six_cal_dev(dev)], memory_order_relaxed);
+}
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }
 HLE_FORCE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", "gyroscope zero-drift mode; ignored by the host", void, h_hid_GyroSet, const uint32_t *h, const int *m) { (void)h; (void)m; }
 HLE_FORCE("_ZN2nn3hid32GetSixAxisSensorFusionParametersEPfS1_RKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters: 0", void, h_hid_FusionGet, float *a, float *b, const uint32_t *h) { (void)h; *a = 0; *b = 0; }

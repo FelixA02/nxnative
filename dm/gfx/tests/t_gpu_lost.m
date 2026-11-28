@@ -33,7 +33,7 @@ static tex_t picture(void) {
     serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
     // NOLINTEND(clang-analyzer-osx.cocoa.RetainCount)
 }
-static int present_asks(const tex_t *t) { int before = atomic_load(&g_layer_asks); mtl_present_wait(mtl_present(t, 1. / 60, NULL, NULL)); return atomic_load(&g_layer_asks) - before; }
+static int present_asks(const tex_t *t) { int before = atomic_load(&g_layer_asks); mtl_present_wait(mtl_present(t, 1. / 60, NULL, 0, NULL)); return atomic_load(&g_layer_asks) - before; }
 int main(void) { @autoreleasepool {
     alarm(60); setvbuf(stdout, NULL, _IONBF, 0);
     setenv("DM_TEST_GPU_LOST", "4", 1);
@@ -54,6 +54,8 @@ int main(void) { @autoreleasepool {
 
     // Recoverable unsignaled submission: hold the queue behind a gate so feedback cannot run before g_ev is restored, redirect rec_signal to a decoy event, then release.
     id<MTLSharedEvent> gate = [g_dev newSharedEvent], decoy = [g_dev newSharedEvent], real_ev = g_ev;
+    CHECK("test shared events allocated", gate && decoy);
+    if (!gate || !decoy) return 1;
     rec_queue_block(^{ [g_q4 waitForEvent:gate value:1]; });
     mtl_sub_begin();
     g_ev = decoy;

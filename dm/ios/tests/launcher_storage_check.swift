@@ -45,16 +45,29 @@ import Foundation
         expect(!m.rows(in: "Controls").contains { $0.env == "DM_RUMBLE_GAIN" }, "a sub-setting is hidden while its setting is off")
         expect(m.rows(in: "Controls").contains { $0.env == "DM_RUMBLE" }, "the setting it depends on stays drawn")
         m.values["DM_RUMBLE"] = "1"
-        // DM_LAUNCHER=0 skips the screen, not the saved choices; DM_SAVED_CHOICES=0 ignores them and leaves them stored
+        // DM_LAUNCHER=0 skips the screen, applying saved choices and launcher.json defaults without writing UserDefaults; DM_SAVED_CHOICES=0 ignores saved choices and leaves them stored
         let fps = file.settings.first { $0.env == "DM_FPS_TARGET" }!
-        d.set("30", forKey: "launcher.DM_FPS_TARGET"); unsetenv("DM_FPS_TARGET")
-        LauncherModel(file.settings, defaults: d).applySaved()
+        let snap = file.settings.first { $0.env == "DM_PRESENT_SNAP" }!
+        let mtl4 = file.settings.first { $0.env == "DM_PSO_MTL4" }!
+        d.set("30", forKey: "launcher.DM_FPS_TARGET"); d.removeObject(forKey: "launcher.DM_PSO_MTL4")
+        unsetenv("DM_FPS_TARGET"); unsetenv("DM_PRESENT_SNAP"); unsetenv("DM_PSO_MTL4")
+        LauncherModel(file.settings, defaults: d).apply(persist: false)
         expect(String(cString: getenv("DM_FPS_TARGET")) == "30" && d.string(forKey: "launcher.DM_FPS_TARGET") == "30", "without the screen, a saved choice goes into the environment and stays saved")
-        setenv("DM_SAVED_CHOICES", "0", 1); unsetenv("DM_FPS_TARGET")
+        expect(String(cString: getenv("DM_PRESENT_SNAP")) == snap.def && String(cString: getenv("DM_PSO_MTL4")) == mtl4.def && d.string(forKey: "launcher.DM_PSO_MTL4") == nil, "without the screen, launcher.json defaults go into the environment without writing UserDefaults")
+        expect(String(cString: getenv("DM_METAL_HUD")) == "1", "without the screen, fixed env-file values are kept ahead of defaults")
+        let aspect = try! JSONDecoder().decode(Setting.self, from: Data(#"{"env":"DM_SCREEN_ASPECT","kind":"choice","label":"Picture shape","note":"","default":"auto","options":[["auto","Match screen"],["0","16:9"]]}"#.utf8))
+        unsetenv("DM_SCREEN_ASPECT")
+        LauncherModel([aspect], defaults: d).apply(persist: false)
+        expect(String(cString: getenv("DM_SCREEN_ASPECT")) == "auto" && d.string(forKey: "launcher.DM_SCREEN_ASPECT") == nil, "without the screen, an auto default (DM_SCREEN_ASPECT) is exported so front_ios.m resolves it")
+        setenv("DM_ENV_LAUNCH_KEYS", "DM_SCREEN_ASPECT", 1); setenv("DM_SCREEN_ASPECT", "0", 1)
+        LauncherModel([aspect], defaults: d).apply(persist: false)
+        expect(String(cString: getenv("DM_SCREEN_ASPECT")) == "0", "without the screen, a launch override wins over the launcher.json default")
+        unsetenv("DM_SCREEN_ASPECT"); setenv("DM_ENV_LAUNCH_KEYS", "", 1)
+        setenv("DM_SAVED_CHOICES", "0", 1); unsetenv("DM_FPS_TARGET"); unsetenv("DM_PSO_MTL4")
         let plain = LauncherModel(file.settings, defaults: d)
         expect(plain.values["DM_FPS_TARGET"] == fps.def, "DM_SAVED_CHOICES=0 starts from the defaults")
-        plain.applySaved()
-        expect(getenv("DM_FPS_TARGET") == nil, "DM_SAVED_CHOICES=0: nothing saved goes into the environment")
+        plain.apply(persist: false)
+        expect(String(cString: getenv("DM_FPS_TARGET")) == fps.def && String(cString: getenv("DM_PSO_MTL4")) == mtl4.def && d.string(forKey: "launcher.DM_FPS_TARGET") == "30", "DM_SAVED_CHOICES=0 without the screen applies launcher.json defaults and leaves saved choices stored")
         plain.apply()
         expect(String(cString: getenv("DM_FPS_TARGET")) == fps.def && d.string(forKey: "launcher.DM_FPS_TARGET") == "30", "DM_SAVED_CHOICES=0: Play uses the screen's values and leaves the saved choices")
         plain.reset()
@@ -94,6 +107,17 @@ import Foundation
         expect(SaveSyncReport.step(none) == .play("ask") && none.localChoice == "local:none", "no cloud save and never synced: ask, local:none")
         let missing = SaveSyncReport(line: "sync=1 cloud=0 local=\(lh) saved=1 files=1 size=1 chash=- csaved=0 cfiles=0 csize=0 cdevice=- sametitle=1 conflict=1 pull=0")!
         expect(SaveSyncReport.step(missing) == .missing && missing.localChoice == "local:none", "no cloud save though previously synced: missing, local:none")
+        // A value hidden for this game (settings.tsv ?: Game's HDR for a game without nn::vi::QueryDisplayHdrStatus) is not listed: a saved one loads the default, and choose (the
+        // path of the in-game menu's live settings, which do not include HDR) refuses it
+        let hdr = try! JSONDecoder().decode(Setting.self, from: Data(#"{"env":"DM_HDR","kind":"choice","label":"HDR","note":"","default":"0","options":[["0","Off"],["1","BT.2446"]]}"#.utf8))
+        unsetenv("DM_HDR"); d.set("2", forKey: "launcher.DM_HDR")
+        let hm = LauncherModel([hdr], defaults: d)
+        expect(hm.values["DM_HDR"] == "0", "a saved value the game does not list loads the default")
+        hm.choose(hdr, "2")
+        expect(hm.values["DM_HDR"] == "0" && getenv("DM_HDR") == nil, "choose refuses a value the game does not list")
+        hm.apply()
+        expect(d.object(forKey: "launcher.DM_HDR") == nil && String(cString: getenv("DM_HDR")) == "0", "Play forgets a saved value the game does not list and runs the default")
+        d.removeObject(forKey: "launcher.DM_HDR"); unsetenv("DM_HDR")
         // Sync-off effective-folder resolution bypasses save_sync_report in the launchers
         expect(!SaveSyncReport.syncEnabled(nil) && !SaveSyncReport.syncEnabled("") && !SaveSyncReport.syncEnabled("0"), "nil, empty and 0 disable sync")
         expect(SaveSyncReport.syncEnabled("/tmp/cloud") && SaveSyncReport.syncEnabled("icloud"), "a folder path or icloud enables sync")

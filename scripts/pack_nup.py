@@ -20,7 +20,9 @@
 # Every file read is checked against its SHA-256. A repeat run keeps code modules whose content is the same and an image made from the same container tree by the same packer,
 # or, after a packer update, an image whose bytes check against the container's hashes.
 # Needs the zstd module: compression.zstd (Python 3.14+) or backports.zstd, as the NSP script.
-# Usage: pack_nup.py <game.nup> [--version N] [--program N] [--work-dir DIR]   (exit 1 on error)
+# --verify checks every file in the container against its size and SHA-256 and writes nothing: the check a build makes as it extracts, done in one read pass,
+# so a damaged container is reported before a build rather than partway through.
+# Usage: pack_nup.py <game.nup> [--version N] [--program N] [--work-dir DIR] [--verify]   (exit 1 on error)
 import argparse, hashlib, mmap, os, re, shutil, struct, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/tools'))
@@ -122,7 +124,7 @@ class Nup:
     """A validated NUP (SPEC §6.1): the superblock, the TOC's SHA-256, every record's bounds. File content is checked against its SHA-256 as it is read"""
     def __init__(self, path):
         self.path = Path(path)
-        self.application, self.aoc_base, self.siblings = None, None, {}   # scan's: the application, its add-on content base ID, the other programs
+        self.application, self.aoc_base, self.siblings, self.multi_program = None, None, {}, False   # scan's: the application, its add-on content base ID, the other programs, whether same-family multi-program
         with open(self.path, 'rb') as f:   # the map keeps its own descriptor
             try: self.mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             except ValueError: raise Error(f'{self.path}: empty file') from None
@@ -209,22 +211,26 @@ class Nup:
     def copy(self, i, out):
         """File i's content to out (anything with write), streamed and checked against its size and SHA-256; returns its size"""
         name, size, sha, eoff, esz, codec = self.files[i]
-        h, n, view = hashlib.sha256(), 0, memoryview(self.mm)
+        h, n = hashlib.sha256(), 0
         def put(b):
             nonlocal n
             h.update(b); out.write(b); n += len(b)
-        if codec == 0:
-            for p in range(eoff, eoff + esz, 8 << 20): put(view[p:min(p + (8 << 20), eoff + esz)])
-        elif size:
-            if zstd is None: raise Error('reading a NUP needs the zstd module: compression.zstd (Python 3.14+) or pip install backports.zstd')
-            d = zstd.ZstdDecompressor()
-            try:
-                for p in range(eoff, eoff + esz, 4 << 20):
-                    put(d.decompress(view[p:min(p + (4 << 20), eoff + esz)]))
-                    if n > size: break
-            except zstd.ZstdError as e: raise Error(f'{self.path}: {name.decode(errors="replace")}: {e}') from e
-            if not d.eof: n = -1
-        view.release()
+        with memoryview(self.mm) as view:
+            if codec == 0:
+                for p in range(eoff, eoff + esz, 8 << 20):
+                    with view[p:min(p + (8 << 20), eoff + esz)] as chunk:
+                        put(chunk)
+            elif size:
+                if zstd is None: raise Error('reading a NUP needs the zstd module: compression.zstd (Python 3.14+) or pip install backports.zstd')
+                d = zstd.ZstdDecompressor()
+                try:
+                    for p in range(eoff, eoff + esz, 4 << 20):
+                        with view[p:min(p + (4 << 20), eoff + esz)] as chunk:
+                            data = d.decompress(chunk)
+                        put(data)
+                        if n > size: break
+                except zstd.ZstdError as e: raise Error(f'{self.path}: {name.decode(errors="replace")}: {e}') from e
+                if not d.eof: n = -1
         if n != size or h.digest() != sha: raise Error(f'{self.path}: {name.decode(errors="replace")} does not match its size or SHA-256 (damaged file)')
         return n
 
@@ -244,6 +250,23 @@ class Nup:
                 while len(out) < min(n, size) and not d.needs_input and not d.eof: out += d.decompress(b'', max_length=n - len(out))
         except zstd.ZstdError as e: raise Error(f'{self.path}: {name.decode(errors="replace")}: {e}') from e
         return out[:n]
+
+
+class Sink:
+    """copy()'s out when the content is only checked: it keeps nothing"""
+    def write(self, b): return len(b)
+
+
+def verify(n, say=print):
+    """Every file against its size and SHA-256, writing nothing (--verify). Reports each damaged file and goes on, so one pass lists them all; returns how many."""
+    if zstd is None and any(f[5] for f in n.files):
+        raise Error('checking a NUP needs the zstd module: compression.zstd (Python 3.14+) or pip install backports.zstd')
+    sink, bad = Sink(), 0
+    for i in range(len(n.files)):
+        try: n.copy(i, sink)
+        except Error as e: say(f'[RED] {e}'); bad += 1
+        if (i + 1) % 50000 == 0: say(f'  {i + 1:,} of {len(n.files):,} files checked, {bad} damaged')
+    return bad
 
 
 def program_id(npdm, where):   # the ACI0 program ID of an NPDM
@@ -306,10 +329,11 @@ def scan(n, program=None):
             if not k.version: raise Error(f'{n.path}: an update of version 0')
             vers[k.version] = k
         layout[pid & 0xFFF] = (pid, own_bases[0] if own_bases else None, vers)
-    if program is None: program = max(layout)
+    multi_program = len(layout) > 1 and all((pid & ~0xFFF) == owner[pid] for pid in progs)
+    if program is None: program = min(layout) if multi_program else max(layout)
     if program not in layout: raise Error(f'{n.path}: no program {program}; it holds ' + ', '.join(f'{i} ({pid:016X})' for i, (pid, _, _) in sorted(layout.items())))
     app, base, vers = layout.pop(program)
-    n.application, n.siblings = owner[app], layout
+    n.application, n.siblings, n.multi_program = owner[app], layout, multi_program
     newest = [vers[v] for v in sorted(vers, reverse=True)] + ([base] if base else []) + [k for _, b, vs in layout.values() for k in [*vs.values(), *([b] if b else [])]]
     n.aoc_base = next((a for k in newest if (a := nacp_ids(k)[1]) is not None), n.application + 0x1000)
     dlc = {}
@@ -324,7 +348,9 @@ def scan(n, program=None):
 
 def sibling_romfs(n, k):
     """{program index: RomFS folder} of the other programs of the application (scan's n.siblings) at the version package k runs: each one's newest update of no higher version, else its
-    base (an update without romfs/ uses its base's). On Horizon the programs of an application are patched together, and a program mounts another's RomFS by its index"""
+    base (an update without romfs/ uses its base's). On Horizon the programs of an application are patched together, and a program mounts another's RomFS by its index. Same-family
+    multi-program collections pack each program as its own executable instead of copying every other program's RomFS beside each one."""
+    if getattr(n, 'multi_program', False): return {}
     out = {}
     for idx, (_, sbase, svers) in sorted(n.siblings.items()):
         u = max((v for v in svers if v <= k.version), default=None)
@@ -512,10 +538,18 @@ def main():
     ap.add_argument('--version', type=int, help='the update version to pack (default: the newest in the container; 0 = the base game)')
     ap.add_argument('--program', type=int, help='a NUP holding several programs of one application (a Switch 2 Edition of a Switch 1 game): the index of the one to pack (default: the highest)')
     ap.add_argument('--work-dir', type=Path, help='the build folder (default: <folder of the .nup>/<title ID>_build)')
+    ap.add_argument('--verify', action='store_true', help='check every file in the container against its size and SHA-256, write nothing, and list the damaged ones (exit 1 if any)')
     a = ap.parse_args()
     path = a.nup.resolve()
     try:
         with Nup(path) as n:
+            if a.verify:
+                say = lambda s: print(s, flush=True)
+                say(f'{path.name}: {len(n.files):,} files, {sum(f[1] for f in n.files) / 2**30:.2f} GB')
+                bad = verify(n, say)
+                if bad: sys.exit(f'[RED] {bad} of {len(n.files):,} files are damaged')
+                say(f'all {len(n.files):,} files match their size and SHA-256')
+                return
             app, base, vers, dlc = scan(n, a.program)
             ver = a.version if a.version is not None else max(vers, default=0)
             if ver and ver not in vers: raise Error(f'no update {ver} in {path.name} (have: {", ".join(map(str, sorted(vers))) or "none"})')
